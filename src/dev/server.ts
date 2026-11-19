@@ -186,7 +186,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       name: 'clover-css-urls',
       setup(build) {
         build.onResolve({ filter: /.*/ }, (a) => {
-          if (a.kind === 'entry-point') return { path: a.path, namespace: 'clover-entry' }
+          if (a.kind === 'entry-point' || a.importer === '<stdin>') return { path: a.path, namespace: 'clover-entry' }
           if (/^(https?:|data:|\/\/|#)/.test(a.path)) return { path: a.path, external: true }
           const importer = a.importer || abs
           if (a.kind === 'url-token' || a.kind === 'import-rule') {

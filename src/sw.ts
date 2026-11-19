@@ -92,7 +92,11 @@ self.addEventListener('fetch', (e) => {
   const direct = parse(url.pathname)
   if (direct) {
     if (req.mode === 'navigate' && e.resultingClientId) remember(e.resultingClientId, direct)
-    e.respondWith(forward(req, direct, direct.rest + url.search))
+    e.respondWith(
+      forward(req, direct, direct.rest + url.search).then((res) =>
+        req.mode === 'navigate' && (res.headers.get('content-type') ?? '').includes('text/html') ? injectStrip(res) : res,
+      ),
+    )
     return
   }
   const viaClient = e.clientId ? clientMap.get(e.clientId) : undefined
@@ -105,22 +109,48 @@ self.addEventListener('fetch', (e) => {
     e.respondWith(handleRelative(e, viaRef, url))
     return
   }
-  if (!restored || (req.mode === 'navigate' && req.destination === 'iframe')) {
+  const nav = req.mode === 'navigate' && (req.destination === 'iframe' || req.destination === 'frame' || req.destination === 'document')
+  if (!restored || nav) {
     e.respondWith(
       (async () => {
         await restoring
-        let t = e.clientId ? clientMap.get(e.clientId) : undefined
-        if (!t && req.mode === 'navigate' && req.referrer) {
-          // an iframe navigating itself after history.pushState: its referrer is its own current URL
-          for (const c of await self.clients.matchAll({ type: 'window' })) {
-            if (c.url === req.referrer && clientMap.has(c.id)) t = clientMap.get(c.id)
-          }
-        }
+        const t = (e.clientId ? clientMap.get(e.clientId) : undefined) ?? (nav ? await navTarget(req) : undefined)
         return t ? handleRelative(e, t, url) : fetch(req)
       })(),
     )
   }
 })
+
+/**
+ * Previews strip their /__clover__/<id>/<port> prefix from location (see STRIP_SCRIPT), so a full navigation
+ * inside a preview (link click, reload) arrives as a plain same-origin URL. Attribute it to the preview whose
+ * document is being navigated: for frames, the mapped client whose URL is the referrer (link) or the URL itself
+ * (reload); for top-level tabs, only reloads, and only when no unmapped (host) window shows the same URL.
+ */
+async function navTarget(req: Request): Promise<Target | undefined> {
+  const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true })
+  const mapped = all.filter((c) => clientMap.has(c.id))
+  if (!mapped.length) return undefined
+  if (req.destination === 'document') {
+    if (all.some((c) => !clientMap.has(c.id) && c.url === req.url)) return undefined
+    const c = mapped.find((c) => c.frameType === 'top-level' && c.url === req.url)
+    return c && clientMap.get(c.id)
+  }
+  const c = mapped.find((c) => c.frameType !== 'top-level' && (c.url === req.referrer || c.url === req.url))
+  return c && clientMap.get(c.id)
+}
+
+/** Injected first into preview HTML: hide the preview prefix from the app (routers see "/"). */
+const STRIP_SCRIPT = `<script>(function(){var l=location,m=/^\\/__clover__\\/[^/]+\\/\\d+/.exec(l.pathname);if(m)history.replaceState(history.state,'',(l.pathname.slice(m[0].length)||'/')+l.search+l.hash)})()</script>`
+
+async function injectStrip(res: Response): Promise<Response> {
+  const html = await res.text()
+  const at = html.search(/<head[^>]*>/i)
+  const body = at >= 0 ? html.replace(/<head[^>]*>/i, (h) => h + STRIP_SCRIPT) : STRIP_SCRIPT + html
+  const headers = new Headers(res.headers)
+  headers.delete('content-length')
+  return new Response(body, { status: res.status, statusText: res.statusText, headers })
+}
 
 async function handleRelative(e: FetchEvent, t: Target, url: URL): Promise<Response> {
   if (e.request.mode === 'navigate') return Response.redirect(prefixOf(t) + url.pathname + url.search + url.hash, 302)

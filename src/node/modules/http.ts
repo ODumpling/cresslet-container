@@ -242,6 +242,8 @@ export class Server extends EventEmitter {
       req.headers[key] = key in req.headers ? `${req.headers[key]}, ${v}` : v
     }
     req.headers.host ??= `localhost:${this.port}`
+    // bodies arrive fully buffered; body parsers (type-is) need a length to detect a body
+    if (m.body && m.body.byteLength && !req.headers['content-length'] && !req.headers['transfer-encoding']) req.headers['content-length'] = String(m.body.byteLength)
     const res = new ServerResponse(req, m.id)
     inflight.set(m.id, res)
     res.on('finish', () => {

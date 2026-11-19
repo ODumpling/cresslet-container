@@ -44,6 +44,19 @@ test.describe.serial('clover-container demo', () => {
     await expect(page.frameLocator('#frame').getByRole('heading', { name: 'Edited via API' })).toBeVisible()
   })
 
+  test('preview hides its URL prefix from the app; pushState + reload keep working', async () => {
+    await page.evaluate(() =>
+      (window as unknown as Win).container.fs.writeFile(
+        'src/App.tsx',
+        `export default function App() {\n  return <><h1>path:{location.pathname}</h1><button onClick={() => { history.pushState(null, '', '/deep/link'); location.reload() }}>go</button></>\n}\n`,
+      ),
+    )
+    const frame = page.frameLocator('#frame')
+    await expect(frame.getByRole('heading', { name: 'path:/' })).toBeVisible()
+    await frame.getByRole('button', { name: 'go' }).click()
+    await expect(frame.getByRole('heading', { name: 'path:/deep/link' })).toBeVisible()
+  })
+
   test('syntax errors show an overlay, fixing them recovers', async () => {
     await page.evaluate(() => (window as unknown as Win).container.fs.writeFile('src/App.tsx', `export default function App() { return <h1>broken</h1 }\n`))
     await expect(page.frameLocator('#frame').locator('clover-error-overlay pre')).toContainText('App.tsx')
@@ -129,5 +142,15 @@ test.describe.serial('clover-container demo', () => {
     )
     const r = await sh(page, 'cd src && clover deploy --prod')
     expect(r).toEqual({ code: 3, out: 'clover deploy --prod in /home/project/src\n' })
+  })
+
+  test('interactive jsh: Ctrl+C stops the foreground dev server and returns to the prompt', async () => {
+    const closed = page.evaluate(
+      () => new Promise<number>((res) => (window as unknown as Win).container.on('port', (port, type) => type === 'close' && res(port))),
+    )
+    await page.evaluate(() => (window as unknown as { shellInput: WritableStreamDefaultWriter<string> }).shellInput.write('\x03'))
+    expect(await closed).toBe(5173)
+    await page.evaluate(() => (window as unknown as { shellInput: WritableStreamDefaultWriter<string> }).shellInput.write('echo after-ctrl-c\r'))
+    await expect(page.locator('.xterm-rows')).toContainText('after-ctrl-c')
   })
 })
