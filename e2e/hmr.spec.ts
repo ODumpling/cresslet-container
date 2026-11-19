@@ -77,12 +77,75 @@ test.describe.serial('HMR', () => {
     expect(await marked()).toBe(true)
   })
 
+  test('adding a hook inside a custom hook in a .ts module remounts its user (no "Rendered more hooks")', async () => {
+    const f = page.frameLocator('#frame')
+    const errors: string[] = []
+    const onErr = (e: Error) => void errors.push(e.message)
+    page.on('pageerror', onErr)
+    const hook = (extra = '') => `import { useState } from 'react'\nexport function useCounter() {\n${extra}  return useState(0)\n}\n`
+    const withHook = `import { useCounter } from './useCounter'
+
+export default function App() {
+  const [count, setCount] = useCounter()
+  return (
+    <main>
+      <h1>Custom hook</h1>
+      <button onClick={() => setCount((c) => c + 1)}>count is {count}</button>
+    </main>
+  )
+}
+`
+    await page.evaluate(([h, a]) => {
+      const fs = (window as unknown as Win).container.fs
+      return fs.writeFile('src/useCounter.ts', h).then(() => fs.writeFile('src/App.tsx', a))
+    }, [hook(), withHook] as const)
+    await expect(f.getByRole('heading', { name: 'Custom hook' })).toBeVisible()
+    await f.getByRole('button', { name: 'count is 0' }).click()
+    await expect(f.getByRole('button', { name: 'count is 1' })).toBeVisible()
+    await write(page, 'src/useCounter.ts', hook(`  const [extra] = useState('x')\n`))
+    await expect(f.getByRole('button', { name: 'count is 0' })).toBeVisible() // remounted: state reset
+    await expect(f.locator('cresslet-error-overlay')).toHaveCount(0)
+    expect(errors.filter((m) => /hooks/i.test(m))).toEqual([])
+    expect(await marked()).toBe(true)
+    page.off('pageerror', onErr)
+  })
+
+  test('a broken boundary in a batch does not hold back the other updates', async () => {
+    const f = page.frameLocator('#frame')
+    const other = (text: string) => `export default function Other() {\n  return <p>${text}</p>\n}\n`
+    const appWith = (heading: string) => `import Other from './Other'\n\n` + app(heading).replace('</h1>', '</h1>\n      <Other />')
+    await page.evaluate(([o, a]) => {
+      const fs = (window as unknown as Win).container.fs
+      return fs.writeFile('src/Other.tsx', o).then(() => fs.writeFile('src/App.tsx', a))
+    }, [other('other v1'), appWith('Batch')] as const)
+    await expect(f.getByText('other v1')).toBeVisible()
+    // one flush: App (first) gets a syntax error, Other changes
+    await page.evaluate(([a, o]) => {
+      const fs = (window as unknown as Win).container.fs
+      return fs.writeFile('src/App.tsx', a).then(() => fs.writeFile('src/Other.tsx', o))
+    }, [appWith('broken</h2>'), other('other v2')] as const)
+    await expect(f.getByText('other v2')).toBeVisible()
+    await expect(f.locator('cresslet-error-overlay pre')).toContainText('App.tsx')
+    await write(page, 'src/App.tsx', appWith('Batch fixed'))
+    await expect(f.getByRole('heading', { name: 'Batch fixed' })).toBeVisible()
+    await expect(f.locator('cresslet-error-overlay')).toHaveCount(0)
+    expect(await marked()).toBe(true)
+  })
+
+  test('renaming the default export (another component family) falls back to a full reload', async () => {
+    const f = page.frameLocator('#frame')
+    await write(page, 'src/App.tsx', app('Renamed').replace('function App()', 'function Main()'))
+    await expect.poll(marked).toBe(false)
+    await expect(f.getByRole('heading', { name: 'Renamed' })).toBeVisible()
+    await frame.evaluate(() => void ((window as unknown as Win).__marker = 1))
+  })
+
   test('editing a non-component module (the entry) falls back to a full reload', async () => {
     const f = page.frameLocator('#frame')
     const main = await page.evaluate(() => (window as unknown as Win).container.fs.readFile('src/main.tsx', 'utf8'))
     await write(page, 'src/main.tsx', main + '\n// touched\n')
     await expect.poll(marked).toBe(false)
-    await expect(f.getByRole('heading', { name: 'Recovered' })).toBeVisible()
+    await expect(f.getByRole('heading', { name: 'Renamed' })).toBeVisible()
     await expect(f.getByRole('button', { name: 'count is 0' })).toBeVisible()
   })
 

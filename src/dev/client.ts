@@ -1,5 +1,33 @@
 // Browser-side HMR / live-reload + error overlay client, served at /@cresslet/client.
 
+/**
+ * Point the active `<link rel=stylesheet>`s for `pathname` at `href`. Each active link has at most one pending
+ * replacement (a newer edit supersedes it); the active link goes only once its replacement has loaded, and stays if
+ * the replacement fails. Returns false when the page has no such link. Plain JS: inlined into the client.
+ */
+export const SWAP_LINKS = `function swapLinks(doc, pathname, href) {
+  const links = [...doc.querySelectorAll('link[rel="stylesheet"]')].filter((l) => !l.__cressletPending && new URL(l.href, doc.baseURI).pathname === pathname);
+  if (!links.length) return false;
+  for (const l of links) {
+    if (l.__cressletNext) l.__cressletNext.remove();
+    const next = l.cloneNode();
+    next.__cressletPending = true;
+    next.href = href;
+    l.__cressletNext = next;
+    next.onload = () => {
+      if (l.__cressletNext !== next) return;
+      next.__cressletPending = false;
+      l.remove();
+    };
+    next.onerror = () => {
+      if (l.__cressletNext === next) l.__cressletNext = null;
+      next.remove();
+    };
+    l.after(next);
+  }
+  return true;
+}`
+
 export function clientCode(channel: string, prefix: string): string {
   return `const CH = ${JSON.stringify(channel)};
 const PREFIX = ${JSON.stringify(prefix)};
@@ -34,34 +62,38 @@ export function moduleError(msg) {
   if (!updating) stale = true;
   showOverlay(msg);
 }
+${SWAP_LINKS}
 let queue = Promise.resolve();
 async function applyUpdates(updates) {
   if (stale) return reload();
   updating++;
   try {
     let refresh = false;
+    let failed;
     for (const u of updates) {
       const url = u.url + (u.url.includes('?') ? '&' : '?') + 't=' + u.t;
       if (u.kind === 'css-link') {
-        const links = [...document.querySelectorAll('link[rel="stylesheet"]')].filter((l) => new URL(l.href, location.href).pathname === u.url);
-        if (!links.length) return reload();
-        for (const l of links) {
-          // swap in a fresh <link> and drop the old one once it has loaded (no flash of unstyled content)
-          const next = l.cloneNode();
-          next.href = url;
-          next.onload = next.onerror = () => l.remove();
-          l.after(next);
-        }
+        if (!swapLinks(document, u.url, url)) return reload();
         continue;
       }
-      const mod = await import(url);
+      // one failing boundary (e.g. a syntax error) must not hold back the others in this batch;
+      // the server re-sends it once it is fixed
+      let mod;
+      try {
+        mod = await import(url);
+      } catch (err) {
+        failed = err;
+        continue;
+      }
       if (u.kind === 'js') {
         const rt = await import('/@cresslet/refresh');
-        if (!rt.isBoundary(mod)) return reload();
+        // added/removed exports, or a default that now is another component: importers hold the old bindings
+        if (!rt.isBoundary(mod) || rt.exportsChanged(u.url)) return reload();
         refresh = true;
       }
     }
     if (refresh) (await import('/@cresslet/refresh')).performRefresh();
+    if (failed) throw failed;
     clearOverlay();
     console.debug('[cresslet] hot updated', updates.map((u) => u.url).join(', '));
   } catch (err) {

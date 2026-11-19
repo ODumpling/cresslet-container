@@ -40,6 +40,9 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   const deps = new DepOptimizer(vfs, fs, root, { wasmURL: c.esbuildWasmUrl, define: { 'process.env.NODE_ENV': '"development"' } })
   deps.onStale = () => scheduleReload('dependencies re-optimized')
   const transformCache = new Map<string, { mtime: number; code: string }>()
+  /** Bumped per module by each HMR flush: an in-flight transform from an older generation must not publish. */
+  const generation = new Map<string, number>()
+  const bump = (f: string) => generation.set(f, (generation.get(f) ?? 0) + 1)
   let lastError = ''
   let lastErrorFile = ''
 
@@ -62,6 +65,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     reloadTimer = setTimeout(() => {
       reloadTimer = null
       pending.clear()
+      lastError = lastErrorFile = '' // the page starts over; a still-broken module reports again when requested
       post({ type: 'reload' })
     }, 60)
   }
@@ -75,11 +79,25 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     if (reloadTimer || !pending.size) return
     // a module that failed to transform may be fixed by this change (e.g. a newly created import target)
     if (lastErrorFile) {
-      if (!graph.nodes.has(lastErrorFile)) return scheduleReload('recovering from an error')
-      pending.add(lastErrorFile)
+      const n = graph.nodes.get(lastErrorFile)
+      // deleted, or no longer imported by anything: its error is no longer the page's problem
+      if (!vfs.isFile(lastErrorFile) || (n && !n.importers.size && !graph.isEntry(lastErrorFile))) lastError = lastErrorFile = ''
+      else if (!n) return scheduleReload('recovering from an error')
+      else pending.add(lastErrorFile)
     }
     const files = [...pending]
     pending.clear()
+    for (const f of files) bump(f)
+    // deleted/renamed modules: forget them (all of them, before anything returns) so stale edges don't steer later updates
+    const gone = files.filter((f) => graph.nodes.has(f) && !vfs.isFile(f))
+    for (const f of gone) {
+      graph.remove(f)
+      hmrStamp.delete(f)
+      transformCache.delete(f)
+      unresolved.delete(f)
+      if (f === lastErrorFile) lastError = lastErrorFile = ''
+    }
+    if (gone.length) return scheduleReload(gone[0])
     const updates = new Map<string, HmrUpdate>()
     const chain = new Set<string>()
     for (let i = 0; i < files.length; i++) {
@@ -87,11 +105,14 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       if (!graph.nodes.has(f)) {
         // never served to the page, so it can't affect it, unless it's something loaded outside the module graph
         // or a module whose import of it failed to resolve
-        if (!SCRIPT_EXT.test(f) && !f.endsWith('.css')) return scheduleReload(f)
+        if (vfs.isDir(f)) continue
+        if (!SCRIPT_EXT.test(f) && !f.endsWith('.css')) {
+          if (ASSET_EXT.test(f)) return scheduleReload(f)
+          continue // README, dotfiles, editor temp files...
+        }
         for (const u of unresolved) if (!files.includes(u)) files.push(u)
         continue
       }
-      if (!vfs.isFile(f)) return scheduleReload(f) // deleted/renamed module
       const r = graph.propagate(f)
       if (!r) return scheduleReload(f)
       for (const u of r.updates) updates.set(u.file, u)
@@ -102,6 +123,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     for (const m of chain) {
       hmrStamp.set(m, t)
       transformCache.delete(m)
+      bump(m)
     }
     post({ type: 'update', updates: [...updates.values()].map((u) => ({ kind: u.kind, url: toUrl(u.file) + (u.kind === 'css' ? '?import' : ''), t })) })
   }
@@ -196,6 +218,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     },
   })
 
+  const SCRIPT_LOADERS = new Set(['ts', 'tsx', 'jsx', 'js'])
   const loaderOf = (p: string) => {
     const e = extname(p)
     return e === '.tsx' ? 'tsx' : e === '.ts' || e === '.mts' || e === '.cts' ? 'ts' : e === '.jsx' ? 'jsx' : 'jsx'
@@ -205,6 +228,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     const st = vfs.stat(abs)
     const hit = transformCache.get(abs)
     if (hit && hit.mtime === st.mtimeMs) return hit.code
+    const gen = generation.get(abs) ?? 0
     const es = await loadEsbuild(c.esbuildWasmUrl)
     const locals = new Set<string>()
     unresolved.delete(abs)
@@ -225,14 +249,17 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       absWorkingDir: root,
     })
     let code = r.outputFiles[0].text
-    graph.setImports(abs, locals)
-    const node = graph.ensure(abs)
-    node.accept = null
-    if (cfg.refresh && /\.[jt]sx$/.test(abs)) {
+    let boundary = false
+    // every script esbuild loads (incl. .ts hook modules, .js JSX): hooks need signatures wherever they're defined
+    if (cfg.refresh && SCRIPT_LOADERS.has(loaderOf(abs))) {
       const rr = refreshTransform(code, toUrl(abs))
       code = rr.code
-      if (rr.boundary) node.accept = 'self'
+      boundary = rr.boundary
     }
+    // changed while this transform was in flight: serve it, but don't publish stale code / edges
+    if ((generation.get(abs) ?? 0) !== gen) return code
+    graph.setImports(abs, locals)
+    graph.ensure(abs).accept = boundary ? 'self' : null
     transformCache.set(abs, { mtime: st.mtimeMs, code })
     return code
   }
@@ -325,6 +352,13 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
 
   const transformHtml = async (abs: string): Promise<string> => {
     let html = vfs.readText(abs)
+    graph.setEntries(
+      abs,
+      findModuleScripts(html).map((src) => {
+        const [p] = splitQuery(src)
+        return p.startsWith('/') ? fromUrl(p) : join(dirname(abs), p)
+      }),
+    )
     html = html.replace(/%(\w+)%/g, (m, k) => (k in env ? String(env[k]) : m))
     // transform inline module scripts
     const inline = /<script\b([^>]*\btype\s*=\s*["']?module["']?[^>]*)>([\s\S]*?)<\/script>/gi

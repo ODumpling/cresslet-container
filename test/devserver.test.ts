@@ -1,0 +1,163 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { VFS } from '../src/vfs'
+import { join } from '../src/path'
+
+// Dev server HMR decisions in node: native esbuild stands in for esbuild-wasm, a fake container captures the handler,
+// and a BroadcastChannel listener records what the page would be told.
+const gate = vi.hoisted(() => ({ hold: null as Promise<void> | null, built: 0 }))
+vi.mock('../src/esbuild', async (orig) => {
+  const m = await orig<typeof import('../src/esbuild')>()
+  const real = await import('esbuild')
+  const es = {
+    ...real,
+    build: async (o: Parameters<typeof real.build>[0]) => {
+      const r = await real.build(o)
+      gate.built++
+      if (gate.hold) await gate.hold // simulates a transform still in flight
+      return r
+    },
+  }
+  return { ...m, loadEsbuild: async () => es }
+})
+const { createDevServer } = await import('../src/dev/server')
+
+const ROOT = '/__cresslet_test__/p'
+let n = 0
+const servers: { close(): void }[] = []
+afterEach(() => {
+  for (const s of servers.splice(0)) s.close()
+  gate.hold = null
+})
+
+type Msg = { type: string; updates?: { kind: string; url: string }[] }
+async function devServer(files: Record<string, string>) {
+  const vfs = new VFS()
+  const write = (p: string, s: string) => vfs.writeFile(join(ROOT, p), s, { mkdirp: true })
+  write('package.json', JSON.stringify({ dependencies: { react: '*', 'react-dom': '*' } }))
+  for (const [p, s] of Object.entries(files)) write(p, s)
+  let handler!: (r: Request) => Promise<Response>
+  const id = `t${++n}`
+  const c = {
+    workdir: ROOT,
+    vfs,
+    instanceId: id,
+    esbuildWasmUrl: '',
+    resolveFs: { isFile: (p: string) => vfs.isFile(p), isDir: (p: string) => vfs.isDir(p), readText: (p: string) => vfs.tryReadText(p) },
+    ports: { free: () => 5173, open: (_p: number, h: typeof handler) => ((handler = h), 'http://localhost/'), close() {} },
+  }
+  const server = await createDevServer(c as never, {})
+  const msgs: Msg[] = []
+  const bc = new BroadcastChannel(`cresslet:${id}:5173`)
+  bc.onmessage = (e) => void msgs.push(e.data)
+  servers.push(server, bc)
+  const get = async (path: string) => (await handler(new Request('http://localhost' + path))).text()
+  /** Wait for the next message the page would receive. */
+  const next = async (): Promise<Msg> => {
+    const k = msgs.length
+    for (let i = 0; i < 200 && msgs.length === k; i++) await new Promise((r) => setTimeout(r, 10))
+    if (msgs.length === k) throw new Error('no message')
+    return msgs[k]
+  }
+  /** Assert nothing is sent for a while. */
+  const quiet = async () => {
+    const k = msgs.length
+    await new Promise((r) => setTimeout(r, 250))
+    return msgs.slice(k)
+  }
+  return { vfs, write, get, next, quiet, rm: (p: string) => vfs.rm(join(ROOT, p), { recursive: true }) }
+}
+
+// no JSX / bare imports: keeps the dependency optimizer out of it
+const comp = (name: string, body = 'return null', imports = '') => `${imports}\nexport default function ${name}() { ${body} }\n`
+const upd = (m: Msg) => (m.type === 'update' ? m.updates!.map((u) => u.url) : m.type)
+
+describe('dev server HMR', () => {
+  it('an HTML entry that exports a component is not a refresh boundary', async () => {
+    const s = await devServer({ 'index.html': '<script type="module" src="/src/App.tsx"></script>', 'src/App.tsx': comp('App') })
+    await s.get('/')
+    expect(await s.get('/src/App.tsx')).toContain('.register(App')
+    s.write('src/App.tsx', comp('App', 'return 1'))
+    expect(upd(await s.next())).toBe('reload')
+  })
+
+  it('signs hooks in .ts modules and registers JSX components in .js files', async () => {
+    const s = await devServer({ 'src/useCounter.ts': 'export function useCounter() { return useState(0) }\nfunction useState(x) { return [x] }\n', 'src/Button.js': 'export default function Button() { return <b /> }\n' })
+    expect(await s.get('/src/useCounter.ts')).toMatch(/\.sign\(useCounter, "return useState\(0\);"/)
+    expect(await s.get('/src/Button.js')).toContain('.register(Button')
+  })
+
+  it('an in-flight transform from before a flush does not publish stale code', async () => {
+    const s = await devServer({ 'src/main.ts': "import App from './App'\n", 'src/App.tsx': comp('App', 'return util', "import util from './util'"), 'src/util.ts': 'export default 1\n' })
+    await s.get('/src/main.ts')
+    await s.get('/src/App.tsx')
+    await s.get('/src/util.ts')
+    s.write('src/util.ts', 'export default 2\n')
+    const m1 = await s.next()
+    expect(upd(m1)).toEqual(['/src/App.tsx'])
+    // the page re-imports App (new util stamp); meanwhile util changes again before that transform finishes
+    let release!: () => void
+    gate.hold = new Promise((r) => (release = r))
+    const built = gate.built
+    const inflight = s.get('/src/App.tsx?t=1')
+    while (gate.built === built) await new Promise((r) => setTimeout(r, 5))
+    s.write('src/util.ts', 'export default 3\n')
+    await s.next()
+    gate.hold = null
+    release()
+    const stale = await inflight
+    const fresh = await s.get('/src/App.tsx?t=2')
+    const stamp = (code: string) => /util\.ts\?t=(\d+)/.exec(code)![1]
+    expect(stamp(fresh)).not.toBe(stamp(stale))
+  })
+
+  it('a deleted module leaves the graph (its edges no longer steer updates)', async () => {
+    const s = await devServer({
+      'src/main.ts': "import App from './App'\nimport Old from './Old'\n",
+      'src/App.tsx': comp('App', 'return util', "import util from './util'"),
+      'src/Old.tsx': comp('Old', 'return util', "import util from './util'"),
+      'src/util.ts': 'export default 1\n',
+    })
+    for (const p of ['/src/main.ts', '/src/App.tsx', '/src/Old.tsx', '/src/util.ts']) await s.get(p)
+    s.write('src/main.ts', "import App from './App'\n")
+    s.rm('src/Old.tsx')
+    expect(upd(await s.next())).toBe('reload')
+    await s.get('/src/main.ts')
+    s.write('src/util.ts', 'export default 2\n')
+    expect(upd(await s.next())).toEqual(['/src/App.tsx'])
+  })
+
+  it('a transform error stops counting once its module is no longer imported; a full reload clears it', async () => {
+    const s = await devServer({
+      'index.html': '<script type="module" src="/src/main.ts"></script>',
+      'src/main.ts': "import App from './App'\n",
+      'src/App.tsx': comp('App', 'return Broken', "import Broken from './Broken'"),
+      'src/Broken.tsx': 'export default function Broken( {\n',
+    })
+    for (const p of ['/', '/src/main.ts', '/src/App.tsx', '/src/Broken.tsx']) await s.get(p)
+    expect(await s.get('/@cresslet/last-error')).toContain('Broken.tsx')
+    s.write('src/App.tsx', comp('App'))
+    expect(upd(await s.next())).toEqual(['/src/App.tsx'])
+    await s.get('/src/App.tsx?t=1') // no longer imports Broken
+    s.write('src/App.tsx', comp('App', 'return 2'))
+    expect(upd(await s.next())).toEqual(['/src/App.tsx'])
+    expect(await s.get('/@cresslet/last-error')).toBe('')
+
+    await s.get('/src/Broken.tsx')
+    expect(await s.get('/@cresslet/last-error')).toContain('Broken.tsx')
+    s.write('index.html', '<script type="module" src="/src/main.ts"></script>\n')
+    expect(upd(await s.next())).toBe('reload')
+    expect(await s.get('/@cresslet/last-error')).toBe('')
+  })
+
+  it('ignores directories and non-asset files outside the graph; unknown assets reload', async () => {
+    const s = await devServer({ 'src/App.tsx': comp('App') })
+    await s.get('/src/App.tsx')
+    s.write('README.md', '# hi')
+    s.write('.gitignore', 'node_modules')
+    s.write('src/App.tsx.swp', 'x')
+    s.vfs.mkdir(join(ROOT, 'src/newdir'), { recursive: true })
+    expect(await s.quiet()).toEqual([])
+    s.write('src/logo.svg', '<svg/>')
+    expect(upd(await s.next())).toBe('reload')
+  })
+})

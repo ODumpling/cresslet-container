@@ -56,6 +56,8 @@ export function refreshTransform(code: string, id: string): RefreshResult {
     if (m) decls.push({ name: m[1] ?? m[2] ?? m[3], start: i })
   }
   const exports = parseExports(code)
+  let ns = '__cresslet_refresh' // binding for the injected import: must not collide with anything in the module
+  while (code.includes(ns)) ns += '_'
   const tail: string[] = []
   const registered: string[] = []
   decls.forEach((d, k) => {
@@ -73,14 +75,18 @@ export function refreshTransform(code: string, id: string): RefreshResult {
       }
     }
     const getHooks = custom.length ? `() => [${custom.map((h) => `typeof ${h} === "function" ? ${h} : void 0`).join(', ')}]` : 'void 0'
+    // `typeof` guard: a declaration-looking line inside a multi-line template literal is not a real binding
+    const guard = `typeof ${d.name} !== "undefined" && `
     if (isComponentName(d.name)) {
       registered.push(d.name)
-      tail.push(`__cresslet_refresh.register(${d.name}, ${JSON.stringify(`${id} ${d.name}`)}, ${JSON.stringify(keys.join('\n'))}, ${getHooks});`)
-    } else tail.push(`__cresslet_refresh.sign(${d.name}, ${JSON.stringify(keys.join('\n'))}, ${getHooks});`)
+      tail.push(`${guard}${ns}.register(${d.name}, ${JSON.stringify(`${id} ${d.name}`)}, ${JSON.stringify(keys.join('\n'))}, ${getHooks});`)
+    } else tail.push(`${guard}${ns}.sign(${d.name}, ${JSON.stringify(keys.join('\n'))}, ${getHooks});`)
   })
   const boundary = !!exports && exports.size > 0 && [...exports].every(([exp, local]) => isComponentName(exp === 'default' ? local : exp))
-  if (!registered.length) return { code, boundary: false, registered }
-  const add = `\nimport * as __cresslet_refresh from ${JSON.stringify(REFRESH_UTILS_URL)};\n${tail.join('\n')}\n`
+  if (!tail.length) return { code, boundary: false, registered }
+  // export shape (names + refresh families), compared on update: an added/removed/re-pointed export needs a reload
+  if (boundary) tail.push(`${ns}.exportsOf(${JSON.stringify(id)}, { ${[...exports!].map(([exp, local]) => `${JSON.stringify(exp)}: typeof ${local} !== "undefined" ? ${local} : void 0`).join(', ')} });`)
+  const add = `\nimport * as ${ns} from ${JSON.stringify(REFRESH_UTILS_URL)};\n${tail.join('\n')}\n`
   const sm = code.lastIndexOf('\n//# sourceMappingURL=')
   return { code: sm < 0 ? code + add : code.slice(0, sm) + add + code.slice(sm), boundary, registered }
 }
@@ -102,6 +108,20 @@ export function register(type, id, key, getHooks) {
 }
 export function sign(fn, key, getHooks) {
   if (typeof fn === 'function') R.setSignature(fn, key, false, getHooks);
+}
+const shapes = new Map();
+const shapeChanged = new Set();
+/** Record a boundary's exports (name -> refresh family); a different shape than last time means it can't hot-update. */
+export function exportsOf(id, mod) {
+  const next = Object.keys(mod).sort().map((k) => [k, R.getFamilyByType(mod[k])]);
+  const prev = shapes.get(id);
+  shapes.set(id, next);
+  if (prev && (prev.length !== next.length || prev.some(([k, f], i) => next[i][0] !== k || next[i][1] !== f))) shapeChanged.add(id);
+  else shapeChanged.delete(id);
+}
+/** Whether the last evaluation of module \`id\` added/removed exports or re-pointed one to another component. */
+export function exportsChanged(id) {
+  return shapeChanged.has(id);
 }
 /** Every export of an updated module must be a component, otherwise its importers would keep stale values. */
 export function isBoundary(mod) {
