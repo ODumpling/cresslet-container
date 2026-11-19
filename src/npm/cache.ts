@@ -13,6 +13,8 @@ export type CacheStore = 'tarballs' | 'packuments'
 const DB_NAME = 'cresslet-npm'
 const STORES: CacheStore[] = ['tarballs', 'packuments']
 const OPEN_TIMEOUT = 3000
+/** Bound for one IndexedDB transaction (and for flushing pending writes): past it a get is a miss, a put/delete a no-op. */
+export const OP_TIMEOUT = 2000
 
 /** In-memory PackageCache (tests, or a host that wants per-session caching only). */
 export class MemoryCache implements PackageCache {
@@ -32,37 +34,55 @@ export class IdbCache implements PackageCache {
   private db: Promise<IDBDatabase | null> | null = null
 
   private open(): Promise<IDBDatabase | null> {
-    this.db ??= new Promise<IDBDatabase | null>((resolve) => {
-      const done = (db: IDBDatabase | null) => (clearTimeout(timer), resolve(db))
+    if (this.db) return this.db
+    const p: Promise<IDBDatabase | null> = new Promise((resolve) => {
+      let settled = false
+      const done = (db: IDBDatabase | null) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(db)
+      }
       // a blocked upgrade (another tab on an older version) or a hung open must not stall installs
-      const timer = setTimeout(() => resolve(null), OPEN_TIMEOUT)
+      const timer = setTimeout(() => done(null), OPEN_TIMEOUT)
+      const drop = () => void (this.db === p && (this.db = null)) // reopen on next use
       try {
         if (typeof indexedDB === 'undefined') return done(null)
         const req = indexedDB.open(DB_NAME, 1)
         req.onupgradeneeded = () => {
           for (const s of STORES) if (!req.result.objectStoreNames.contains(s)) req.result.createObjectStore(s)
         }
-        req.onsuccess = () => done(req.result)
+        req.onsuccess = () => {
+          const db = req.result
+          // the fallback already resolved: an unused open connection would block deleteDatabase / version bumps
+          if (settled) return db.close()
+          db.onversionchange = () => (db.close(), drop())
+          db.onclose = drop
+          done(db)
+        }
         req.onerror = () => done(null)
         req.onblocked = () => done(null)
       } catch {
         done(null)
       }
     })
-    return this.db
+    this.db = p
+    return p
   }
 
   private async tx<T>(store: CacheStore, mode: IDBTransactionMode, fn: (s: IDBObjectStore) => IDBRequest): Promise<T | undefined> {
     const db = await this.open()
     if (!db) return undefined
     return new Promise<T | undefined>((resolve) => {
+      const done = (v: T | undefined) => (clearTimeout(timer), resolve(v))
+      const timer = setTimeout(() => resolve(undefined), OP_TIMEOUT) // a stuck transaction is a miss / no-op
       try {
         const t = db.transaction(store, mode)
         const req = fn(t.objectStore(store))
-        t.oncomplete = () => resolve(req.result as T)
-        t.onerror = t.onabort = () => resolve(undefined)
+        t.oncomplete = () => done(req.result as T)
+        t.onerror = t.onabort = () => done(undefined)
       } catch {
-        resolve(undefined)
+        done(undefined)
       }
     })
   }
@@ -78,10 +98,36 @@ export class IdbCache implements PackageCache {
   }
 }
 
-/** Cache key for a tarball: its integrity (content-addressed, shared across mirrors) or, without one, its URL. */
+const ALGOS = { sha512: 'SHA-512', sha384: 'SHA-384', sha256: 'SHA-256', sha1: 'SHA-1' } as const
+export interface Digest {
+  /** `algo-hash`, the token used as the cache key */
+  token: string
+  algo: keyof typeof ALGOS
+  hash: string
+  /** WebCrypto algorithm name */
+  subtle: string
+}
+
+/** The one integrity token used for both cache keying and verification: the strongest supported hash (SRI rules). */
+export function selectDigest(integrity?: string): Digest | null {
+  let best: Digest | null = null
+  const rank = (a: string) => Object.keys(ALGOS).indexOf(a)
+  for (const t of integrity?.trim().split(/\s+/) ?? []) {
+    const m = /^(sha512|sha384|sha256|sha1)-([A-Za-z0-9+/=_-]+)/.exec(t) // drops SRI `?options`
+    if (!m) continue
+    const algo = m[1] as Digest['algo']
+    if (!best || rank(algo) < rank(best.algo)) best = { token: `${algo}-${m[2]}`, algo, hash: m[2], subtle: ALGOS[algo] }
+  }
+  return best
+}
+
+/** Whether a digest can actually be checked here (WebCrypto is missing on insecure origins). */
+export const canVerify = (d: Digest | null): d is Digest => !!d && !!globalThis.crypto?.subtle
+
+/** Cache key for a tarball: its sha256+ digest when it is verified on read (content-addressed, shared across mirrors), else its URL. */
 export function tarballKey(url: string, integrity?: string): string {
-  const sri = integrity?.split(/\s+/).find((s) => /^sha(256|384|512)-/.test(s))
-  return sri ?? url
+  const d = selectDigest(integrity)
+  return canVerify(d) && d.algo !== 'sha1' ? d.token : url
 }
 
 let shared: IdbCache | null = null

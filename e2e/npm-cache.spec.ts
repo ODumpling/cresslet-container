@@ -5,7 +5,8 @@ import { expect, test, type Page, type Request } from '@playwright/test'
 
 const REGISTRY = 'https://registry.npmjs.org/'
 
-async function installOnce(page: Page): Promise<{ tarballs: string[]; packuments: string[] }> {
+/** Records registry requests from before `navigate` starts until the demo app renders. */
+async function installOnce(page: Page, navigate: () => Promise<unknown>): Promise<{ tarballs: string[]; packuments: string[] }> {
   const tarballs: string[] = []
   const packuments: string[] = []
   const onReq = (r: Request) => {
@@ -14,6 +15,7 @@ async function installOnce(page: Page): Promise<{ tarballs: string[]; packuments
     ;(u.endsWith('.tgz') ? tarballs : packuments).push(u)
   }
   page.on('request', onReq)
+  await navigate()
   await expect(page.frameLocator('#frame').getByRole('heading', { name: 'Hello from Cresslet' })).toBeVisible({ timeout: 120_000 })
   page.off('request', onReq)
   return { tarballs, packuments }
@@ -23,13 +25,11 @@ test('second npm install after a reload is served from the persistent cache', as
   const page = await (await browser.newContext()).newPage()
   page.on('pageerror', (e) => console.log('[pageerror]', e.message))
 
-  await page.goto('/')
-  const first = await installOnce(page)
+  const first = await installOnce(page, () => page.goto('/'))
   expect(first.tarballs.length).toBeGreaterThan(0)
   expect(first.packuments.length).toBeGreaterThan(0)
 
-  await page.reload()
-  const second = await installOnce(page)
+  const second = await installOnce(page, () => page.reload())
   console.log(`registry requests: first load ${first.tarballs.length} tarballs + ${first.packuments.length} packuments; after reload ${second.tarballs.length} + ${second.packuments.length}`)
   expect(second.tarballs).toEqual([])
   expect(second.packuments).toEqual([])
@@ -37,11 +37,10 @@ test('second npm install after a reload is served from the persistent cache', as
 
 test('boot({ npmCache: false }) bypasses the persistent cache', async ({ browser }) => {
   const page = await (await browser.newContext()).newPage()
-  await page.goto('/')
-  await installOnce(page) // warms the persistent cache in this context
-  await page.goto('/demo/blank.html')
+  await installOnce(page, () => page.goto('/')) // warms the persistent cache in this context
   const urls: string[] = []
   page.on('request', (r) => void (r.url().startsWith(REGISTRY) && urls.push(r.url())))
+  await page.goto('/demo/blank.html')
   const out = await page.evaluate(async () => {
     const { Container } = await import('/dist/cresslet-container.js')
     const c = await Container.boot({ serviceWorkerUrl: false, npmCache: false })
