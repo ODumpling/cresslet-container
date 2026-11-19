@@ -76,7 +76,9 @@ Root-relative paths keep working: the SW injects a one-line script into preview 
 
 ## Dev server
 
-Serves `index.html` (+ live-reload client), `public/`, SPA fallback. Transforms `.ts/.tsx/.jsx/.js` with esbuild (automatic JSX; import source from tsconfig `jsxImportSource` or react/preact deps; tsconfig `paths` aliases). Bare imports → `/@modules/<spec>`: all deps pre-bundled together in one esbuild run with code splitting (one copy of react), CJS named exports via cjs-module-lexer; newly discovered deps re-optimize and reload. CSS imports inject `<style>`, CSS modules (`*.module.css`), `?url`/`?raw`, asset and JSON imports, `import.meta.env` (`MODE`, `DEV`, `PROD`, `BASE_URL`, `VITE_*` from `.env*`), `%VITE_X%` in HTML. File changes → full reload; errors → overlay.
+Serves `index.html` (+ live-reload client), `public/`, SPA fallback. Transforms `.ts/.tsx/.jsx/.js` with esbuild (automatic JSX; import source from tsconfig `jsxImportSource` or react/preact deps; tsconfig `paths` aliases). Bare imports → `/@modules/<spec>`: all deps pre-bundled together in one esbuild run with code splitting (one copy of react), CJS named exports via cjs-module-lexer; newly discovered deps re-optimize and reload. CSS imports inject `<style>`, CSS modules (`*.module.css`), `?url`/`?raw`, asset and JSON imports, `import.meta.env` (`MODE`, `DEV`, `PROD`, `BASE_URL`, `VITE_*` from `.env*`), `%VITE_X%` in HTML. Errors → overlay.
+
+**HMR**: the server keeps a module graph of what the page loaded and walks importers from a changed file to the nearest module that can accept the update. CSS (imported or `<link rel=stylesheet>`, incl. `@import`ed files) is swapped in place. React projects (`react-dom` dep, React JSX) get **React Fast Refresh**: `.jsx`/`.tsx` modules whose exports are all components are refresh boundaries, so component edits keep state; a changed hook signature remounts the component. Everything else falls back to the full reload: entry scripts and other modules no boundary accepts, `index.html`, `public/`, config/`.env`/`package.json`, dependency changes, deleted files, and any change after an error outside an update (failed initial load, uncaught runtime error). `import.meta.hot` is not exposed to app code.
 
 ## Build
 
@@ -85,7 +87,7 @@ Parses `index.html`, bundles each `<script type="module" src>` and local stylesh
 ## Limitations
 
 - Not real Node: real `vite`, `next`, `tsc`, native addons, `child_process`, raw sockets don't run (built-ins cover the common workflow).
-- No HMR (full reload). No PostCSS/Tailwind v3/Sass/Less (Tailwind via CDN works).
+- HMR covers CSS and React Fast Refresh only (no `import.meta.hot` API, no Preact/Vue/Svelte HMR; those full-reload). Refresh signatures come from a light pass over esbuild output, not Babel: hook changes are detected per component, but unusual code shapes may remount or reload instead. No PostCSS/Tailwind v3/Sass/Less (Tailwind via CDN works).
 - `node` needs a cross-origin isolated page; without it sync fs/`require` fail with a clear error.
 - `npm`: no lockfile-driven installs, no workspaces, no git/file deps, no lifecycle scripts. The package cache has no size cap/eviction of its own (the browser may evict it; clear with `indexedDB.deleteDatabase('cresslet-npm')`).
 - Previews share the host origin: a preview at `/` and a host page at `/` can't be told apart on a *top-level* reload; manual reload of a preview frame after `pushState` is best-effort in WebKit.
@@ -99,7 +101,7 @@ host page ───────────────────────�
      ├─ jsh (parser + builtins) ── commands: npm · npx · vite · serve · node · registered
      ├─ npm: resolver (semver, hoist) → registry fetch → gunzip/untar → VFS
      ├─ node → Web Worker (CJS loader, polyfills) ⇄ SAB/Atomics sync RPC (fs, resolve, esbuild transform)
-     ├─ dev server / build → esbuild-wasm (VFS plugin)
+     ├─ dev server (module graph, HMR, React Refresh) / build → esbuild-wasm (VFS plugin)
      └─ PortTable ⇄ cresslet-sw.js ⇄ preview iframes (/__cresslet__/<id>/<port>/…)
 ```
 
@@ -115,7 +117,7 @@ pnpm demo        # http://localhost:4400
 
 ## Roadmap
 
-VFS persistence (IndexedDB/OPFS snapshots; the npm cache already persists), npm cache size cap/LRU, HMR (React Fast Refresh), lockfile-driven installs + workspaces, PostCSS/Tailwind, more Node compat (zlib, child_process via jsh), real Node via WASM for big CLIs, subdomain-isolated previews.
+VFS persistence (IndexedDB/OPFS snapshots; the npm cache already persists), npm cache size cap/LRU, `import.meta.hot` API + non-React HMR, lockfile-driven installs + workspaces, PostCSS/Tailwind, more Node compat (zlib, child_process via jsh), real Node via WASM for big CLIs, subdomain-isolated previews.
 
 ## License
 

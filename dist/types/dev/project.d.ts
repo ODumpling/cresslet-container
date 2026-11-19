@@ -15,6 +15,8 @@ export interface ProjectConfig {
         targets: string[];
     }[];
     tsconfigRaw: Record<string, unknown>;
+    /** React DOM project with React JSX: enable React Fast Refresh in the dev server. */
+    refresh: boolean;
 }
 export declare function readProjectConfig(vfs: VFS, root: string): ProjectConfig;
 /** Apply tsconfig paths; returns candidate absolute paths (unresolved) or null. */

@@ -72,6 +72,8 @@ export interface ProjectConfig {
   /** tsconfig `paths` as [prefix, replacement dirs] with '*' wildcard support */
   paths: { pattern: string; targets: string[] }[]
   tsconfigRaw: Record<string, unknown>
+  /** React DOM project with React JSX: enable React Fast Refresh in the dev server. */
+  refresh: boolean
 }
 
 export function readProjectConfig(vfs: VFS, root: string): ProjectConfig {
@@ -125,6 +127,7 @@ export function readProjectConfig(vfs: VFS, root: string): ProjectConfig {
     jsxFragment: co.jsxFragmentFactory as string | undefined,
     paths,
     tsconfigRaw,
+    refresh: !!deps['react-dom'] && (classic ? !co.jsxFactory || /^React\./.test(String(co.jsxFactory)) : jsxImportSource === 'react'),
   }
 }
 
