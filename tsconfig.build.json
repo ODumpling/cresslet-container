@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "outDir": "dist/types",
+    "noEmit": false
+  },
+  "include": ["src"],
+  "exclude": ["src/node/shims", "src/sw.ts", "src/node/worker.ts", "src/node/modules", "src/node/rpc.ts"]
+}

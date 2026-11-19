@@ -1,0 +1,265 @@
+// Dependency pre-bundling (vite "optimizeDeps"-like): every bare import used by the app is bundled from
+// node_modules in ONE esbuild run with code splitting, so shared deps (react, ...) exist exactly once.
+// CJS entries get named exports via cjs-module-lexer. Served at /@modules/<spec>, chunks at /@modules/chunk-*.js.
+import type { Plugin } from 'esbuild-wasm'
+import { parse as lexCjs } from 'cjs-lexer-js'
+import type { VFS } from '../vfs'
+import { bundleVfs, loadEsbuild, type VfsPluginOptions } from '../esbuild'
+import { BROWSER_OPTS, resolveModule, type ResolveFs } from '../resolve'
+import { isEsmFile } from '../esm'
+import { dirname } from '../path'
+
+const RESERVED = new Set(
+  'break case catch class const continue debugger default delete do else enum export extends false finally for function if import in instanceof new null return super switch this throw true try typeof var void while with yield let static implements interface package private protected public await arguments eval'.split(' '),
+)
+const IDENT = /^[A-Za-z_$][\w$]*$/
+
+export interface DepsResult {
+  id: number
+  /** spec -> output text */
+  entries: Map<string, string>
+  /** chunk file name -> text */
+  chunks: Map<string, string>
+  errors: Map<string, string>
+}
+
+export class DepOptimizer {
+  private specs = new Set<string>()
+  private current: Promise<DepsResult> | null = null
+  private builtFor = new Set<string>()
+  private buildId = 0
+  private timer: ReturnType<typeof setTimeout> | null = null
+  private pendingResolve: ((r: Promise<DepsResult>) => void)[] = []
+  /** Called when already-served modules became stale (page must reload). */
+  onStale?: () => void
+  private lastServed = 0
+
+  constructor(
+    private vfs: VFS,
+    private fs: ResolveFs,
+    private root: string,
+    private opts: { wasmURL?: string; define: Record<string, string>; conditions?: string[] },
+  ) {}
+
+  has(spec: string): boolean {
+    return this.specs.has(spec)
+  }
+
+  /** Add specs (e.g. from the initial scan) without serving. */
+  add(specs: Iterable<string>): void {
+    let changed = false
+    for (const s of specs) if (!this.specs.has(s)) (this.specs.add(s), (changed = true))
+    if (changed) this.schedule()
+  }
+
+  invalidate(): void {
+    this.current = null
+    this.builtFor.clear()
+    this.lastServed = 0
+  }
+
+  async get(spec: string): Promise<{ code: string } | { error: string }> {
+    if (!this.specs.has(spec)) {
+      this.specs.add(spec)
+      this.schedule()
+    }
+    const r = await this.result()
+    this.markServed(r.id)
+    const code = r.entries.get(spec)
+    return code !== undefined ? { code } : { error: r.errors.get(spec) ?? `failed to pre-bundle ${spec}` }
+  }
+
+  async chunk(name: string): Promise<string | undefined> {
+    const r = await this.result()
+    this.markServed(r.id)
+    return r.chunks.get(name)
+  }
+
+  private markServed(id: number) {
+    if (this.lastServed && this.lastServed !== id) this.onStale?.()
+    this.lastServed = id
+  }
+
+  private result(): Promise<DepsResult> {
+    const missing = [...this.specs].some((s) => !this.builtFor.has(s))
+    if (this.current && !missing && !this.timer) return this.current
+    return new Promise((resolve) => {
+      this.pendingResolve.push((p) => resolve(p))
+      this.schedule()
+    })
+  }
+
+  private schedule() {
+    if (this.timer) return
+    this.timer = setTimeout(() => {
+      this.timer = null
+      const specs = [...this.specs]
+      const p = this.build(specs)
+      this.current = p
+      for (const s of specs) this.builtFor.add(s)
+      for (const r of this.pendingResolve.splice(0)) r(p)
+    }, 25)
+  }
+
+  private async build(specs: string[]): Promise<DepsResult> {
+    const id = ++this.buildId
+    const errors = new Map<string, string>()
+    const ropts = { ...BROWSER_OPTS, conditions: this.opts.conditions ?? BROWSER_OPTS.conditions }
+    const entryPoints: { in: string; out: string }[] = []
+    const virtual = new Map<string, string>()
+    for (const spec of specs) {
+      if (spec.endsWith('.css')) continue
+      let file: string | false
+      try {
+        file = resolveModule(this.fs, spec, this.root, ropts)
+      } catch (e) {
+        errors.set(spec, `Failed to resolve import "${spec}". Is it installed? (npm install ${spec.split('/').slice(0, spec.startsWith('@') ? 2 : 1).join('/')})`)
+        continue
+      }
+      if (file === false) {
+        virtual.set(spec, 'export default {}')
+        entryPoints.push({ in: `clover-dep:${spec}`, out: spec })
+        continue
+      }
+      const code = this.vfs.readText(file)
+      if (isEsmFile(this.fs, file, code)) entryPoints.push({ in: file, out: spec })
+      else {
+        const names = await this.cjsExports(file, ropts)
+        const named = [...names].filter((n) => IDENT.test(n) && !RESERVED.has(n) && n !== '__esModule')
+        virtual.set(
+          spec,
+          `import * as __m from ${JSON.stringify(file)};\nexport default (__m.default ?? __m);\n` + (named.length ? `export const { ${named.join(', ')} } = __m;\n` : ''),
+        )
+        entryPoints.push({ in: `clover-dep:${spec}`, out: spec })
+      }
+    }
+    const result: DepsResult = { id, entries: new Map(), chunks: new Map(), errors }
+    if (!entryPoints.length) return result
+    const depPlugin: Plugin = {
+      name: 'clover-deps',
+      setup(build) {
+        build.onResolve({ filter: /^clover-dep:/ }, (a) => ({ path: a.path.slice('clover-dep:'.length), namespace: 'clover-dep' }))
+        build.onLoad({ filter: /.*/, namespace: 'clover-dep' }, (a) => ({ contents: virtual.get(a.path) ?? '', loader: 'js', resolveDir: '/' }))
+        // CSS imported from JS inside deps: inject as <style>
+        build.onLoad({ filter: /\.css$/, namespace: 'clover-vfs' }, async (a) => {
+          const es = await loadEsbuild()
+          const css = await es.transform(new TextDecoder().decode(vfsRead(a.path)), { loader: 'css', minify: false })
+          return {
+            contents: `const s=document.createElement('style');s.setAttribute('data-clover-dep',${JSON.stringify(a.path)});s.textContent=${JSON.stringify(css.code)};document.head.appendChild(s);`,
+            loader: 'js',
+          }
+        })
+      },
+    }
+    const vfsRead = (p: string) => this.vfs.readFile(p)
+    const vopts: VfsPluginOptions = { resolve: ropts }
+    try {
+      const out = await bundleVfs(this.vfs, {
+        cwd: this.root,
+        wasmURL: this.opts.wasmURL,
+        entryPoints,
+        outdir: '/@modules',
+        splitting: true,
+        format: 'esm',
+        target: 'es2022',
+        chunkNames: 'chunk-[hash]',
+        define: { 'process.env.NODE_ENV': JSON.stringify(this.opts.define['process.env.NODE_ENV'] ? JSON.parse(this.opts.define['process.env.NODE_ENV']) : 'development'), global: 'globalThis', ...this.opts.define },
+        loader: { '.png': 'dataurl', '.jpg': 'dataurl', '.jpeg': 'dataurl', '.gif': 'dataurl', '.svg': 'dataurl', '.webp': 'dataurl', '.woff': 'dataurl', '.woff2': 'dataurl', '.ttf': 'dataurl' },
+        metafile: true,
+        plugins: [depPlugin],
+        vfsPlugin: vopts,
+        logLevel: 'silent',
+      })
+      const byOut = new Map(entryPoints.map((e) => [`/@modules/${e.out}.js`, e.out]))
+      for (const f of out.outputFiles) {
+        const spec = byOut.get(f.path)
+        if (spec !== undefined) result.entries.set(spec, f.text)
+        else if (f.path.endsWith('.js')) result.chunks.set(f.path.slice(f.path.lastIndexOf('/') + 1), f.text)
+      }
+    } catch (e) {
+      const { formatErrors } = await import('../esbuild')
+      const msg = `Pre-bundling dependencies failed:\n${formatErrors(e)}`
+      for (const ep of entryPoints) errors.set(ep.out, msg)
+    }
+    return result
+  }
+
+  /** Named exports of a CJS module, following `module.exports = require(...)` re-exports. */
+  private async cjsExports(file: string, ropts: typeof BROWSER_OPTS, depth = 0, seen = new Set<string>()): Promise<Set<string>> {
+    const names = new Set<string>()
+    if (depth > 8 || seen.has(file)) return names
+    seen.add(file)
+    let code = this.vfs.readText(file)
+    try {
+      // resolve NODE_ENV branches first (react's index.js picks dev/prod build)
+      const es = await loadEsbuild(this.opts.wasmURL)
+      code = (await es.transform(code, { define: { 'process.env.NODE_ENV': '"development"' }, minifySyntax: true, loader: 'js', logLevel: 'silent' })).code
+    } catch {
+      /* lex the raw code */
+    }
+    let lexed: { exports: string[]; reexports: string[] }
+    try {
+      lexed = lexCjs(code)
+    } catch {
+      return names
+    }
+    for (const n of lexed.exports) names.add(n)
+    for (const r of lexed.reexports) {
+      try {
+        const f = resolveModule(this.fs, r, dirname(file), ropts)
+        if (f) for (const n of await this.cjsExports(f, ropts, depth + 1, seen)) names.add(n)
+      } catch {
+        /* ignore */
+      }
+    }
+    return names
+  }
+}
+
+/** Collect bare imports reachable from entry files (vite-like dependency scan). */
+export async function scanImports(vfs: VFS, root: string, entries: string[], opts: { wasmURL?: string; jsx?: Record<string, string>; resolveLocal: (spec: string, importer: string) => string | null }): Promise<Set<string>> {
+  const found = new Set<string>()
+  const plugin: Plugin = {
+    name: 'clover-scan',
+    setup(build) {
+      build.onResolve({ filter: /.*/ }, (a) => {
+        if (a.kind === 'entry-point') return { path: a.path, namespace: 'scan' }
+        if (/^(https?:|data:|\/\/|\/@)/.test(a.path)) return { path: a.path, external: true }
+        const local = opts.resolveLocal(a.path, a.importer)
+        if (local === null) {
+          if (!/\.(css|scss|sass|less)$/.test(a.path)) found.add(a.path.split('?')[0])
+          return { path: a.path, external: true }
+        }
+        if (!/\.(m?[jt]sx?|cjs|cts|mts)$/.test(local)) return { path: local, external: true }
+        return { path: local, namespace: 'scan' }
+      })
+      build.onLoad({ filter: /.*/, namespace: 'scan' }, (a) => {
+        const ext = a.path.slice(a.path.lastIndexOf('.'))
+        return {
+          contents: vfs.tryReadText(a.path) ?? '',
+          loader: ext === '.tsx' ? 'tsx' : ext === '.ts' || ext === '.mts' || ext === '.cts' ? 'ts' : ext === '.jsx' ? 'jsx' : 'jsx',
+          resolveDir: dirname(a.path),
+        }
+      })
+    },
+  }
+  try {
+    const es = await loadEsbuild(opts.wasmURL)
+    await es.build({
+      entryPoints: entries.filter((e) => vfs.isFile(e)),
+      bundle: true,
+      write: false,
+      format: 'esm',
+      outdir: '/__scan__',
+      jsx: 'automatic',
+      ...opts.jsx,
+      plugins: [plugin],
+      logLevel: 'silent',
+      absWorkingDir: root,
+    })
+  } catch {
+    /* best effort */
+  }
+  return found
+}
+
