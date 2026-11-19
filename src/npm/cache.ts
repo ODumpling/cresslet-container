@@ -54,8 +54,9 @@ export class IdbCache implements PackageCache {
         }
         req.onsuccess = () => {
           const db = req.result
-          // the fallback already resolved: an unused open connection would block deleteDatabase / version bumps
-          if (settled) return db.close()
+          // the fallback already resolved: an unused open connection would block deleteDatabase / version bumps;
+          // drop the null result so the next operation reopens instead of staying cache-less until reload
+          if (settled) return db.close(), drop()
           db.onversionchange = () => (db.close(), drop())
           db.onclose = drop
           done(db)
@@ -74,10 +75,17 @@ export class IdbCache implements PackageCache {
     const db = await this.open()
     if (!db) return undefined
     return new Promise<T | undefined>((resolve) => {
+      let t: IDBTransaction | undefined
       const done = (v: T | undefined) => (clearTimeout(timer), resolve(v))
-      const timer = setTimeout(() => resolve(undefined), OP_TIMEOUT) // a stuck transaction is a miss / no-op
+      // a stuck transaction is a miss / no-op, and is aborted so a late put/delete can't commit after we gave up
+      const timer = setTimeout(() => {
+        resolve(undefined)
+        try {
+          t?.abort()
+        } catch {}
+      }, OP_TIMEOUT)
       try {
-        const t = db.transaction(store, mode)
+        t = db.transaction(store, mode)
         const req = fn(t.objectStore(store))
         t.oncomplete = () => done(req.result as T)
         t.onerror = t.onabort = () => done(undefined)
@@ -104,19 +112,22 @@ export interface Digest {
   token: string
   algo: keyof typeof ALGOS
   hash: string
+  /** every hash given for `algo` (SRI: matching any one of them passes); `hash` is the first */
+  hashes: string[]
   /** WebCrypto algorithm name */
   subtle: string
 }
 
-/** The one integrity token used for both cache keying and verification: the strongest supported hash (SRI rules). */
+/** The strongest supported algorithm (SRI rules): its first token keys the cache, all of its tokens verify. */
 export function selectDigest(integrity?: string): Digest | null {
-  let best: Digest | null = null
+  let best = null as Digest | null
   const rank = (a: string) => Object.keys(ALGOS).indexOf(a)
   for (const t of integrity?.trim().split(/\s+/) ?? []) {
     const m = /^(sha512|sha384|sha256|sha1)-([A-Za-z0-9+/=_-]+)/.exec(t) // drops SRI `?options`
     if (!m) continue
     const algo = m[1] as Digest['algo']
-    if (!best || rank(algo) < rank(best.algo)) best = { token: `${algo}-${m[2]}`, algo, hash: m[2], subtle: ALGOS[algo] }
+    if (best?.algo === algo) best.hashes.push(m[2])
+    else if (!best || rank(algo) < rank(best.algo)) best = { token: `${algo}-${m[2]}`, algo, hash: m[2], hashes: [m[2]], subtle: ALGOS[algo] }
   }
   return best
 }

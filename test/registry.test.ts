@@ -134,6 +134,25 @@ describe('HttpRegistry persistent cache', () => {
     expect(tarballKey(url, integrity)).toBe(sri(body))
   })
 
+  it('accepts a tarball matching any of several strongest-algorithm digests (SRI)', async () => {
+    const b = base()
+    const url = `${b}/a/-/a-1.0.0.tgz`
+    const other = 'sha512-' + createHash('sha512').update('other').digest('base64')
+    const integrity = `${other} ${sri(body)}`
+    mockFetch({ [url]: () => new Response(body) })
+    const cache = new MemoryCache()
+    expect(await new HttpRegistry(b, { cache }).tarball(url, integrity)).toEqual(body)
+    expect(selectDigest(integrity)?.token).toBe(other) // keyed by one chosen token
+    await Promise.resolve()
+    // served from the cache on reload, verified against every sha512 token
+    mockFetch({})
+    expect(await new HttpRegistry(b, { cache }).tarball(url, integrity)).toEqual(body)
+    // a weaker matching digest does not rescue a failing strongest set
+    mockFetch({ [url]: () => new Response(body) })
+    const sha256 = 'sha256-' + createHash('sha256').update(body).digest('base64')
+    await expect(new HttpRegistry(b, { cache: null }).tarball(url, `${other} ${sha256}`)).rejects.toThrow(/integrity/)
+  })
+
   it('keys by URL when the digest cannot be verified (no WebCrypto)', async () => {
     const b = base()
     const url = `${b}/a/-/a-1.0.0.tgz`

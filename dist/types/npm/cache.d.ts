@@ -32,10 +32,12 @@ export interface Digest {
     token: string;
     algo: keyof typeof ALGOS;
     hash: string;
+    /** every hash given for `algo` (SRI: matching any one of them passes); `hash` is the first */
+    hashes: string[];
     /** WebCrypto algorithm name */
     subtle: string;
 }
-/** The one integrity token used for both cache keying and verification: the strongest supported hash (SRI rules). */
+/** The strongest supported algorithm (SRI rules): its first token keys the cache, all of its tokens verify. */
 export declare function selectDigest(integrity?: string): Digest | null;
 /** Whether a digest can actually be checked here (WebCrypto is missing on insecure origins). */
 export declare const canVerify: (d: Digest | null) => d is Digest;

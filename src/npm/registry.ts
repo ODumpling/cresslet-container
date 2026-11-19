@@ -165,11 +165,11 @@ async function fetchRetry(url: string, init?: RequestInit, tries = 3): Promise<R
   }
 }
 
-/** Checks `buf` against the selected digest; a no-op when there is none or it can't be checked (tarballs are then keyed by URL). */
+/** Checks `buf` against the selected digests (any may match); a no-op when there is none or it can't be checked (tarballs are then keyed by URL). */
 async function verify(buf: Uint8Array, digest: Digest | null, url: string): Promise<void> {
   if (!canVerify(digest)) return
   const bytes = new Uint8Array(await crypto.subtle.digest(digest.subtle, buf as BufferSource))
   let s = ''
   for (const b of bytes) s += String.fromCharCode(b)
-  if (btoa(s) !== digest.hash) throw new Error(`integrity check failed for ${url}`)
+  if (!digest.hashes.includes(btoa(s))) throw new Error(`integrity check failed for ${url}`)
 }

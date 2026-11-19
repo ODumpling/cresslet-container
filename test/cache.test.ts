@@ -10,6 +10,7 @@ interface FakeDb {
 }
 function fakeIndexedDb(o: { openDelay?: number; hangTx?: () => boolean } = {}) {
   const dbs: FakeDb[] = []
+  const txs: { aborted: boolean }[] = []
   const data = new Map<string, unknown>()
   const factory = {
     open() {
@@ -25,9 +26,12 @@ function fakeIndexedDb(o: { openDelay?: number; hangTx?: () => boolean } = {}) {
         transaction() {
           if (db.closed) throw new Error('InvalidStateError')
           const t: Record<string, (() => void) | null> = { oncomplete: null, onerror: null, onabort: null }
+          const rec = { aborted: false }
+          txs.push(rec)
           const finish = () => !o.hangTx?.() && setTimeout(() => t.oncomplete?.(), 0)
           const r = (result?: unknown) => (finish(), { result })
           return Object.assign(t, {
+            abort: () => ((rec.aborted = true), t.onabort?.()),
             objectStore: () => ({
               get: (k: string) => r(data.get(k)),
               put: (v: unknown, k: string) => (data.set(k, v), r()),
@@ -45,7 +49,7 @@ function fakeIndexedDb(o: { openDelay?: number; hangTx?: () => boolean } = {}) {
     },
   }
   vi.stubGlobal('indexedDB', factory)
-  return { dbs }
+  return { dbs, txs }
 }
 
 afterEach(() => {
@@ -86,6 +90,25 @@ describe('IdbCache connection lifecycle', () => {
     await vi.advanceTimersByTimeAsync(10_000)
     expect(dbs[0].closed).toBe(true)
   })
+
+  it('reopens on the next operation after a late first open (not memory-only until reload)', async () => {
+    vi.useFakeTimers()
+    const o = { openDelay: 10_000 }
+    const { dbs } = fakeIndexedDb(o)
+    const c = new IdbCache()
+    const miss = c.get('tarballs', 'k')
+    await vi.advanceTimersByTimeAsync(3001)
+    expect(await miss).toBeUndefined()
+    await vi.advanceTimersByTimeAsync(10_000)
+    o.openDelay = 0
+    const put = c.put('tarballs', 'k', 1)
+    await vi.advanceTimersByTimeAsync(1)
+    await put
+    expect(dbs.length).toBe(2)
+    const get = c.get('tarballs', 'k')
+    await vi.advanceTimersByTimeAsync(1)
+    expect(await get).toBe(1)
+  })
 })
 
 describe('IdbCache transaction timeout', () => {
@@ -105,5 +128,15 @@ describe('IdbCache transaction timeout', () => {
     expect(settled).toBe(false)
     await vi.advanceTimersByTimeAsync(20)
     expect(await all).toEqual([undefined, undefined, undefined])
+  })
+
+  it('aborts a timed-out transaction so it cannot commit later', async () => {
+    vi.useFakeTimers()
+    const { txs } = fakeIndexedDb({ hangTx: () => true })
+    const c = new IdbCache()
+    const put = c.put('tarballs', 'k', 1)
+    await vi.advanceTimersByTimeAsync(OP_TIMEOUT + 10)
+    await put
+    expect(txs).toEqual([{ aborted: true }])
   })
 })
