@@ -39,8 +39,9 @@
     "dev": "node scripts/build.mjs --watch",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "test:e2e": "playwright test",
-    "demo": "node scripts/serve.mjs"
+    "test:e2e": "playwright test --project=chromium",
+    "demo": "node scripts/serve.mjs",
+    "test:e2e:all": "playwright test"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

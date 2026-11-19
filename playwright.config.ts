@@ -7,6 +7,11 @@ export default defineConfig({
   workers: 1,
   reporter: [['list']],
   use: { baseURL: 'http://localhost:4401', ...devices['Desktop Chrome'] },
-  projects: [{ name: 'chromium', use: { browserName: 'chromium' } }],
+  // chromium is the supported target; firefox/webkit are best-effort (`pnpm test:e2e --project=firefox`)
+  projects: [
+    { name: 'chromium', use: { browserName: 'chromium' } },
+    { name: 'firefox', use: { ...devices['Desktop Firefox'] } },
+    { name: 'webkit', use: { ...devices['Desktop Safari'] } },
+  ],
   webServer: { command: 'node scripts/serve.mjs', env: { PORT: '4401' }, url: 'http://localhost:4401/', reuseExistingServer: true },
 })

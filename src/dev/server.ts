@@ -286,7 +286,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     }
     const has = (k: string) => u.searchParams.has(k)
     try {
-      if (pathname === '/@clover/client') return new Response(clientCode(channelName), { headers: JS })
+      if (pathname === '/@clover/client') return new Response(clientCode(channelName, `/__clover__/${c.instanceId}/${port}`), { headers: JS })
       if (pathname === '/@clover/last-error') return new Response(lastError, { headers: { 'content-type': 'text/plain', ...NO_CACHE } })
       if (pathname === '/@clover/empty') return new Response('export default {}', { headers: JS })
       if (pathname.startsWith('/@modules/')) {

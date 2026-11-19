@@ -48,13 +48,15 @@ test.describe.serial('clover-container demo', () => {
     await page.evaluate(() =>
       (window as unknown as Win).container.fs.writeFile(
         'src/App.tsx',
-        `export default function App() {\n  return <><h1>path:{location.pathname}</h1><button onClick={() => { history.pushState(null, '', '/deep/link'); location.reload() }}>go</button></>\n}\n`,
+        `export default function App() {\n  return <><h1>path:{location.pathname}</h1><button onClick={() => history.pushState(null, '', '/deep/link')}>go</button></>\n}\n`,
       ),
     )
     const frame = page.frameLocator('#frame')
     await expect(frame.getByRole('heading', { name: 'path:/' })).toBeVisible()
     await frame.getByRole('button', { name: 'go' }).click()
-    await expect(frame.getByRole('heading', { name: 'path:/deep/link' })).toBeVisible()
+    // live reload while on a client-side route keeps the route
+    await page.evaluate(() => (window as unknown as Win).container.fs.writeFile('src/App.tsx', `export default function App() { return <h1>route:{location.pathname}</h1> }\n`))
+    await expect(frame.getByRole('heading', { name: 'route:/deep/link' })).toBeVisible()
   })
 
   test('syntax errors show an overlay, fixing them recovers', async () => {

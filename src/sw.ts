@@ -131,13 +131,26 @@ async function navTarget(req: Request): Promise<Target | undefined> {
   const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true })
   const mapped = all.filter((c) => clientMap.has(c.id))
   if (!mapped.length) return undefined
+  // some browsers report a client's URL from before history.replaceState; compare without the prefix
+  const noHash = (x: string) => x.split('#')[0]
+  const same = (clientUrl: string, u: string) => !!u && (noHash(clientUrl) === noHash(u) || noHash(stripPrefix(clientUrl)) === noHash(u))
   if (req.destination === 'document') {
-    if (all.some((c) => !clientMap.has(c.id) && c.url === req.url)) return undefined
-    const c = mapped.find((c) => c.frameType === 'top-level' && c.url === req.url)
+    if (all.some((c) => !clientMap.has(c.id) && noHash(c.url) === noHash(req.url))) return undefined
+    const c = mapped.find((c) => c.frameType === 'top-level' && same(c.url, req.url))
     return c && clientMap.get(c.id)
   }
-  const c = mapped.find((c) => c.frameType !== 'top-level' && (c.url === req.referrer || c.url === req.url))
+  const c = mapped.find((c) => c.frameType !== 'top-level' && (same(c.url, req.referrer) || same(c.url, req.url)))
   return c && clientMap.get(c.id)
+}
+
+function stripPrefix(u: string): string {
+  try {
+    const url = new URL(u)
+    const t = parse(url.pathname)
+    return t ? url.origin + t.rest + url.search + url.hash : u
+  } catch {
+    return u
+  }
 }
 
 /** Injected first into preview HTML: hide the preview prefix from the app (routers see "/"). */
@@ -153,8 +166,12 @@ async function injectStrip(res: Response): Promise<Response> {
 }
 
 async function handleRelative(e: FetchEvent, t: Target, url: URL): Promise<Response> {
-  if (e.request.mode === 'navigate') return Response.redirect(prefixOf(t) + url.pathname + url.search + url.hash, 302)
-  return forward(e.request, t, url.pathname + url.search)
+  if (e.request.mode !== 'navigate') return forward(e.request, t, url.pathname + url.search)
+  // Serve the navigation in place (no redirect: WebKit blocks SW redirects under COEP); the new document
+  // keeps its clean URL and is attributed to the preview by its client id.
+  remember(e.resultingClientId, t)
+  const res = await forward(e.request, t, url.pathname + url.search)
+  return (res.headers.get('content-type') ?? '').includes('text/html') ? injectStrip(res) : res
 }
 
 async function findOwner(instanceId: string): Promise<Client | null> {

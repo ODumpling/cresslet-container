@@ -1,7 +1,8 @@
 // Browser-side live-reload + error overlay client, served at /@clover/client.
 
-export function clientCode(channel: string): string {
+export function clientCode(channel: string, prefix: string): string {
   return `const CH = ${JSON.stringify(channel)};
+const PREFIX = ${JSON.stringify(prefix)};
 let overlay;
 export function showOverlay(msg) {
   if (typeof document === 'undefined') return;
@@ -22,16 +23,17 @@ window.__clover_overlay = showOverlay;
 const bc = new BroadcastChannel(CH);
 bc.onmessage = (e) => {
   const m = e.data || {};
-  if (m.type === 'reload') location.reload();
+  // navigate via the preview prefix rather than location.reload(): works even when the browser can't
+  // attribute a clean (prefix-stripped) URL to this preview
+  if (m.type === 'reload') location.replace(location.pathname.startsWith(PREFIX + '/') ? location.href : PREFIX + location.pathname + location.search + location.hash);
   else if (m.type === 'error') showOverlay(m.message);
   else if (m.type === 'clear') clearOverlay();
 };
 window.addEventListener('error', (e) => {
   const msg = (e.error && e.error.stack) || e.message;
-  // a module that failed to transform breaks linking of its importers; show the real transform error instead
-  if (/does not provide an export|Failed to fetch dynamically|error loading dynamically/i.test(String(msg))) {
-    fetch('/@clover/last-error').then((r) => r.text()).then((t) => showOverlay(t || msg), () => showOverlay(msg));
-  } else showOverlay(msg);
+  // a module that failed to transform breaks linking of its importers (browser-specific messages);
+  // prefer the dev server's pending transform error when there is one
+  fetch('/@clover/last-error').then((r) => r.text()).then((t) => showOverlay(t || msg), () => showOverlay(msg));
 });
 window.addEventListener('unhandledrejection', (e) => showOverlay((e.reason && e.reason.stack) || String(e.reason)));
 `
