@@ -50,7 +50,7 @@ async function loadModule(c: Container, path: string): Promise<{ code: string; f
           sourcefile: path,
           sourcemap: 'inline',
           jsx: 'automatic',
-          define: { 'import.meta.url': '__clover_meta_url', 'import.meta.dirname': '__dirname', 'import.meta.filename': '__filename' },
+          define: { 'import.meta.url': '__cresslet_meta_url', 'import.meta.dirname': '__dirname', 'import.meta.filename': '__filename' },
           supported: { 'dynamic-import': false },
           logLevel: 'silent',
         })
@@ -80,13 +80,13 @@ async function tlaToCjs(c: Container, code: string, path: string, ext: string): 
     platform: 'node',
     target: 'es2022',
     jsx: 'automatic',
-    define: { 'import.meta.url': '__clover_meta_url', 'import.meta.dirname': '__dirname', 'import.meta.filename': '__filename' },
+    define: { 'import.meta.url': '__cresslet_meta_url', 'import.meta.dirname': '__dirname', 'import.meta.filename': '__filename' },
     plugins: [{ name: 'ext', setup: (b) => b.onResolve({ filter: /.*/ }, (a) => ({ path: a.path, external: true })) }],
     logLevel: 'silent',
   })
   let out = r.outputFiles[0].text
   const exportsList: string[] = []
-  const req = (m: string) => `__clover_ns(require(${m}))`
+  const req = (m: string) => `__cresslet_ns(require(${m}))`
   out = out
     .replace(/^import\s+(\{[^}]*\})\s+from\s+("[^"]+");?$/gm, (_, names: string, m) => `const ${names.replace(/\s+as\s+/g, ': ')} = ${req(m)};`)
     .replace(/^import\s+\*\s+as\s+([\w$]+)\s+from\s+("[^"]+");?$/gm, (_, n, m) => `const ${n} = ${req(m)};`)
@@ -95,7 +95,7 @@ async function tlaToCjs(c: Container, code: string, path: string, ext: string): 
     .replace(/^import\s+("[^"]+");?$/gm, (_, m) => `require(${m});`)
     .replace(/^export\s+\*\s+from\s+("[^"]+");?$/gm, (_, m) => `Object.assign(exports, require(${m}));`)
     .replace(/^export\s+\{([^}]*)\}\s+from\s+("[^"]+");?$/gm, (_, names: string, m) => {
-      const v = `__clover_re${exportsList.length}`
+      const v = `__cresslet_re${exportsList.length}`
       for (const n of names.split(',').map((x) => x.trim()).filter(Boolean)) {
         const [a, b = a] = n.split(/\s+as\s+/)
         exportsList.push(`${JSON.stringify(b)}: () => ${v}[${JSON.stringify(a)}]`)
@@ -109,7 +109,7 @@ async function tlaToCjs(c: Container, code: string, path: string, ext: string): 
       }
       return ''
     })
-  const helper = `function __clover_ns(m) { return m && m.__esModule ? m : Object.assign(Object.create(null), m, { default: m }); }`
+  const helper = `function __cresslet_ns(m) { return m && m.__esModule ? m : Object.assign(Object.create(null), m, { default: m }); }`
   const define = exportsList.length ? `for (const [k, g] of Object.entries({ ${exportsList.join(', ')} })) Object.defineProperty(exports, k, { get: g, enumerable: true });` : ''
   return `"use strict";\nObject.defineProperty(exports, "__esModule", { value: true });\n${helper}\nmodule.exports.__tla = (async () => {\n${out}\n${define}\n})();\n`
 }

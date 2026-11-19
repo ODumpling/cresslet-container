@@ -18,7 +18,7 @@ async function sh(page: Page, line: string): Promise<{ code: number; out: string
   }, line)
 }
 
-test.describe.serial('clover-container demo', () => {
+test.describe.serial('cresslet-container demo', () => {
   let page: Page
 
   test.beforeAll(async ({ browser }) => {
@@ -30,7 +30,7 @@ test.describe.serial('clover-container demo', () => {
   test('npm install + dev server renders the React app in the preview iframe', async () => {
     await expect.poll(() => page.evaluate(() => crossOriginIsolated)).toBe(true)
     const frame = page.frameLocator('#frame')
-    await expect(frame.getByRole('heading', { name: 'Hello from Clover' })).toBeVisible({ timeout: 120_000 })
+    await expect(frame.getByRole('heading', { name: 'Hello from Cresslet' })).toBeVisible({ timeout: 120_000 })
     await frame.getByRole('button', { name: 'count is 0' }).click()
     await expect(frame.getByRole('button', { name: 'count is 1' })).toBeVisible()
     // styles from `import './index.css'` applied
@@ -61,7 +61,7 @@ test.describe.serial('clover-container demo', () => {
 
   test('syntax errors show an overlay, fixing them recovers', async () => {
     await page.evaluate(() => (window as unknown as Win).container.fs.writeFile('src/App.tsx', `export default function App() { return <h1>broken</h1 }\n`))
-    await expect(page.frameLocator('#frame').locator('clover-error-overlay pre')).toContainText('App.tsx')
+    await expect(page.frameLocator('#frame').locator('cresslet-error-overlay pre')).toContainText('App.tsx')
     await page.evaluate(() => (window as unknown as Win).container.fs.writeFile('src/App.tsx', `export default function App() { return <h1>Fixed</h1> }\n`))
     await expect(page.frameLocator('#frame').getByRole('heading', { name: 'Fixed' })).toBeVisible()
   })
@@ -137,13 +137,13 @@ test.describe.serial('clover-container demo', () => {
     expect(keys).not.toContain('node_modules')
     expect(keys).not.toContain('dist')
     await page.evaluate(() =>
-      (window as unknown as Win).container.registerCommand('clover', async (ctx) => {
-        ctx.stdout.write(`clover ${ctx.args.join(' ')} in ${ctx.cwd}\n`)
+      (window as unknown as Win).container.registerCommand('cresslet', async (ctx) => {
+        ctx.stdout.write(`cresslet ${ctx.args.join(' ')} in ${ctx.cwd}\n`)
         return 3
       }),
     )
-    const r = await sh(page, 'cd src && clover deploy --prod')
-    expect(r).toEqual({ code: 3, out: 'clover deploy --prod in /home/project/src\n' })
+    const r = await sh(page, 'cd src && cresslet deploy --prod')
+    expect(r).toEqual({ code: 3, out: 'cresslet deploy --prod in /home/project/src\n' })
   })
 
   test('interactive jsh: Ctrl+C stops the foreground dev server and returns to the prompt', async () => {

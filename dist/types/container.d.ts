@@ -8,7 +8,7 @@ import { type BuildOptions as EsbuildOptions } from './esbuild';
 import { type DevServerHandle, type DevServerOptions } from './dev/server';
 import { type BuildOptions } from './build/build';
 export interface BootOptions {
-    /** Service worker URL served by the host at its origin root. Default '/clover-sw.js'. `false` disables previews. */
+    /** Service worker URL served by the host at its origin root. Default '/cresslet-sw.js'. `false` disables previews. */
     serviceWorkerUrl?: string | false;
     /** esbuild.wasm URL (must match esbuild-wasm version). Default: jsDelivr. */
     esbuildWasmUrl?: string;

@@ -118,7 +118,7 @@ export class DepOptimizer {
       }
       if (file === false) {
         virtual.set(spec, 'export default {}')
-        entryPoints.push({ in: `clover-dep:${spec}`, out: spec })
+        entryPoints.push({ in: `cresslet-dep:${spec}`, out: spec })
         continue
       }
       const code = this.vfs.readText(file)
@@ -130,22 +130,22 @@ export class DepOptimizer {
           spec,
           `import * as __m from ${JSON.stringify(file)};\nexport default (__m.default ?? __m);\n` + (named.length ? `export const { ${named.join(', ')} } = __m;\n` : ''),
         )
-        entryPoints.push({ in: `clover-dep:${spec}`, out: spec })
+        entryPoints.push({ in: `cresslet-dep:${spec}`, out: spec })
       }
     }
     const result: DepsResult = { id, entries: new Map(), chunks: new Map(), errors }
     if (!entryPoints.length) return result
     const depPlugin: Plugin = {
-      name: 'clover-deps',
+      name: 'cresslet-deps',
       setup(build) {
-        build.onResolve({ filter: /^clover-dep:/ }, (a) => ({ path: a.path.slice('clover-dep:'.length), namespace: 'clover-dep' }))
-        build.onLoad({ filter: /.*/, namespace: 'clover-dep' }, (a) => ({ contents: virtual.get(a.path) ?? '', loader: 'js', resolveDir: '/' }))
+        build.onResolve({ filter: /^cresslet-dep:/ }, (a) => ({ path: a.path.slice('cresslet-dep:'.length), namespace: 'cresslet-dep' }))
+        build.onLoad({ filter: /.*/, namespace: 'cresslet-dep' }, (a) => ({ contents: virtual.get(a.path) ?? '', loader: 'js', resolveDir: '/' }))
         // CSS imported from JS inside deps: inject as <style>
-        build.onLoad({ filter: /\.css$/, namespace: 'clover-vfs' }, async (a) => {
+        build.onLoad({ filter: /\.css$/, namespace: 'cresslet-vfs' }, async (a) => {
           const es = await loadEsbuild()
           const css = await es.transform(new TextDecoder().decode(vfsRead(a.path)), { loader: 'css', minify: false })
           return {
-            contents: `const s=document.createElement('style');s.setAttribute('data-clover-dep',${JSON.stringify(a.path)});s.textContent=${JSON.stringify(css.code)};document.head.appendChild(s);`,
+            contents: `const s=document.createElement('style');s.setAttribute('data-cresslet-dep',${JSON.stringify(a.path)});s.textContent=${JSON.stringify(css.code)};document.head.appendChild(s);`,
             loader: 'js',
           }
         })
@@ -220,7 +220,7 @@ export class DepOptimizer {
 export async function scanImports(vfs: VFS, root: string, entries: string[], opts: { wasmURL?: string; jsx?: Record<string, string>; resolveLocal: (spec: string, importer: string) => string | null }): Promise<Set<string>> {
   const found = new Set<string>()
   const plugin: Plugin = {
-    name: 'clover-scan',
+    name: 'cresslet-scan',
     setup(build) {
       build.onResolve({ filter: /.*/ }, (a) => {
         if (a.kind === 'entry-point') return { path: a.path, namespace: 'scan' }

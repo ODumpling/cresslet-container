@@ -1,4 +1,4 @@
-// clover-sw.js — serves preview URLs /__clover__/<instanceId>/<port>/<path> by forwarding requests to the
+// cresslet-sw.js — serves preview URLs /__cresslet__/<instanceId>/<port>/<path> by forwarding requests to the
 // page that owns the container. Root-relative subresources from inside a preview (e.g. /src/main.tsx) are
 // mapped back to their preview via the requesting client id (remembered per document, persisted in Cache
 // Storage so SW restarts keep working), falling back to the Referer.
@@ -6,8 +6,8 @@
 export {}
 declare const self: ServiceWorkerGlobalScope
 
-const PREFIX = '/__clover__/'
-const STORE = 'clover-sw-clients-v1'
+const PREFIX = '/__cresslet__/'
+const STORE = 'cresslet-sw-clients-v1'
 interface Target {
   instanceId: string
   port: number
@@ -36,13 +36,13 @@ function remember(clientId: string, t: Target) {
   clientMap.set(clientId, t)
   caches
     .open(STORE)
-    .then((c) => c.put(`/__clover_clients__/${encodeURIComponent(clientId)}`, new Response(JSON.stringify(t))))
+    .then((c) => c.put(`/__cresslet_clients__/${encodeURIComponent(clientId)}`, new Response(JSON.stringify(t))))
     .catch(() => {})
 }
 
 function parse(pathname: string): (Target & { rest: string }) | null {
   if (!pathname.startsWith(PREFIX)) return null
-  const m = /^\/__clover__\/([^/]+)\/(\d+)(\/.*)?$/.exec(pathname)
+  const m = /^\/__cresslet__\/([^/]+)\/(\d+)(\/.*)?$/.exec(pathname)
   if (!m) return null
   return { instanceId: m[1], port: Number(m[2]), rest: m[3] || '/' }
 }
@@ -71,7 +71,7 @@ self.addEventListener('activate', (e) => {
       for (const id of [...clientMap.keys()]) {
         if (!alive.has(id)) {
           clientMap.delete(id)
-          cache?.delete(`/__clover_clients__/${encodeURIComponent(id)}`)
+          cache?.delete(`/__cresslet_clients__/${encodeURIComponent(id)}`)
         }
       }
     })(),
@@ -80,9 +80,9 @@ self.addEventListener('activate', (e) => {
 
 self.addEventListener('message', (e) => {
   const d = e.data
-  if (d?.type === 'clover-register' && e.source && 'id' in e.source) owners.set(d.instanceId, (e.source as Client).id)
-  else if (d?.type === 'clover-unregister') owners.delete(d.instanceId)
-  else if (d?.type === 'clover-ping') e.ports[0]?.postMessage({ type: 'clover-pong' })
+  if (d?.type === 'cresslet-register' && e.source && 'id' in e.source) owners.set(d.instanceId, (e.source as Client).id)
+  else if (d?.type === 'cresslet-unregister') owners.delete(d.instanceId)
+  else if (d?.type === 'cresslet-ping') e.ports[0]?.postMessage({ type: 'cresslet-pong' })
 })
 
 self.addEventListener('fetch', (e) => {
@@ -122,7 +122,7 @@ self.addEventListener('fetch', (e) => {
 })
 
 /**
- * Previews strip their /__clover__/<id>/<port> prefix from location (see STRIP_SCRIPT), so a full navigation
+ * Previews strip their /__cresslet__/<id>/<port> prefix from location (see STRIP_SCRIPT), so a full navigation
  * inside a preview (link click, reload) arrives as a plain same-origin URL. Attribute it to the preview whose
  * document is being navigated: for frames, the mapped client whose URL is the referrer (link) or the URL itself
  * (reload); for top-level tabs, only reloads, and only when no unmapped (host) window shows the same URL.
@@ -154,7 +154,7 @@ function stripPrefix(u: string): string {
 }
 
 /** Injected first into preview HTML: hide the preview prefix from the app (routers see "/"). */
-const STRIP_SCRIPT = `<script>(function(){var l=location,m=/^\\/__clover__\\/[^/]+\\/\\d+/.exec(l.pathname);if(m)history.replaceState(history.state,'',(l.pathname.slice(m[0].length)||'/')+l.search+l.hash)})()</script>`
+const STRIP_SCRIPT = `<script>(function(){var l=location,m=/^\\/__cresslet__\\/[^/]+\\/\\d+/.exec(l.pathname);if(m)history.replaceState(history.state,'',(l.pathname.slice(m[0].length)||'/')+l.search+l.hash)})()</script>`
 
 async function injectStrip(res: Response): Promise<Response> {
   const html = await res.text()
@@ -192,7 +192,7 @@ async function findOwner(instanceId: string): Promise<Client | null> {
             clearTimeout(timer)
             resolve(ev.data?.owns ? c : null)
           }
-          c.postMessage({ type: 'clover-who', instanceId }, [ch.port2])
+          c.postMessage({ type: 'cresslet-who', instanceId }, [ch.port2])
         }),
     ),
   )
@@ -212,12 +212,12 @@ function isolate(headers: [string, string][], t: Target): Headers {
 
 async function forward(req: Request, t: Target, path: string): Promise<Response> {
   const client = await findOwner(t.instanceId)
-  if (!client) return new Response(`Clover preview ${t.instanceId}:${t.port} is not running (owning page closed?)`, { status: 503, headers: { 'content-type': 'text/plain' } })
+  if (!client) return new Response(`Cresslet preview ${t.instanceId}:${t.port} is not running (owning page closed?)`, { status: 503, headers: { 'content-type': 'text/plain' } })
   const body = req.method === 'GET' || req.method === 'HEAD' ? null : await req.arrayBuffer()
   const ch = new MessageChannel()
   const headers: [string, string][] = []
   req.headers.forEach((v, k) => headers.push([k, v]))
-  client.postMessage({ type: 'clover-request', instanceId: t.instanceId, port: t.port, path, method: req.method, headers, body }, body ? [ch.port2, body] : [ch.port2])
+  client.postMessage({ type: 'cresslet-request', instanceId: t.instanceId, port: t.port, path, method: req.method, headers, body }, body ? [ch.port2, body] : [ch.port2])
   return new Promise<Response>((resolve) => {
     let ctrl: ReadableStreamDefaultController<Uint8Array> | null = null
     let headed = false

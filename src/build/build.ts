@@ -18,7 +18,7 @@ const PROD_RESOLVE = { ...BROWSER_OPTS, conditions: ['browser', 'import', 'modul
 
 export function pathsPlugin(c: Container, cfg: ProjectConfig): Plugin {
   return {
-    name: 'clover-tsconfig-paths',
+    name: 'cresslet-tsconfig-paths',
     setup(build) {
       if (!cfg.paths.length) return
       build.onResolve({ filter: /.*/ }, (a) => {
@@ -27,7 +27,7 @@ export function pathsPlugin(c: Container, cfg: ProjectConfig): Plugin {
         for (const cand of cands) {
           try {
             const r = resolveModule(c.resolveFs, cand, '/', PROD_RESOLVE)
-            if (r) return { path: r, namespace: 'clover-vfs' }
+            if (r) return { path: r, namespace: 'cresslet-vfs' }
           } catch {
             /* next */
           }
@@ -102,7 +102,7 @@ export async function build(c: Container, o: BuildOptions = {}): Promise<{ files
   for (const [out, meta] of Object.entries(result.metafile!.outputs)) {
     if (!meta.entryPoint) continue
     const absOut = out.startsWith('/') ? out : normalize(join(root, out))
-    const entryAbs = meta.entryPoint.replace(/^clover-vfs:/, '')
+    const entryAbs = meta.entryPoint.replace(/^cresslet-vfs:/, '')
     const ref = entryFor.get(normalize(entryAbs.startsWith('/') ? entryAbs : join(root, entryAbs)))
     if (!ref) continue
     if (absOut.endsWith('.css')) styles[ref] = url(absOut)

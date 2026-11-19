@@ -13,7 +13,7 @@ import { build, type BuildOptions } from './build/build'
 import { dirname, join, normalize, resolve } from './path'
 
 export interface BootOptions {
-  /** Service worker URL served by the host at its origin root. Default '/clover-sw.js'. `false` disables previews. */
+  /** Service worker URL served by the host at its origin root. Default '/cresslet-sw.js'. `false` disables previews. */
   serviceWorkerUrl?: string | false
   /** esbuild.wasm URL (must match esbuild-wasm version). Default: jsDelivr. */
   esbuildWasmUrl?: string
@@ -99,7 +99,7 @@ export class Container {
   /** Boot a container. Registers the preview service worker (unless disabled). */
   static async boot(opts: BootOptions = {}): Promise<Container> {
     const c = new Container(opts)
-    if (opts.serviceWorkerUrl !== false) await c.connectServiceWorker(opts.serviceWorkerUrl ?? '/clover-sw.js')
+    if (opts.serviceWorkerUrl !== false) await c.connectServiceWorker(opts.serviceWorkerUrl ?? '/cresslet-sw.js')
     return c
   }
 
@@ -163,7 +163,7 @@ export class Container {
   defaultEnv(): Record<string, string> {
     return {
       HOME: '/home',
-      USER: 'clover',
+      USER: 'cresslet',
       SHELL: '/bin/jsh',
       PATH: '/usr/local/bin:/usr/bin:/bin',
       TERM: 'xterm-256color',
@@ -226,7 +226,7 @@ export class Container {
 
   private runFile(file: string, ctx: CommandContext): Promise<number> {
     const head = this.vfs.readText(file).slice(0, 512)
-    const shim = /\/\/ clover-bin -> (.+)\n/.exec(head)
+    const shim = /\/\/ cresslet-bin -> (.+)\n/.exec(head)
     if (shim) return COMMANDS.node({ ...ctx, args: [resolve(dirname(file), shim[1]), ...ctx.args] })
     const shebang = head.startsWith('#!') ? head.slice(2, head.indexOf('\n')) : ''
     if (/\b(sh|bash|jsh|zsh)\b/.test(shebang)) return COMMANDS.jsh({ ...ctx, args: [file, ...ctx.args] })
@@ -280,9 +280,9 @@ export class Container {
   /** Create a runtime worker shipped next to this module (dist/node-worker.js). */
   createWorker(_name: 'node-worker.js'): Worker {
     const url = new URL('./node-worker.js', import.meta.url)
-    if (typeof location === 'undefined' || url.origin === location.origin) return new Worker(url, { type: 'module', name: 'clover-node' })
+    if (typeof location === 'undefined' || url.origin === location.origin) return new Worker(url, { type: 'module', name: 'cresslet-node' })
     const blob = new Blob([`import ${JSON.stringify(url.href)};`], { type: 'text/javascript' })
-    return new Worker(URL.createObjectURL(blob), { type: 'module', name: 'clover-node' })
+    return new Worker(URL.createObjectURL(blob), { type: 'module', name: 'cresslet-node' })
   }
 
   // ---------------- service worker bridge ----------------
@@ -295,8 +295,8 @@ export class Container {
     const onMessage = (ev: MessageEvent) => {
       const m = ev.data
       if (!m || typeof m !== 'object') return
-      if (m.type === 'clover-who') ev.ports[0]?.postMessage({ owns: m.instanceId === this.instanceId })
-      else if (m.type === 'clover-request' && m.instanceId === this.instanceId && ev.ports[0]) void this.ports.answer(m as SwRequest, ev.ports[0])
+      if (m.type === 'cresslet-who') ev.ports[0]?.postMessage({ owns: m.instanceId === this.instanceId })
+      else if (m.type === 'cresslet-request' && m.instanceId === this.instanceId && ev.ports[0]) void this.ports.answer(m as SwRequest, ev.ports[0])
     }
     sw.addEventListener('message', onMessage)
     sw.startMessages()
@@ -304,8 +304,8 @@ export class Container {
     try {
       const reg = await sw.register(url, { scope: '/' })
       const active = reg.active ?? (await waitActive(reg))
-      active.postMessage({ type: 'clover-register', instanceId: this.instanceId })
-      this.cleanups.push(() => active.postMessage({ type: 'clover-unregister', instanceId: this.instanceId }))
+      active.postMessage({ type: 'cresslet-register', instanceId: this.instanceId })
+      this.cleanups.push(() => active.postMessage({ type: 'cresslet-unregister', instanceId: this.instanceId }))
     } catch (e) {
       this.emit('error', { message: `Service worker registration failed (${url}): ${e instanceof Error ? e.message : e}` })
     }

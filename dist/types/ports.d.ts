@@ -1,12 +1,12 @@
 export type PortHandler = (req: Request) => Promise<Response> | Response;
-export declare const PREVIEW_PREFIX = "/__clover__/";
+export declare const PREVIEW_PREFIX = "/__cresslet__/";
 export interface PortEvents {
     open(port: number, url: string): void;
     close(port: number, url: string): void;
 }
 /** Message the SW posts to pages (with a MessagePort for the reply). */
 export interface SwRequest {
-    type: 'clover-request';
+    type: 'cresslet-request';
     instanceId: string;
     port: number;
     /** Path after the port prefix, incl. query. */

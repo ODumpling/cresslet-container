@@ -1,4 +1,4 @@
-// Browser-side live-reload + error overlay client, served at /@clover/client.
+// Browser-side live-reload + error overlay client, served at /@cresslet/client.
 
 export function clientCode(channel: string, prefix: string): string {
   return `const CH = ${JSON.stringify(channel)};
@@ -7,7 +7,7 @@ let overlay;
 export function showOverlay(msg) {
   if (typeof document === 'undefined') return;
   if (!overlay) {
-    overlay = document.createElement('clover-error-overlay');
+    overlay = document.createElement('cresslet-error-overlay');
     const root = overlay.attachShadow({ mode: 'open' });
     root.innerHTML = '<style>:host{position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.66);display:flex;align-items:flex-start;justify-content:center;font:13px/1.5 ui-monospace,Menlo,monospace}'
       + '.box{margin:6vh 16px;max-width:960px;width:100%;max-height:80vh;overflow:auto;background:#181818;color:#eee;border-top:6px solid #ff5555;border-radius:6px;padding:20px 24px;box-shadow:0 10px 40px #000a}'
@@ -19,7 +19,7 @@ export function showOverlay(msg) {
   if (!overlay.isConnected) (document.body || document.documentElement).appendChild(overlay);
 }
 export function clearOverlay() { overlay?.remove(); }
-window.__clover_overlay = showOverlay;
+window.__cresslet_overlay = showOverlay;
 const bc = new BroadcastChannel(CH);
 bc.onmessage = (e) => {
   const m = e.data || {};
@@ -33,7 +33,7 @@ window.addEventListener('error', (e) => {
   const msg = (e.error && e.error.stack) || e.message;
   // a module that failed to transform breaks linking of its importers (browser-specific messages);
   // prefer the dev server's pending transform error when there is one
-  fetch('/@clover/last-error').then((r) => r.text()).then((t) => showOverlay(t || msg), () => showOverlay(msg));
+  fetch('/@cresslet/last-error').then((r) => r.text()).then((t) => showOverlay(t || msg), () => showOverlay(msg));
 });
 window.addEventListener('unhandledrejection', (e) => showOverlay((e.reason && e.reason.stack) || String(e.reason)));
 `
@@ -41,15 +41,15 @@ window.addEventListener('unhandledrejection', (e) => showOverlay((e.reason && e.
 
 export function styleModule(css: string, id: string, exportsCode = ''): string {
   return `const id = ${JSON.stringify(id)};
-let el = document.querySelector('style[data-clover-id="' + id + '"]');
-if (!el) { el = document.createElement('style'); el.setAttribute('data-clover-id', id); document.head.appendChild(el); }
+let el = document.querySelector('style[data-cresslet-id="' + id + '"]');
+if (!el) { el = document.createElement('style'); el.setAttribute('data-cresslet-id', id); document.head.appendChild(el); }
 el.textContent = ${JSON.stringify(css)};
 ${exportsCode || 'export default ' + JSON.stringify(css) + ';'}
 `
 }
 
 export function errorModule(message: string): string {
-  return `import { showOverlay } from '/@clover/client';
+  return `import { showOverlay } from '/@cresslet/client';
 const msg = ${JSON.stringify(message)};
 showOverlay(msg);
 throw new Error(msg);

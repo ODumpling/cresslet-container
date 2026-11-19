@@ -84,10 +84,10 @@ export function vfsPlugin(vfs: VFS, opts: VfsPluginOptions = {}): Plugin {
   const ropts = opts.resolve ?? BROWSER_OPTS
   const fsAdapter = { isFile: (p: string) => vfs.isFile(p), isDir: (p: string) => vfs.isDir(p), readText: (p: string) => vfs.tryReadText(p) }
   return {
-    name: 'clover-vfs',
+    name: 'cresslet-vfs',
     setup(build) {
       build.onResolve({ filter: /.*/ }, (args) => {
-        if (args.namespace === 'clover-empty') return undefined
+        if (args.namespace === 'cresslet-empty') return undefined
         const spec = args.path
         if (/^(https?:|data:)/.test(spec) || spec.startsWith('//')) return { path: spec, external: true }
         const importer = args.importer || ''
@@ -95,21 +95,21 @@ export function vfsPlugin(vfs: VFS, opts: VfsPluginOptions = {}): Plugin {
         if (typeof ext === 'string') return { path: ext, external: true }
         if (isBare(spec) && isNodeBuiltin(spec)) {
           if (opts.builtins === 'external') return { path: spec, external: true }
-          return { path: spec, namespace: 'clover-empty' }
+          return { path: spec, namespace: 'cresslet-empty' }
         }
         const fromDir = args.resolveDir || (importer ? dirname(importer) : '/')
         const [clean, query] = splitQuery(spec)
         try {
           const r = resolveModule(fsAdapter, clean, fromDir, ropts)
-          if (r === false) return { path: spec, namespace: 'clover-empty' }
-          return { path: r, namespace: 'clover-vfs', suffix: query }
+          if (r === false) return { path: spec, namespace: 'cresslet-empty' }
+          return { path: r, namespace: 'cresslet-vfs', suffix: query }
         } catch (e) {
           if (e instanceof ResolveError) return { errors: [{ text: e.message }] }
           throw e
         }
       })
-      build.onLoad({ filter: /.*/, namespace: 'clover-empty' }, () => ({ contents: 'module.exports = {}', loader: 'js' }))
-      build.onLoad({ filter: /.*/, namespace: 'clover-vfs' }, (args) => {
+      build.onLoad({ filter: /.*/, namespace: 'cresslet-empty' }, () => ({ contents: 'module.exports = {}', loader: 'js' }))
+      build.onLoad({ filter: /.*/, namespace: 'cresslet-vfs' }, (args) => {
         const loader = (build.initialOptions.loader?.[extname(args.path)] as Loader | undefined) ?? loaderFor(args.path)
         const data = vfs.readFile(args.path)
         return {

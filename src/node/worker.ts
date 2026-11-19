@@ -315,7 +315,7 @@ function createModule(filename: string, parent: Mod | null): Mod {
 function loadFile(filename: string, parent: Mod | null): unknown {
   const cached = cache[filename]
   if (cached) return cached.exports
-  if (filename.endsWith('.node')) throw new Error(`[clover] native addon '${filename}' cannot be loaded in the browser runtime`)
+  if (filename.endsWith('.node')) throw new Error(`[cresslet] native addon '${filename}' cannot be loaded in the browser runtime`)
   const mod = createModule(filename, parent)
   parent?.children.push(mod)
   cache[filename] = mod
@@ -324,7 +324,7 @@ function loadFile(filename: string, parent: Mod | null): unknown {
     if (fmt === 'json') mod.exports = JSON.parse(code)
     else {
       const body = (code.startsWith('#!') ? '//' + code : code) + `\n//# sourceURL=${filename}`
-      const fn = new Function('exports', 'require', 'module', '__filename', '__dirname', '__clover_meta_url', body)
+      const fn = new Function('exports', 'require', 'module', '__filename', '__dirname', '__cresslet_meta_url', body)
       fn.call(mod.exports, mod.exports, mod.require, mod, filename, mod.path, 'file://' + filename)
     }
     mod.loaded = true
@@ -444,7 +444,7 @@ function start(m: StartMsg) {
   const entry = m.argv[1]
   const release = ref()
   try {
-    if (!hasSync()) throw new Error('[clover] `node` requires a cross-origin isolated page (serve with COOP: same-origin + COEP: require-corp)')
+    if (!hasSync()) throw new Error('[cresslet] `node` requires a cross-origin isolated page (serve with COOP: same-origin + COEP: require-corp)')
     let resolved: string
     try {
       resolved = resolveFrom(entry.startsWith('/') ? entry : './' + entry, (proc.cwd as () => string)()) as string
@@ -460,7 +460,7 @@ function start(m: StartMsg) {
     if (fmt === 'json') mod.exports = JSON.parse(code)
     else {
       const body = (code.startsWith('#!') ? '//' + code : code) + `\n//# sourceURL=${resolved}`
-      new Function('exports', 'require', 'module', '__filename', '__dirname', '__clover_meta_url', body).call(mod.exports, mod.exports, mod.require, mod, resolved, mod.path, 'file://' + resolved)
+      new Function('exports', 'require', 'module', '__filename', '__dirname', '__cresslet_meta_url', body).call(mod.exports, mod.exports, mod.require, mod, resolved, mod.path, 'file://' + resolved)
     }
     mod.loaded = true
   } catch (e) {

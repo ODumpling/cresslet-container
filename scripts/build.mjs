@@ -10,7 +10,7 @@ const watch = process.argv.includes('--watch')
 rmSync(`${root}dist`, { recursive: true, force: true })
 
 const shims = {
-  name: 'clover-shims',
+  name: 'cresslet-shims',
   setup(b) {
     // readable-stream & friends expect browserify-style globals
     b.onResolve({ filter: /^process\/?$/ }, () => ({ path: `${root}src/node/shims/process.cjs` }))
@@ -31,9 +31,9 @@ const common = {
 }
 
 const configs = [
-  { ...common, entryPoints: { 'clover-container': 'src/index.ts' }, format: 'esm', outdir: 'dist', minify: true },
+  { ...common, entryPoints: { 'cresslet-container': 'src/index.ts' }, format: 'esm', outdir: 'dist', minify: true },
   { ...common, entryPoints: { 'node-worker': 'src/node/worker.ts' }, format: 'esm', outdir: 'dist', minify: true, define: {} },
-  { ...common, entryPoints: { 'clover-sw': 'src/sw.ts' }, format: 'iife', outdir: 'dist', minify: true },
+  { ...common, entryPoints: { 'cresslet-sw': 'src/sw.ts' }, format: 'iife', outdir: 'dist', minify: true },
 ]
 
 if (watch) {

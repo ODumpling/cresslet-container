@@ -13,8 +13,8 @@ export function post(m: WorkerToMain, transfer: Transferable[] = []): void {
 
 export function syncCall<T = unknown>(op: string, ...args: unknown[]): T {
   if (!sab)
-    throw Object.assign(new Error(`[clover] synchronous '${op}' requires a cross-origin isolated page (COOP/COEP headers); use fs.promises instead`), {
-      code: 'ERR_CLOVER_NO_SYNC',
+    throw Object.assign(new Error(`[cresslet] synchronous '${op}' requires a cross-origin isolated page (COOP/COEP headers); use fs.promises instead`), {
+      code: 'ERR_CRESSLET_NO_SYNC',
     })
   let i32 = new Int32Array(sab, 0, 2)
   Atomics.store(i32, 0, STATE_IDLE)

@@ -1,4 +1,4 @@
-# clover-container
+# cresslet-container
 
 In-browser runtime for small/medium web apps: in-memory FS, shell, real `npm install`, a Node-ish `node`, a vite-like dev server, production builds and live previews. Our own WebContainer-style runtime, not Node-in-WASM — pragmatic built-ins instead of running real vite/next.
 
@@ -6,7 +6,7 @@ In-browser runtime for small/medium web apps: in-memory FS, shell, real `npm ins
 
 ```html
 <script type="module">
-  import { Container } from '/dist/clover-container.js' // or https://cdn.jsdelivr.net/gh/ODumpling/clover-container@main/dist/clover-container.js
+  import { Container } from '/dist/cresslet-container.js' // or https://cdn.jsdelivr.net/gh/ODumpling/cresslet-container@main/dist/cresslet-container.js
 
   const c = await Container.boot()
   await c.mount({
@@ -20,13 +20,13 @@ In-browser runtime for small/medium web apps: in-memory FS, shell, real `npm ins
 </script>
 ```
 
-Install: `pnpm add github:ODumpling/clover-container` (dist is committed) or load from jsDelivr.
+Install: `pnpm add github:ODumpling/cresslet-container` (dist is committed) or load from jsDelivr.
 
 ### Host requirements
 
 1. **Cross-origin isolation** on the host page (needed for sync fs in `node` via `SharedArrayBuffer`):
    `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp`.
-2. **Serve `dist/clover-sw.js` from your origin root** (default URL `/clover-sw.js`, scope `/`; override with `boot({ serviceWorkerUrl })`). Service workers must be same-origin, so copy it even when loading the library from a CDN.
+2. **Serve `dist/cresslet-sw.js` from your origin root** (default URL `/cresslet-sw.js`, scope `/`; override with `boot({ serviceWorkerUrl })`). Service workers must be same-origin, so copy it even when loading the library from a CDN.
 3. `dist/node-worker.js` is loaded via `new URL('./node-worker.js', import.meta.url)`; cross-origin (CDN) copies are wrapped in a same-origin blob worker automatically.
 4. esbuild-wasm (0.28.2) loads lazily from jsDelivr; override with `boot({ esbuildWasmUrl })`.
 
@@ -61,7 +61,7 @@ Notes:
 
 ## Previews
 
-Preview URL: `${origin}/__clover__/<instanceId>/<port>/`. The SW forwards requests to the owning page (MessageChannel, streamed bodies) and adds `COEP: require-corp` + `CORP: same-origin`.
+Preview URL: `${origin}/__cresslet__/<instanceId>/<port>/`. The SW forwards requests to the owning page (MessageChannel, streamed bodies) and adds `COEP: require-corp` + `CORP: same-origin`.
 
 Root-relative paths keep working: the SW injects a one-line script into preview HTML that `history.replaceState`s the prefix away (apps and routers see `/`), and attributes later requests to the preview by the document's client id (persisted in Cache Storage across SW restarts). Full navigations inside a preview (links, reloads) are matched by the frame's current URL; live reload navigates through the prefixed URL so it works in every browser.
 
@@ -70,7 +70,7 @@ Root-relative paths keep working: the SW injects a one-line script into preview 
 - **jsh**: quotes, `$VAR`/`${VAR:-x}`, `VAR=x cmd`, `|`, `&&`, `||`, `;`, `>`, `>>`, `<`, `2>`, `2>&1`, `&>`. Builtins: `cd pwd ls cat echo mkdir rm rmdir mv cp touch env export unset which clear exit head tail grep wc sleep true false help`.
 - **npm**: `install|i|add [pkgs] [-D] [-E]`, `ci`, `uninstall`, `run`, `start`, `test`, `init -y`, `exec`, `ls`, `pkg get/set`. Registry installs: semver, abbreviated packuments, parallel tarball fetch, sha integrity check, gunzip + untar, hoisting with nesting on conflict, peers, optional deps, `npm:` aliases, `.bin` shims, `package-lock.json` (written, not read). Tarballs cached in memory + Cache Storage. `github:`/`git+`/`file:`/URL specs are skipped with a warning; install scripts are skipped with a warning.
 - **npx**: local `.bin`, built-ins, or temp-installs the package.
-- **node**: Web Worker with CommonJS loader over the VFS; ESM/TS/JSX transformed to CJS by esbuild (top-level await supported). Builtins: fs (sync + promises + streams), path, events, process, buffer, util, url, os, assert, stream, timers(/promises), crypto (randomUUID/randomBytes/createHash/createHmac for sha1/256/384/512), http/https (`createServer().listen()` → virtual port; `request`/`get`/`fetch` incl. `localhost:<port>`), querystring, string_decoder, readline, module, tty, net (isIP only), vm, async_hooks, perf_hooks, worker_threads (stub). `child_process`, `net` sockets, `tls`, `zlib`, `dns`, `http2`… throw `[clover] … is not supported`. Express works.
+- **node**: Web Worker with CommonJS loader over the VFS; ESM/TS/JSX transformed to CJS by esbuild (top-level await supported). Builtins: fs (sync + promises + streams), path, events, process, buffer, util, url, os, assert, stream, timers(/promises), crypto (randomUUID/randomBytes/createHash/createHmac for sha1/256/384/512), http/https (`createServer().listen()` → virtual port; `request`/`get`/`fetch` incl. `localhost:<port>`), querystring, string_decoder, readline, module, tty, net (isIP only), vm, async_hooks, perf_hooks, worker_threads (stub). `child_process`, `net` sockets, `tls`, `zlib`, `dns`, `http2`… throw `[cresslet] … is not supported`. Express works.
 - **vite** / **vite dev** / **vite --port N**: built-in dev server. **vite build**: production build. **vite preview**, **serve [dir] [-p N]**: static server with SPA fallback.
 - **tsc**: no-op stub (type-checking skipped; esbuild strips types) so `tsc -b && vite build` scripts work.
 
@@ -100,14 +100,14 @@ host page ───────────────────────�
      ├─ npm: resolver (semver, hoist) → registry fetch → gunzip/untar → VFS
      ├─ node → Web Worker (CJS loader, polyfills) ⇄ SAB/Atomics sync RPC (fs, resolve, esbuild transform)
      ├─ dev server / build → esbuild-wasm (VFS plugin)
-     └─ PortTable ⇄ clover-sw.js ⇄ preview iframes (/__clover__/<id>/<port>/…)
+     └─ PortTable ⇄ cresslet-sw.js ⇄ preview iframes (/__cresslet__/<id>/<port>/…)
 ```
 
 ## Development
 
 ```sh
 pnpm install
-pnpm build       # dist/: clover-container.js, node-worker.js, clover-sw.js, index.d.ts (+ types/)
+pnpm build       # dist/: cresslet-container.js, node-worker.js, cresslet-sw.js, index.d.ts (+ types/)
 pnpm test        # vitest: VFS, parser, resolver/hoisting, tar, html, module resolution
 pnpm test:e2e    # Playwright (chromium); test:e2e:all adds firefox + webkit
 pnpm demo        # http://localhost:4400

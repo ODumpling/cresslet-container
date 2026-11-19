@@ -27,7 +27,7 @@ const JS = { 'content-type': 'text/javascript; charset=utf-8', ...NO_CACHE }
 export async function createDevServer(c: Container, o: DevServerOptions = {}): Promise<DevServerHandle> {
   const root = normalize(o.root ? (o.root.startsWith('/') ? o.root : join(c.workdir, o.root)) : c.workdir)
   const port = o.port ?? c.ports.free(5173)
-  const channelName = `clover:${c.instanceId}:${port}`
+  const channelName = `cresslet:${c.instanceId}:${port}`
   const bc = new BroadcastChannel(channelName)
   const vfs = c.vfs
   const fs = c.resolveFs
@@ -107,17 +107,17 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     const [clean, query] = splitQuery(spec)
     const local = resolveLocal(spec, importer)
     if (local) return toUrl(local) + flagFor(local, query)
-    if (isNodeBuiltin(clean)) return '/@clover/empty'
+    if (isNodeBuiltin(clean)) return '/@cresslet/empty'
     if (/\.(css)$/.test(clean)) return `/@modules/${clean}${query ? query + '&import' : '?import'}`
     return `/@modules/${clean}${query}`
   }
 
   // ---- transforms ----
   const importsPlugin = (importer: string): Plugin => ({
-    name: 'clover-dev-imports',
+    name: 'cresslet-dev-imports',
     setup(build) {
       build.onResolve({ filter: /.*/ }, (a) => {
-        if (a.kind === 'entry-point') return { path: a.path, namespace: 'clover-entry' }
+        if (a.kind === 'entry-point') return { path: a.path, namespace: 'cresslet-entry' }
         try {
           const url = rewrite(a.path, a.importer && a.importer !== '<stdin>' ? a.importer : importer)
           if (url.startsWith('/@modules/')) {
@@ -129,7 +129,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
           return { errors: [{ text: e instanceof Error ? e.message : String(e) }] }
         }
       })
-      build.onLoad({ filter: /.*/, namespace: 'clover-entry' }, (a) => ({ contents: vfs.readText(a.path), loader: loaderOf(a.path), resolveDir: dirname(a.path) }))
+      build.onLoad({ filter: /.*/, namespace: 'cresslet-entry' }, (a) => ({ contents: vfs.readText(a.path), loader: loaderOf(a.path), resolveDir: dirname(a.path) }))
     },
   })
 
@@ -183,10 +183,10 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   const cssModule = async (abs: string, asModule: boolean): Promise<string> => {
     const es = await loadEsbuild(c.esbuildWasmUrl)
     const urlPlugin: Plugin = {
-      name: 'clover-css-urls',
+      name: 'cresslet-css-urls',
       setup(build) {
         build.onResolve({ filter: /.*/ }, (a) => {
-          if (a.kind === 'entry-point' || a.importer === '<stdin>') return { path: a.path, namespace: 'clover-entry' }
+          if (a.kind === 'entry-point' || a.importer === '<stdin>') return { path: a.path, namespace: 'cresslet-entry' }
           if (/^(https?:|data:|\/\/|#)/.test(a.path)) return { path: a.path, external: true }
           const importer = a.importer || abs
           if (a.kind === 'url-token' || a.kind === 'import-rule') {
@@ -202,16 +202,16 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
               if (clean.startsWith('/') && vfs.isFile(pub)) return { path: clean, external: true }
               return { path: a.path, external: true }
             }
-            if (a.kind === 'import-rule') return { path: target, namespace: 'clover-entry' }
+            if (a.kind === 'import-rule') return { path: target, namespace: 'cresslet-entry' }
             return { path: toUrl(target), external: true }
           }
           if (a.kind === 'composes-from') {
             const t = resolveLocal(a.path, importer)
-            return t ? { path: t, namespace: 'clover-entry' } : { path: a.path, external: true }
+            return t ? { path: t, namespace: 'cresslet-entry' } : { path: a.path, external: true }
           }
           return { path: a.path, external: true }
         })
-        build.onLoad({ filter: /.*/, namespace: 'clover-entry' }, (a) => ({
+        build.onLoad({ filter: /.*/, namespace: 'cresslet-entry' }, (a) => ({
           contents: vfs.readText(a.path),
           loader: /\.module\.css$/.test(a.path) ? 'local-css' : 'css',
           resolveDir: dirname(a.path),
@@ -250,7 +250,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     const done = await Promise.all(parts)
     let i = 0
     html = html.replace(inline, () => done[i++])
-    const tag = `<script type="module" src="/@clover/client"></script>`
+    const tag = `<script type="module" src="/@cresslet/client"></script>`
     if (/<head[^>]*>/i.test(html)) html = html.replace(/<head[^>]*>/i, (h) => `${h}\n    ${tag}`)
     else html = tag + html
     return html
@@ -286,9 +286,9 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     }
     const has = (k: string) => u.searchParams.has(k)
     try {
-      if (pathname === '/@clover/client') return new Response(clientCode(channelName, `/__clover__/${c.instanceId}/${port}`), { headers: JS })
-      if (pathname === '/@clover/last-error') return new Response(lastError, { headers: { 'content-type': 'text/plain', ...NO_CACHE } })
-      if (pathname === '/@clover/empty') return new Response('export default {}', { headers: JS })
+      if (pathname === '/@cresslet/client') return new Response(clientCode(channelName, `/__cresslet__/${c.instanceId}/${port}`), { headers: JS })
+      if (pathname === '/@cresslet/last-error') return new Response(lastError, { headers: { 'content-type': 'text/plain', ...NO_CACHE } })
+      if (pathname === '/@cresslet/empty') return new Response('export default {}', { headers: JS })
       if (pathname.startsWith('/@modules/')) {
         const spec = pathname.slice('/@modules/'.length)
         if (/^chunk-[\w-]+\.js$/.test(spec.split('/').pop()!) && !deps.has(spec)) {

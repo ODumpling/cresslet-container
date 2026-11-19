@@ -2,7 +2,7 @@
 
 export type PortHandler = (req: Request) => Promise<Response> | Response
 
-export const PREVIEW_PREFIX = '/__clover__/'
+export const PREVIEW_PREFIX = '/__cresslet__/'
 
 interface PortEntry {
   handler: PortHandler
@@ -16,7 +16,7 @@ export interface PortEvents {
 
 /** Message the SW posts to pages (with a MessagePort for the reply). */
 export interface SwRequest {
-  type: 'clover-request'
+  type: 'cresslet-request'
   instanceId: string
   port: number
   /** Path after the port prefix, incl. query. */

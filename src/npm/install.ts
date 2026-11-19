@@ -196,7 +196,7 @@ function linkBins(vfs: VFS, cwd: string, placements: Placement[]): void {
     }
     for (const [name, rel] of binEntries(p.name, bin)) {
       const target = `../${p.name}/${rel.replace(/^\.\//, '')}`
-      vfs.writeFile(join(binDir, name), `#!/usr/bin/env node\n// clover-bin -> ${target}\nrequire(${JSON.stringify(target)})\n`, { mkdirp: true })
+      vfs.writeFile(join(binDir, name), `#!/usr/bin/env node\n// cresslet-bin -> ${target}\nrequire(${JSON.stringify(target)})\n`, { mkdirp: true })
     }
   }
 }

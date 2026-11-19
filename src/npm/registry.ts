@@ -30,7 +30,7 @@ export interface Registry {
 const PACKUMENT_TTL = 5 * 60_000
 const packuments = new Map<string, { at: number; p: Promise<Packument> }>()
 const tarballs = new Map<string, Promise<Uint8Array>>()
-const CACHE_NAME = 'clover-npm-tarballs-v1'
+const CACHE_NAME = 'cresslet-npm-tarballs-v1'
 
 export class HttpRegistry implements Registry {
   constructor(public base = 'https://registry.npmjs.org') {

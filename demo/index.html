@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>clover-container demo</title>
+    <title>cresslet-container demo</title>
     <link rel="stylesheet" crossorigin href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css" />
     <script crossorigin src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
@@ -25,13 +25,13 @@
     </style>
   </head>
   <body>
-    <header><b>clover-container</b><span id="status">booting…</span><button id="edit">Edit App.tsx</button></header>
+    <header><b>cresslet-container</b><span id="status">booting…</span><button id="edit">Edit App.tsx</button></header>
     <main>
       <div id="term"></div>
       <section id="preview"><div id="url">waiting for server…</div><iframe id="frame" title="preview"></iframe></section>
     </main>
     <script type="module">
-      import { Container } from '/dist/clover-container.js'
+      import { Container } from '/dist/cresslet-container.js'
 
       const files = {
         'package.json': { file: { contents: JSON.stringify({ name: 'demo-app', private: true, version: '0.0.0', type: 'module', scripts: { dev: 'vite', build: 'tsc -b && vite build', preview: 'vite preview' }, dependencies: { react: '^19.1.0', 'react-dom': '^19.1.0' } }, null, 2) } },
@@ -40,7 +40,7 @@
         src: {
           directory: {
             'main.tsx': { file: { contents: `import { StrictMode } from 'react'\nimport { createRoot } from 'react-dom/client'\nimport App from './App'\nimport './index.css'\n\ncreateRoot(document.getElementById('root')!).render(<StrictMode><App /></StrictMode>)\n` } },
-            'App.tsx': { file: { contents: `import { useState } from 'react'\n\nexport default function App() {\n  const [count, setCount] = useState(0)\n  return (\n    <main>\n      <h1>Hello from Clover</h1>\n      <button onClick={() => setCount((c) => c + 1)}>count is {count}</button>\n    </main>\n  )\n}\n` } },
+            'App.tsx': { file: { contents: `import { useState } from 'react'\n\nexport default function App() {\n  const [count, setCount] = useState(0)\n  return (\n    <main>\n      <h1>Hello from Cresslet</h1>\n      <button onClick={() => setCount((c) => c + 1)}>count is {count}</button>\n    </main>\n  )\n}\n` } },
             'index.css': { file: { contents: `body { font-family: system-ui, sans-serif; display: grid; place-items: center; min-height: 100vh; margin: 0; background: #f6f8fa; }\nh1 { color: #1f883d; }\nbutton { font-size: 16px; padding: 8px 16px; }\n` } },
           },
         },

@@ -1,24 +1,24 @@
 {
-  "name": "clover-container",
+  "name": "cresslet-container",
   "version": "0.1.0",
   "description": "In-browser runtime: VFS, shell, npm, node-ish workers, dev server, builds.",
   "type": "module",
   "license": "MIT",
-  "main": "./dist/clover-container.js",
-  "module": "./dist/clover-container.js",
+  "main": "./dist/cresslet-container.js",
+  "module": "./dist/cresslet-container.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "default": "./dist/clover-container.js"
+      "default": "./dist/cresslet-container.js"
     },
-    "./clover-sw.js": "./dist/clover-sw.js",
+    "./cresslet-sw.js": "./dist/cresslet-sw.js",
     "./*": "./dist/*"
   },
   "files": [
     "dist"
   ],
-  "repository": "github:ODumpling/clover-container",
+  "repository": "github:ODumpling/cresslet-container",
   "devDependencies": {
     "@playwright/test": "^1.65.1",
     "@types/node": "^26.6.6",

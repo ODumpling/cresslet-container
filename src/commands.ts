@@ -165,12 +165,12 @@ export const npm: Command = async (ctx) => {
       case 'outdated':
       case 'prune':
       case 'dedupe':
-        ctx.stdout.write(`npm ${sub}: not supported in clover (no-op)\n`)
+        ctx.stdout.write(`npm ${sub}: not supported in cresslet (no-op)\n`)
         return 0
       case 'help':
       case '-h':
       case '--help':
-        ctx.stdout.write(`npm (clover ${NPM_VERSION})\n  install|i [pkg...] [-D]   uninstall <pkg...>   run <script>   start   test   init -y   exec|npx <bin>   ls\n`)
+        ctx.stdout.write(`npm (cresslet ${NPM_VERSION})\n  install|i [pkg...] [-D]   uninstall <pkg...>   run <script>   start   test   init -y   exec|npx <bin>   ls\n`)
         return 0
     }
     // `npm <script>` shorthand is not npm behaviour; report unknown command
@@ -233,7 +233,7 @@ export const vite: Command = async (ctx) => {
     if (mode === 'build') {
       const t0 = Date.now()
       const outDir = typeof flags.get('outDir') === 'string' ? (flags.get('outDir') as string) : 'dist'
-      ctx.stdout.write(`${CYAN}vite (clover)${RESET} ${GREEN}building for production...${RESET}\n`)
+      ctx.stdout.write(`${CYAN}vite (cresslet)${RESET} ${GREEN}building for production...${RESET}\n`)
       const { files } = await c.build({ root, outDir })
       for (const f of files) {
         const size = c.vfs.stat(f).size
@@ -248,7 +248,7 @@ export const vite: Command = async (ctx) => {
     }
     if (mode === 'optimize') return 0
     const server = await c.createDevServer({ root, port })
-    ctx.stdout.write(`\n  ${CYAN}${BOLD}VITE${RESET} ${CYAN}(clover)${RESET}  ready\n\n  ${GREEN}➜${RESET}  ${BOLD}Local${RESET}:   ${CYAN}${server.url}${RESET}\n\n`)
+    ctx.stdout.write(`\n  ${CYAN}${BOLD}VITE${RESET} ${CYAN}(cresslet)${RESET}  ready\n\n  ${GREEN}➜${RESET}  ${BOLD}Local${RESET}:   ${CYAN}${server.url}${RESET}\n\n`)
     await aborted(ctx.signal)
     server.close()
     return 0
@@ -295,10 +295,10 @@ export const serve: Command = async (ctx) => {
 
 export const tsc: Command = async (ctx) => {
   if (ctx.args.includes('-v') || ctx.args.includes('--version')) {
-    ctx.stdout.write('Version 5.9.3 (clover stub)\n')
+    ctx.stdout.write('Version 5.9.3 (cresslet stub)\n')
     return 0
   }
-  ctx.stdout.write(`${DIM}tsc: type-checking is skipped in clover (esbuild strips types at build time)${RESET}\n`)
+  ctx.stdout.write(`${DIM}tsc: type-checking is skipped in cresslet (esbuild strips types at build time)${RESET}\n`)
   return 0
 }
 

@@ -10,13 +10,13 @@ export const os = {
   platform: () => 'linux',
   type: () => 'Linux',
   arch: () => 'x64',
-  release: () => '6.0.0-clover',
+  release: () => '6.0.0-cresslet',
   version: () => '#1 SMP',
   machine: () => 'x86_64',
-  hostname: () => 'clover',
+  hostname: () => 'cresslet',
   homedir: () => globalThis.process?.env?.HOME ?? '/home',
   tmpdir: () => '/tmp',
-  userInfo: () => ({ username: 'clover', uid: 1000, gid: 1000, shell: '/bin/jsh', homedir: os.homedir() }),
+  userInfo: () => ({ username: 'cresslet', uid: 1000, gid: 1000, shell: '/bin/jsh', homedir: os.homedir() }),
   cpus: () => Array.from({ length: navigator.hardwareConcurrency || 4 }, () => ({ model: 'virtual', speed: 2000, times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 } })),
   availableParallelism: () => navigator.hardwareConcurrency || 4,
   totalmem: () => 8 * 1024 ** 3,
@@ -421,7 +421,7 @@ export const diagnosticsChannel = {
 }
 
 export function unsupported(what: string): Error {
-  return Object.assign(new Error(`[clover] ${what} is not supported in the browser runtime`), { code: 'ERR_CLOVER_UNSUPPORTED' })
+  return Object.assign(new Error(`[cresslet] ${what} is not supported in the browser runtime`), { code: 'ERR_CRESSLET_UNSUPPORTED' })
 }
 export function unsupportedFn(what: string) {
   return () => {
