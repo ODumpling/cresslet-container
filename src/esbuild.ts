@@ -87,7 +87,7 @@ export function vfsPlugin(vfs: VFS, opts: VfsPluginOptions = {}): Plugin {
     name: 'clover-vfs',
     setup(build) {
       build.onResolve({ filter: /.*/ }, (args) => {
-        if (args.namespace !== 'file' && args.namespace !== 'clover-vfs' && args.namespace !== '') return undefined
+        if (args.namespace === 'clover-empty') return undefined
         const spec = args.path
         if (/^(https?:|data:)/.test(spec) || spec.startsWith('//')) return { path: spec, external: true }
         const importer = args.importer || ''
@@ -134,7 +134,7 @@ export async function bundleVfs(
 ): Promise<esbuild.BuildResult & { outputFiles: esbuild.OutputFile[] }> {
   const { cwd = '/', wasmURL, vfsPlugin: vopts, ...rest } = options
   const es = await loadEsbuild(wasmURL)
-  const fix = (p: string) => (p.startsWith('/') ? p : normalize(`${cwd}/${p}`))
+  const fix = (p: string) => (p.startsWith('/') || /^[\w-]{2,}:/.test(p) ? p : normalize(`${cwd}/${p}`))
   let entryPoints = rest.entryPoints
   if (Array.isArray(entryPoints)) entryPoints = (entryPoints as (string | { in: string; out: string })[]).map((e) => (typeof e === 'string' ? fix(e) : { ...e, in: fix(e.in) })) as string[]
   else if (entryPoints && typeof entryPoints === 'object')

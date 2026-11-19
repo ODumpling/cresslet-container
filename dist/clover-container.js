@@ -4485,7 +4485,7 @@ function vfsPlugin(vfs, opts = {}) {
     name: "clover-vfs",
     setup(build2) {
       build2.onResolve({ filter: /.*/ }, (args) => {
-        if (args.namespace !== "file" && args.namespace !== "clover-vfs" && args.namespace !== "") return;
+        if (args.namespace === "clover-empty") return;
         let spec = args.path;
         if (/^(https?:|data:)/.test(spec) || spec.startsWith("//")) return { path: spec, external: !0 };
         let importer = args.importer || "", ext = opts.external?.(spec, importer, args.kind);
@@ -4516,7 +4516,7 @@ function splitQuery(p) {
   return i < 0 ? [p, ""] : [p.slice(0, i), p.slice(i)];
 }
 async function bundleVfs(vfs, options) {
-  let { cwd = "/", wasmURL, vfsPlugin: vopts, ...rest } = options, es = await loadEsbuild(wasmURL), fix = (p) => p.startsWith("/") ? p : normalize(`${cwd}/${p}`), entryPoints = rest.entryPoints;
+  let { cwd = "/", wasmURL, vfsPlugin: vopts, ...rest } = options, es = await loadEsbuild(wasmURL), fix = (p) => p.startsWith("/") || /^[\w-]{2,}:/.test(p) ? p : normalize(`${cwd}/${p}`), entryPoints = rest.entryPoints;
   return Array.isArray(entryPoints) ? entryPoints = entryPoints.map((e) => typeof e == "string" ? fix(e) : { ...e, in: fix(e.in) }) : entryPoints && typeof entryPoints == "object" && (entryPoints = Object.fromEntries(Object.entries(entryPoints).map(([k, v]) => [k, fix(v)]))), await es.build({
     bundle: !0,
     format: "esm",
