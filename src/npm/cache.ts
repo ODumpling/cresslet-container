@@ -61,7 +61,8 @@ export class IdbCache implements PackageCache {
           db.onclose = drop
           done(db)
         }
-        req.onerror = () => done(null)
+        // a late error after the fallback: drop the null result too, so the next operation retries the open
+        req.onerror = () => (settled ? drop() : done(null))
         req.onblocked = () => done(null)
       } catch {
         done(null)

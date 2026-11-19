@@ -153,6 +153,33 @@ describe('HttpRegistry persistent cache', () => {
     await expect(new HttpRegistry(b, { cache: null }).tarball(url, `${other} ${sha256}`)).rejects.toThrow(/integrity/)
   })
 
+  it('stores a tarball under the digest that verified it, never over another accepted digest', async () => {
+    const b = base()
+    const bodyB = new TextEncoder().encode('other tarball bytes')
+    const [A, B] = [sri(body), sri(bodyB)]
+    const urlA = `${b}/a/-/a-1.0.0.tgz`
+    const urlB = `${b}/mirror/a-1.0.0.tgz`
+    let release!: () => void
+    const gate = new Promise<void>((r) => (release = r))
+    vi.stubGlobal('fetch', async (u: string) => {
+      if (u === urlB) return await gate, new Response(bodyB)
+      return new Response(body)
+    })
+    // two page loads sharing one persistent store, each with its own in-memory memo
+    const data = new Map<string, unknown>()
+    const [c1, c2] = [new MemoryCache(), new MemoryCache()]
+    Object.assign(c1, { data }), Object.assign(c2, { data })
+    const pending = new HttpRegistry(b, { cache: c1 }).tarball(urlB, `${A} ${B}`) // misses A, fetch in flight
+    await new Promise((r) => setTimeout(r, 0))
+    expect(await new HttpRegistry(b, { cache: c2 }).tarball(urlA, A)).toEqual(body) // writes a valid A
+    await Promise.resolve()
+    release()
+    expect(await pending).toEqual(bodyB)
+    await Promise.resolve()
+    expect(data.get(`tarballs:${A}`)).toEqual(body)
+    expect(data.get(`tarballs:${B}`)).toEqual(bodyB)
+  })
+
   it('keys by URL when the digest cannot be verified (no WebCrypto)', async () => {
     const b = base()
     const url = `${b}/a/-/a-1.0.0.tgz`

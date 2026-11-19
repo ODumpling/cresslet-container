@@ -8,7 +8,7 @@ interface FakeDb {
   onclose: (() => void) | null
   close(): void
 }
-function fakeIndexedDb(o: { openDelay?: number; hangTx?: () => boolean } = {}) {
+function fakeIndexedDb(o: { openDelay?: number; openError?: boolean; hangTx?: () => boolean } = {}) {
   const dbs: FakeDb[] = []
   const txs: { aborted: boolean }[] = []
   const data = new Map<string, unknown>()
@@ -41,7 +41,9 @@ function fakeIndexedDb(o: { openDelay?: number; hangTx?: () => boolean } = {}) {
         },
       } as FakeDb & Record<string, unknown>
       dbs.push(db)
+      const fail = o.openError
       setTimeout(() => {
+        if (fail) return (req.onerror as () => void)?.()
         req.result = db
         ;(req.onsuccess as () => void)?.()
       }, o.openDelay ?? 0)
@@ -101,6 +103,25 @@ describe('IdbCache connection lifecycle', () => {
     expect(await miss).toBeUndefined()
     await vi.advanceTimersByTimeAsync(10_000)
     o.openDelay = 0
+    const put = c.put('tarballs', 'k', 1)
+    await vi.advanceTimersByTimeAsync(1)
+    await put
+    expect(dbs.length).toBe(2)
+    const get = c.get('tarballs', 'k')
+    await vi.advanceTimersByTimeAsync(1)
+    expect(await get).toBe(1)
+  })
+
+  it('reopens on the next operation after a late open error (not memory-only until reload)', async () => {
+    vi.useFakeTimers()
+    const o = { openDelay: 10_000, openError: true }
+    const { dbs } = fakeIndexedDb(o)
+    const c = new IdbCache()
+    const miss = c.get('tarballs', 'k')
+    await vi.advanceTimersByTimeAsync(3001)
+    expect(await miss).toBeUndefined()
+    await vi.advanceTimersByTimeAsync(10_000) // the open finally errors
+    Object.assign(o, { openDelay: 0, openError: false })
     const put = c.put('tarballs', 'k', 1)
     await vi.advanceTimersByTimeAsync(1)
     await put
