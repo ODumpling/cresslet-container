@@ -1,8 +1,8 @@
-import * as esbuild from 'esbuild-wasm';
-import type { BuildOptions, Loader, Plugin } from 'esbuild-wasm';
+import * as esbuild from './vendor/esbuild-wasm';
+import type { BuildOptions, Loader, Plugin } from './vendor/esbuild-wasm';
 import type { VFS } from './vfs';
 import { type ResolveOptions } from './resolve';
-export type { BuildOptions, BuildResult, Plugin, Loader, Metafile, OutputFile } from 'esbuild-wasm';
+export type { BuildOptions, BuildResult, Plugin, Loader, Metafile, OutputFile } from './vendor/esbuild-wasm';
 export declare const ESBUILD_VERSION: string;
 export declare const DEFAULT_WASM_URL: string;
 export declare function loadEsbuild(wasmURL?: string): Promise<typeof esbuild>;

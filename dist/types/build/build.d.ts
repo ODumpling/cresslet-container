@@ -1,4 +1,4 @@
-import type { Plugin } from 'esbuild-wasm';
+import type { Plugin } from '../vendor/esbuild-wasm';
 import type { Container } from '../container';
 import { type ProjectConfig } from '../dev/project';
 export interface BuildOptions {
