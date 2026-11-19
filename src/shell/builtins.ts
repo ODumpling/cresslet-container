@@ -1,7 +1,7 @@
 // Shell builtins. State-changing ones (cd/export/exit) act on the ShellState when present.
 import type { CommandContext } from '../process'
 import { readAll } from '../process'
-import { basename, dirname, join, resolve } from '../path'
+import { basename, join, resolve } from '../path'
 
 export interface ShellState {
   cwd: string
@@ -144,6 +144,45 @@ export const builtins: Record<string, Builtin> = {
       return err(ctx, 'cat', e)
     }
   },
+  async grep(ctx) {
+    const { flags: f, rest } = flags(ctx.args)
+    const [pattern, ...files] = rest
+    if (pattern === undefined) return err(ctx, 'grep', 'usage: grep [-ivnc] PATTERN [FILE...]')
+    let re: RegExp
+    try {
+      re = new RegExp(pattern, f.has('i') ? 'i' : '')
+    } catch (e) {
+      return err(ctx, 'grep', e)
+    }
+    try {
+      let count = 0
+      const sources = files.length ? files.map((n) => [n, ctx.container.vfs.readText(abs(ctx, n))]) : [['', await readAll(ctx.stdin)]]
+      for (const [name, text] of sources) {
+        text.split('\n').forEach((line, i, all) => {
+          if (i === all.length - 1 && line === '') return
+          if (re.test(line) === f.has('v')) return
+          count++
+          if (!f.has('c')) ctx.stdout.write(`${files.length > 1 ? name + ':' : ''}${f.has('n') ? i + 1 + ':' : ''}${line}\n`)
+        })
+      }
+      if (f.has('c')) ctx.stdout.write(count + '\n')
+      return count ? 0 : 1
+    } catch (e) {
+      return err(ctx, 'grep', e)
+    }
+  },
+  async wc(ctx) {
+    const { flags: f, rest } = flags(ctx.args)
+    try {
+      const text = await lines(ctx, rest)
+      const n = { l: text.split('\n').length - (text.endsWith('\n') ? 1 : 0), w: text.split(/\s+/).filter(Boolean).length, c: new TextEncoder().encode(text).length }
+      const pick = f.size ? (['l', 'w', 'c'] as const).filter((k) => f.has(k)) : (['l', 'w', 'c'] as const)
+      ctx.stdout.write(pick.map((k) => String(n[k]).padStart(7)).join(' ') + '\n')
+      return 0
+    } catch (e) {
+      return err(ctx, 'wc', e)
+    }
+  },
   head: (ctx) => headTail(ctx, false),
   tail: (ctx) => headTail(ctx, true),
   mkdir(ctx) {
@@ -277,4 +316,3 @@ function color(e: { name: string; isDirectory(): boolean; isSymbolicLink(): bool
   return e.name
 }
 
-export { dirname }

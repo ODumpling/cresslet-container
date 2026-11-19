@@ -5731,6 +5731,41 @@ var builtins = {
       return err(ctx, "cat", e);
     }
   },
+  async grep(ctx) {
+    let { flags: f, rest } = flags(ctx.args), [pattern, ...files] = rest;
+    if (pattern === void 0) return err(ctx, "grep", "usage: grep [-ivnc] PATTERN [FILE...]");
+    let re;
+    try {
+      re = new RegExp(pattern, f.has("i") ? "i" : "");
+    } catch (e) {
+      return err(ctx, "grep", e);
+    }
+    try {
+      let count = 0, sources = files.length ? files.map((n) => [n, ctx.container.vfs.readText(abs(ctx, n))]) : [["", await readAll(ctx.stdin)]];
+      for (let [name, text] of sources)
+        text.split(`
+`).forEach((line, i, all) => {
+          i === all.length - 1 && line === "" || re.test(line) !== f.has("v") && (count++, f.has("c") || ctx.stdout.write(`${files.length > 1 ? name + ":" : ""}${f.has("n") ? i + 1 + ":" : ""}${line}
+`));
+        });
+      return f.has("c") && ctx.stdout.write(count + `
+`), count ? 0 : 1;
+    } catch (e) {
+      return err(ctx, "grep", e);
+    }
+  },
+  async wc(ctx) {
+    let { flags: f, rest } = flags(ctx.args);
+    try {
+      let text = await lines(ctx, rest), n = { l: text.split(`
+`).length - (text.endsWith(`
+`) ? 1 : 0), w: text.split(/\s+/).filter(Boolean).length, c: new TextEncoder().encode(text).length }, pick = f.size ? ["l", "w", "c"].filter((k) => f.has(k)) : ["l", "w", "c"];
+      return ctx.stdout.write(pick.map((k) => String(n[k]).padStart(7)).join(" ") + `
+`), 0;
+    } catch (e) {
+      return err(ctx, "wc", e);
+    }
+  },
   head: (ctx) => headTail(ctx, !1),
   tail: (ctx) => headTail(ctx, !0),
   mkdir(ctx) {
@@ -6702,11 +6737,49 @@ async function loadModule(c, path2) {
         })).code, format: "cjs" };
       } catch (e) {
         let msg = formatErrors(e);
-        throw /Top-level await/.test(msg) ? new Error(`${path2}: top-level await is not supported by clover's node runtime yet; wrap it in an async function`) : new SyntaxError(msg);
+        if (/Top-level await/.test(msg)) value = { code: await tlaToCjs(c, code, path2, ext), format: "cjs" };
+        else throw new SyntaxError(msg);
       }
     }
   }
   return cache.set(path2, { mtime: st.mtimeMs, value }), value;
+}
+async function tlaToCjs(c, code, path2, ext) {
+  let out = (await (await loadEsbuild(c.esbuildWasmUrl)).build({
+    stdin: { contents: code, sourcefile: path2, loader: ext === ".tsx" ? "tsx" : ext === ".jsx" ? "jsx" : /ts$/.test(ext) ? "ts" : "js" },
+    bundle: !0,
+    write: !1,
+    format: "esm",
+    platform: "node",
+    target: "es2022",
+    jsx: "automatic",
+    define: { "import.meta.url": "__clover_meta_url", "import.meta.dirname": "__dirname", "import.meta.filename": "__filename" },
+    plugins: [{ name: "ext", setup: (b) => b.onResolve({ filter: /.*/ }, (a) => ({ path: a.path, external: !0 })) }],
+    logLevel: "silent"
+  })).outputFiles[0].text, exportsList = [], req = (m) => `__clover_ns(require(${m}))`;
+  out = out.replace(/^import\s+(\{[^}]*\})\s+from\s+("[^"]+");?$/gm, (_, names, m) => `const ${names.replace(/\s+as\s+/g, ": ")} = ${req(m)};`).replace(/^import\s+\*\s+as\s+([\w$]+)\s+from\s+("[^"]+");?$/gm, (_, n, m) => `const ${n} = ${req(m)};`).replace(/^import\s+([\w$]+)\s*,\s*(\{[^}]*\})\s+from\s+("[^"]+");?$/gm, (_, d, names, m) => `const { default: ${d}, ${names.slice(1, -1).replace(/\s+as\s+/g, ": ")} } = ${req(m)};`).replace(/^import\s+([\w$]+)\s+from\s+("[^"]+");?$/gm, (_, d, m) => `const ${d} = ${req(m)}.default;`).replace(/^import\s+("[^"]+");?$/gm, (_, m) => `require(${m});`).replace(/^export\s+\*\s+from\s+("[^"]+");?$/gm, (_, m) => `Object.assign(exports, require(${m}));`).replace(/^export\s+\{([^}]*)\}\s+from\s+("[^"]+");?$/gm, (_, names, m) => {
+    let v = `__clover_re${exportsList.length}`;
+    for (let n of names.split(",").map((x) => x.trim()).filter(Boolean)) {
+      let [a, b = a] = n.split(/\s+as\s+/);
+      exportsList.push(`${JSON.stringify(b)}: () => ${v}[${JSON.stringify(a)}]`);
+    }
+    return `const ${v} = ${req(m)};`;
+  }).replace(/^export\s+\{([^}]*)\};?$/gm, (_, names) => {
+    for (let n of names.split(",").map((x) => x.trim()).filter(Boolean)) {
+      let [a, b = a] = n.split(/\s+as\s+/);
+      exportsList.push(`${JSON.stringify(b)}: () => ${a}`);
+    }
+    return "";
+  });
+  let helper = "function __clover_ns(m) { return m && m.__esModule ? m : Object.assign(Object.create(null), m, { default: m }); }", define = exportsList.length ? `for (const [k, g] of Object.entries({ ${exportsList.join(", ")} })) Object.defineProperty(exports, k, { get: g, enumerable: true });` : "";
+  return `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+${helper}
+module.exports.__tla = (async () => {
+${out}
+${define}
+})();
+`;
 }
 async function runOp(c, op, args) {
   let vfs = c.vfs, p = args[0];
@@ -6926,7 +6999,7 @@ function runNode(ctx, entry, args) {
 }
 
 // src/commands.ts
-var BOLD = "\x1B[1m", DIM2 = "\x1B[2m", GREEN = "\x1B[32m", CYAN2 = "\x1B[36m", RED = "\x1B[31m", RESET4 = "\x1B[0m", NPM_VERSION = "10.9.0";
+var BOLD = "\x1B[1m", DIM2 = "\x1B[2m", GREEN = "\x1B[32m", CYAN2 = "\x1B[36m", RED = "\x1B[31m", RESET4 = "\x1B[0m", NPM_VERSION = "10.9.0", VALUE_FLAGS = /* @__PURE__ */ new Set(["port", "host", "outDir", "mode", "config", "base", "listen", "l", "p", "package"]);
 function parseFlags(args) {
   let flags2 = /* @__PURE__ */ new Map(), rest = [];
   for (let i = 0; i < args.length; i++) {
@@ -6937,8 +7010,9 @@ function parseFlags(args) {
     }
     if (a.startsWith("--")) {
       let eq = a.indexOf("=");
-      eq > 0 ? flags2.set(a.slice(2, eq), a.slice(eq + 1)) : flags2.set(a.slice(2), !0);
-    } else if (a.startsWith("-") && a.length > 1) for (let ch of a.slice(1)) flags2.set(ch, !0);
+      eq > 0 ? flags2.set(a.slice(2, eq), a.slice(eq + 1)) : VALUE_FLAGS.has(a.slice(2)) && args[i + 1] !== void 0 && !args[i + 1].startsWith("-") ? flags2.set(a.slice(2), args[++i]) : flags2.set(a.slice(2), !0);
+    } else if (/^-[lp]$/.test(a) && args[i + 1] !== void 0) flags2.set(a.slice(1), args[++i]);
+    else if (a.startsWith("-") && a.length > 1) for (let ch of a.slice(1)) flags2.set(ch, !0);
     else rest.push(a);
   }
   return { flags: flags2, rest };
@@ -7085,7 +7159,7 @@ ${JSON.stringify(pkg, null, 2)}
 }, vite = async (ctx) => {
   let c = ctx.container, args = [...ctx.args], mode = "dev";
   ["dev", "serve", "build", "preview", "optimize"].includes(args[0]) && (mode = args.shift());
-  let { flags: flags2, rest } = parseFlags(args), root = rest[0] ? resolve(ctx.cwd, rest[0]) : ctx.cwd, portFlag = flags2.get("port"), portArg = typeof portFlag == "string" ? portFlag : args[args.indexOf("--port") + 1], port = portArg && /^\d+$/.test(portArg) ? Number(portArg) : void 0;
+  let { flags: flags2, rest } = parseFlags(args), root = rest[0] ? resolve(ctx.cwd, rest[0]) : ctx.cwd, portArg = flags2.get("port"), port = typeof portArg == "string" && /^\d+$/.test(portArg) ? Number(portArg) : void 0;
   try {
     if (mode === "build") {
       let t0 = Date.now(), outDir = typeof flags2.get("outDir") == "string" ? flags2.get("outDir") : "dist";
@@ -7140,8 +7214,8 @@ function staticHandler(c, dir, spa = !0) {
   };
 }
 var serve = async (ctx) => {
-  let { flags: flags2, rest } = parseFlags(ctx.args), pf = ctx.args[ctx.args.indexOf("-p") + 1] ?? ctx.args[ctx.args.indexOf("-l") + 1] ?? ctx.args[ctx.args.indexOf("--port") + 1], port = pf && /^\d+$/.test(pf) ? Number(pf) : 3e3, dir = rest.filter((r) => r !== String(port))[0];
-  return serveStatic(ctx, resolve(ctx.cwd, dir ?? "."), port, flags2.has("s") || flags2.has("single") || !0);
+  let { flags: flags2, rest } = parseFlags(ctx.args), pf = flags2.get("p") ?? flags2.get("l") ?? flags2.get("port") ?? flags2.get("listen"), port = typeof pf == "string" && /^\d+$/.test(pf) ? Number(pf) : 3e3;
+  return serveStatic(ctx, resolve(ctx.cwd, rest[0] ?? "."), port, !0);
 }, tsc = async (ctx) => ctx.args.includes("-v") || ctx.args.includes("--version") ? (ctx.stdout.write(`Version 5.9.3 (clover stub)
 `), 0) : (ctx.stdout.write(`${DIM2}tsc: type-checking is skipped in clover (esbuild strips types at build time)${RESET4}
 `), 0), jsh = async (ctx) => {
@@ -7266,7 +7340,13 @@ bc.onmessage = (e) => {
   else if (m.type === 'error') showOverlay(m.message);
   else if (m.type === 'clear') clearOverlay();
 };
-window.addEventListener('error', (e) => showOverlay((e.error && e.error.stack) || e.message));
+window.addEventListener('error', (e) => {
+  const msg = (e.error && e.error.stack) || e.message;
+  // a module that failed to transform breaks linking of its importers; show the real transform error instead
+  if (/does not provide an export|Failed to fetch dynamically|error loading dynamically/i.test(String(msg))) {
+    fetch('/@clover/last-error').then((r) => r.text()).then((t) => showOverlay(t || msg), () => showOverlay(msg));
+  } else showOverlay(msg);
+});
 window.addEventListener('unhandledrejection', (e) => showOverlay((e.reason && e.reason.stack) || String(e.reason)));
 `;
 }
@@ -7543,7 +7623,7 @@ var NO_CACHE = { "cache-control": "no-cache, no-store" }, JS = { "content-type":
 async function createDevServer(c, o = {}) {
   let root = normalize(o.root ? o.root.startsWith("/") ? o.root : join(c.workdir, o.root) : c.workdir), port = o.port ?? c.ports.free(5173), channelName = `clover:${c.instanceId}:${port}`, bc = new BroadcastChannel(channelName), vfs = c.vfs, fs = c.resolveFs, cfg = readProjectConfig(vfs, root), env = loadEnv(vfs, root, "development"), defines = { ...envDefines(env), "process.env.NODE_ENV": '"development"' }, deps = new DepOptimizer(vfs, fs, root, { wasmURL: c.esbuildWasmUrl, define: { "process.env.NODE_ENV": '"development"' } });
   deps.onStale = () => scheduleReload("dependencies re-optimized");
-  let transformCache = /* @__PURE__ */ new Map(), reloadTimer = null, depsTimer = null, scheduleReload = (_why) => {
+  let transformCache = /* @__PURE__ */ new Map(), lastError = "", lastErrorFile = "", reloadTimer = null, depsTimer = null, scheduleReload = (_why) => {
     reloadTimer && clearTimeout(reloadTimer), reloadTimer = setTimeout(() => {
       reloadTimer = null, bc.postMessage({ type: "reload" });
     }, 60);
@@ -7703,6 +7783,7 @@ async function createDevServer(c, o = {}) {
     let has = (k) => u.searchParams.has(k);
     try {
       if (pathname === "/@clover/client") return new Response(clientCode(channelName), { headers: JS });
+      if (pathname === "/@clover/last-error") return new Response(lastError, { headers: { "content-type": "text/plain", ...NO_CACHE } });
       if (pathname === "/@clover/empty") return new Response("export default {}", { headers: JS });
       if (pathname.startsWith("/@modules/")) {
         let spec = pathname.slice(10);
@@ -7733,9 +7814,10 @@ async function createDevServer(c, o = {}) {
       }
       if (SCRIPT_EXT.test(abs2))
         try {
-          return new Response(await transformScript(abs2), { headers: JS });
+          let code = await transformScript(abs2);
+          return lastErrorFile === abs2 && (lastError = lastErrorFile = ""), new Response(code, { headers: JS });
         } catch (e) {
-          return new Response(errorModule(formatErrors(e)), { headers: JS });
+          return lastError = formatErrors(e), lastErrorFile = abs2, new Response(errorModule(lastError), { headers: JS });
         }
       return fileResponse(abs2);
     } catch (e) {

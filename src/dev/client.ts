@@ -26,7 +26,13 @@ bc.onmessage = (e) => {
   else if (m.type === 'error') showOverlay(m.message);
   else if (m.type === 'clear') clearOverlay();
 };
-window.addEventListener('error', (e) => showOverlay((e.error && e.error.stack) || e.message));
+window.addEventListener('error', (e) => {
+  const msg = (e.error && e.error.stack) || e.message;
+  // a module that failed to transform breaks linking of its importers; show the real transform error instead
+  if (/does not provide an export|Failed to fetch dynamically|error loading dynamically/i.test(String(msg))) {
+    fetch('/@clover/last-error').then((r) => r.text()).then((t) => showOverlay(t || msg), () => showOverlay(msg));
+  } else showOverlay(msg);
+});
 window.addEventListener('unhandledrejection', (e) => showOverlay((e.reason && e.reason.stack) || String(e.reason)));
 `
 }

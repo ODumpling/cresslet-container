@@ -57,13 +57,61 @@ async function loadModule(c: Container, path: string): Promise<{ code: string; f
         value = { code: r.code, format: 'cjs' }
       } catch (e) {
         const msg = formatErrors(e)
-        if (/Top-level await/.test(msg)) throw new Error(`${path}: top-level await is not supported by clover's node runtime yet; wrap it in an async function`)
-        throw new SyntaxError(msg)
+        if (/Top-level await/.test(msg)) value = { code: await tlaToCjs(c, code, path, ext), format: 'cjs' }
+        else throw new SyntaxError(msg)
       }
     }
   }
   cache.set(path, { mtime: st.mtimeMs, value })
   return value
+}
+
+/**
+ * ESM with top-level await can't be emitted as CJS by esbuild. Normalize it to canonical ESM (bundle with
+ * everything external), then rewrite imports/exports to require()/exports and run the body in an async IIFE.
+ */
+async function tlaToCjs(c: Container, code: string, path: string, ext: string): Promise<string> {
+  const es = await loadEsbuild(c.esbuildWasmUrl)
+  const r = await es.build({
+    stdin: { contents: code, sourcefile: path, loader: ext === '.tsx' ? 'tsx' : ext === '.jsx' ? 'jsx' : /ts$/.test(ext) ? 'ts' : 'js' },
+    bundle: true,
+    write: false,
+    format: 'esm',
+    platform: 'node',
+    target: 'es2022',
+    jsx: 'automatic',
+    define: { 'import.meta.url': '__clover_meta_url', 'import.meta.dirname': '__dirname', 'import.meta.filename': '__filename' },
+    plugins: [{ name: 'ext', setup: (b) => b.onResolve({ filter: /.*/ }, (a) => ({ path: a.path, external: true })) }],
+    logLevel: 'silent',
+  })
+  let out = r.outputFiles[0].text
+  const exportsList: string[] = []
+  const req = (m: string) => `__clover_ns(require(${m}))`
+  out = out
+    .replace(/^import\s+(\{[^}]*\})\s+from\s+("[^"]+");?$/gm, (_, names: string, m) => `const ${names.replace(/\s+as\s+/g, ': ')} = ${req(m)};`)
+    .replace(/^import\s+\*\s+as\s+([\w$]+)\s+from\s+("[^"]+");?$/gm, (_, n, m) => `const ${n} = ${req(m)};`)
+    .replace(/^import\s+([\w$]+)\s*,\s*(\{[^}]*\})\s+from\s+("[^"]+");?$/gm, (_, d, names: string, m) => `const { default: ${d}, ${names.slice(1, -1).replace(/\s+as\s+/g, ': ')} } = ${req(m)};`)
+    .replace(/^import\s+([\w$]+)\s+from\s+("[^"]+");?$/gm, (_, d, m) => `const ${d} = ${req(m)}.default;`)
+    .replace(/^import\s+("[^"]+");?$/gm, (_, m) => `require(${m});`)
+    .replace(/^export\s+\*\s+from\s+("[^"]+");?$/gm, (_, m) => `Object.assign(exports, require(${m}));`)
+    .replace(/^export\s+\{([^}]*)\}\s+from\s+("[^"]+");?$/gm, (_, names: string, m) => {
+      const v = `__clover_re${exportsList.length}`
+      for (const n of names.split(',').map((x) => x.trim()).filter(Boolean)) {
+        const [a, b = a] = n.split(/\s+as\s+/)
+        exportsList.push(`${JSON.stringify(b)}: () => ${v}[${JSON.stringify(a)}]`)
+      }
+      return `const ${v} = ${req(m)};`
+    })
+    .replace(/^export\s+\{([^}]*)\};?$/gm, (_, names: string) => {
+      for (const n of names.split(',').map((x) => x.trim()).filter(Boolean)) {
+        const [a, b = a] = n.split(/\s+as\s+/)
+        exportsList.push(`${JSON.stringify(b)}: () => ${a}`)
+      }
+      return ''
+    })
+  const helper = `function __clover_ns(m) { return m && m.__esModule ? m : Object.assign(Object.create(null), m, { default: m }); }`
+  const define = exportsList.length ? `for (const [k, g] of Object.entries({ ${exportsList.join(', ')} })) Object.defineProperty(exports, k, { get: g, enumerable: true });` : ''
+  return `"use strict";\nObject.defineProperty(exports, "__esModule", { value: true });\n${helper}\nmodule.exports.__tla = (async () => {\n${out}\n${define}\n})();\n`
 }
 
 /** Execute one RPC op against the container. Shared by sync and async channels. */

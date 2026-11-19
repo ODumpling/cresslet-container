@@ -5234,7 +5234,7 @@ function syncCall(op, ...args) {
     sab = new SharedArrayBuffer(8 + len2 + 1024 * 1024), i32 = new Int32Array(sab, 0, 2), Atomics.store(i32, 0, 0), post({ type: "sync-grow", sab }), Atomics.wait(i32, 0, 0);
   }
   let len = Atomics.load(i32, 1);
-  return decodeResult(new Uint8Array(sab, 8, len));
+  return decodeResult(new Uint8Array(sab, 8, len).slice());
 }
 var asyncId = 0, waiting = /* @__PURE__ */ new Map();
 function asyncCall(op, ...args) {
@@ -7065,8 +7065,8 @@ function start(m) {
     let resolved;
     try {
       resolved = resolveFrom(entry.startsWith("/") ? entry : "./" + entry, proc.cwd());
-    } catch {
-      throw Object.assign(new Error(`Cannot find module '${entry}'`), { code: "MODULE_NOT_FOUND" });
+    } catch (e) {
+      throw e.code !== "MODULE_NOT_FOUND" ? e : Object.assign(new Error(`Cannot find module '${entry}'`), { code: "MODULE_NOT_FOUND" });
     }
     let mod = createModule(resolved, null);
     mainModule = mod, mod.require.main = mod, cache[resolved] = mod;

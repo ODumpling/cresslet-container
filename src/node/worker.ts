@@ -448,7 +448,8 @@ function start(m: StartMsg) {
     let resolved: string
     try {
       resolved = resolveFrom(entry.startsWith('/') ? entry : './' + entry, (proc.cwd as () => string)()) as string
-    } catch {
+    } catch (e) {
+      if ((e as { code?: string }).code !== 'MODULE_NOT_FOUND') throw e
       throw Object.assign(new Error(`Cannot find module '${entry}'`), { code: 'MODULE_NOT_FOUND' })
     }
     const mod = createModule(resolved, null)

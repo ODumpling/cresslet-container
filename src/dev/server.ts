@@ -37,6 +37,8 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   const deps = new DepOptimizer(vfs, fs, root, { wasmURL: c.esbuildWasmUrl, define: { 'process.env.NODE_ENV': '"development"' } })
   deps.onStale = () => scheduleReload('dependencies re-optimized')
   const transformCache = new Map<string, { mtime: number; code: string }>()
+  let lastError = ''
+  let lastErrorFile = ''
 
   // ---- file watching -> live reload ----
   let reloadTimer: ReturnType<typeof setTimeout> | null = null
@@ -285,6 +287,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     const has = (k: string) => u.searchParams.has(k)
     try {
       if (pathname === '/@clover/client') return new Response(clientCode(channelName), { headers: JS })
+      if (pathname === '/@clover/last-error') return new Response(lastError, { headers: { 'content-type': 'text/plain', ...NO_CACHE } })
       if (pathname === '/@clover/empty') return new Response('export default {}', { headers: JS })
       if (pathname.startsWith('/@modules/')) {
         const spec = pathname.slice('/@modules/'.length)
@@ -321,9 +324,13 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       }
       if (SCRIPT_EXT.test(abs)) {
         try {
-          return new Response(await transformScript(abs), { headers: JS })
+          const code = await transformScript(abs)
+          if (lastErrorFile === abs) lastError = lastErrorFile = ''
+          return new Response(code, { headers: JS })
         } catch (e) {
-          return new Response(errorModule(formatErrors(e)), { headers: JS })
+          lastError = formatErrors(e)
+          lastErrorFile = abs
+          return new Response(errorModule(lastError), { headers: JS })
         }
       }
       return fileResponse(abs)

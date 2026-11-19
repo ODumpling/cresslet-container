@@ -29,7 +29,7 @@ export function syncCall<T = unknown>(op: string, ...args: unknown[]): T {
     Atomics.wait(i32, 0, STATE_IDLE)
   }
   const len = Atomics.load(i32, 1)
-  return decodeResult(new Uint8Array(sab, HEADER, len)) as T
+  return decodeResult(new Uint8Array(sab, HEADER, len).slice()) as T // copy out of shared memory (TextDecoder rejects shared views)
 }
 
 let asyncId = 0

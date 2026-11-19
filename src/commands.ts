@@ -19,6 +19,9 @@ const RED = '\x1b[31m'
 const RESET = '\x1b[0m'
 export const NPM_VERSION = '10.9.0'
 
+/** Flags that take a value (`--port 3000` as well as `--port=3000`). */
+const VALUE_FLAGS = new Set(['port', 'host', 'outDir', 'mode', 'config', 'base', 'listen', 'l', 'p', 'package'])
+
 function parseFlags(args: string[]) {
   const flags = new Map<string, string | true>()
   const rest: string[] = []
@@ -31,8 +34,10 @@ function parseFlags(args: string[]) {
     if (a.startsWith('--')) {
       const eq = a.indexOf('=')
       if (eq > 0) flags.set(a.slice(2, eq), a.slice(eq + 1))
+      else if (VALUE_FLAGS.has(a.slice(2)) && args[i + 1] !== undefined && !args[i + 1].startsWith('-')) flags.set(a.slice(2), args[++i])
       else flags.set(a.slice(2), true)
-    } else if (a.startsWith('-') && a.length > 1) for (const ch of a.slice(1)) flags.set(ch, true)
+    } else if (/^-[lp]$/.test(a) && args[i + 1] !== undefined) flags.set(a.slice(1), args[++i])
+    else if (a.startsWith('-') && a.length > 1) for (const ch of a.slice(1)) flags.set(ch, true)
     else rest.push(a)
   }
   return { flags, rest }
@@ -222,9 +227,8 @@ export const vite: Command = async (ctx) => {
   if (['dev', 'serve', 'build', 'preview', 'optimize'].includes(args[0])) mode = args.shift()!
   const { flags, rest } = parseFlags(args)
   const root = rest[0] ? resolve(ctx.cwd, rest[0]) : ctx.cwd
-  const portFlag = flags.get('port')
-  const portArg = typeof portFlag === 'string' ? portFlag : args[args.indexOf('--port') + 1]
-  const port = portArg && /^\d+$/.test(portArg) ? Number(portArg) : undefined
+  const portArg = flags.get('port')
+  const port = typeof portArg === 'string' && /^\d+$/.test(portArg) ? Number(portArg) : undefined
   try {
     if (mode === 'build') {
       const t0 = Date.now()
@@ -284,10 +288,9 @@ export function staticHandler(c: Container, dir: string, spa = true) {
 
 export const serve: Command = async (ctx) => {
   const { flags, rest } = parseFlags(ctx.args)
-  const pf = ctx.args[ctx.args.indexOf('-p') + 1] ?? ctx.args[ctx.args.indexOf('-l') + 1] ?? ctx.args[ctx.args.indexOf('--port') + 1]
-  const port = pf && /^\d+$/.test(pf) ? Number(pf) : 3000
-  const dir = rest.filter((r) => r !== String(port))[0]
-  return serveStatic(ctx, resolve(ctx.cwd, dir ?? '.'), port, flags.has('s') || flags.has('single') || true)
+  const pf = flags.get('p') ?? flags.get('l') ?? flags.get('port') ?? flags.get('listen')
+  const port = typeof pf === 'string' && /^\d+$/.test(pf) ? Number(pf) : 3000
+  return serveStatic(ctx, resolve(ctx.cwd, rest[0] ?? '.'), port, true)
 }
 
 export const tsc: Command = async (ctx) => {
