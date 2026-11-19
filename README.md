@@ -35,7 +35,7 @@ Install: `pnpm add github:ODumpling/cresslet-container` (dist is committed) or l
 ## API
 
 ```ts
-const c = await Container.boot({ serviceWorkerUrl?, esbuildWasmUrl?, registry?, workdir? /* '/home/project' */ })
+const c = await Container.boot({ serviceWorkerUrl?, esbuildWasmUrl?, registry?, workdir? /* '/home/project' */, npmCache? /* true */ })
 c.workdir; c.instanceId
 c.fs.readFile(p, 'utf8'?) / writeFile(p, data) /* mkdir -p */ / readdir(p, { withFileTypes? }) / mkdir / rm / rename / stat / exists
 c.fs.watch(p, { recursive? }, (event: 'change' | 'rename', filename) => {}) // { close() }
@@ -51,7 +51,7 @@ await c.bundle(esbuildOptions)                   // { outputFiles: [{ path, text
 c.teardown()
 ```
 
-Extras (not in the original contract): `c.vfs` (sync FS), `c.ports`, `c.exec`, `c.which`, `c.path`, `boot({ serviceWorkerUrl: false })`, `spawn(..., { terminal: true })` (CRLF output).
+Extras (not in the original contract): `c.vfs` (sync FS), `c.ports`, `c.exec`, `c.which`, `c.path`, `boot({ serviceWorkerUrl: false })`, `boot({ npmCache: false })` (no persistent npm cache), `spawn(..., { terminal: true })` (CRLF output).
 
 Notes:
 - Relative paths resolve against `workdir`.
@@ -68,7 +68,7 @@ Root-relative paths keep working: the SW injects a one-line script into preview 
 ## Commands
 
 - **jsh**: quotes, `$VAR`/`${VAR:-x}`, `VAR=x cmd`, `|`, `&&`, `||`, `;`, `>`, `>>`, `<`, `2>`, `2>&1`, `&>`. Builtins: `cd pwd ls cat echo mkdir rm rmdir mv cp touch env export unset which clear exit head tail grep wc sleep true false help`.
-- **npm**: `install|i|add [pkgs] [-D] [-E]`, `ci`, `uninstall`, `run`, `start`, `test`, `init -y`, `exec`, `ls`, `pkg get/set`. Registry installs: semver, abbreviated packuments, parallel tarball fetch, sha integrity check, gunzip + untar, hoisting with nesting on conflict, peers, optional deps, `npm:` aliases, `.bin` shims, `package-lock.json` (written, not read). Tarballs cached in memory + Cache Storage. `github:`/`git+`/`file:`/URL specs are skipped with a warning; install scripts are skipped with a warning.
+- **npm**: `install|i|add [pkgs] [-D] [-E]`, `ci`, `uninstall`, `run`, `start`, `test`, `init -y`, `exec`, `ls`, `pkg get/set`. Registry installs: semver, abbreviated packuments, parallel tarball fetch, sha integrity check, gunzip + untar, hoisting with nesting on conflict, peers, optional deps, `npm:` aliases, `.bin` shims, `package-lock.json` (written, not read). Persistent package cache in IndexedDB (`cresslet-npm`, shared by all containers on the origin): tarballs keyed by integrity (URL when there is none) and re-verified on read (a bad entry is evicted and refetched); packuments reused for 5 min (stale copy used if the registry is unreachable). A reinstall after a page reload makes no tarball requests. Silently in-memory only when IndexedDB is unavailable (e.g. some private modes); opt out with `boot({ npmCache: false })`. `github:`/`git+`/`file:`/URL specs are skipped with a warning; install scripts are skipped with a warning.
 - **npx**: local `.bin`, built-ins, or temp-installs the package.
 - **node**: Web Worker with CommonJS loader over the VFS; ESM/TS/JSX transformed to CJS by esbuild (top-level await supported). Builtins: fs (sync + promises + streams), path, events, process, buffer, util, url, os, assert, stream, timers(/promises), crypto (randomUUID/randomBytes/createHash/createHmac for sha1/256/384/512), http/https (`createServer().listen()` → virtual port; `request`/`get`/`fetch` incl. `localhost:<port>`), querystring, string_decoder, readline, module, tty, net (isIP only), vm, async_hooks, perf_hooks, worker_threads (stub). `child_process`, `net` sockets, `tls`, `zlib`, `dns`, `http2`… throw `[cresslet] … is not supported`. Express works.
 - **vite** / **vite dev** / **vite --port N**: built-in dev server. **vite build**: production build. **vite preview**, **serve [dir] [-p N]**: static server with SPA fallback.
@@ -87,7 +87,7 @@ Parses `index.html`, bundles each `<script type="module" src>` and local stylesh
 - Not real Node: real `vite`, `next`, `tsc`, native addons, `child_process`, raw sockets don't run (built-ins cover the common workflow).
 - No HMR (full reload). No PostCSS/Tailwind v3/Sass/Less (Tailwind via CDN works).
 - `node` needs a cross-origin isolated page; without it sync fs/`require` fail with a clear error.
-- `npm`: no lockfile-driven installs, no workspaces, no git/file deps, no lifecycle scripts.
+- `npm`: no lockfile-driven installs, no workspaces, no git/file deps, no lifecycle scripts. The package cache has no size cap/eviction of its own (the browser may evict it; clear with `indexedDB.deleteDatabase('cresslet-npm')`).
 - Previews share the host origin: a preview at `/` and a host page at `/` can't be told apart on a *top-level* reload; manual reload of a preview frame after `pushState` is best-effort in WebKit.
 - In-memory only: the VFS is lost on reload (persist with `export()`/`mount()`).
 
@@ -115,7 +115,7 @@ pnpm demo        # http://localhost:4400
 
 ## Roadmap
 
-Persistence (IndexedDB/OPFS snapshots), HMR (React Fast Refresh), lockfile-driven installs + workspaces, PostCSS/Tailwind, more Node compat (zlib, child_process via jsh), real Node via WASM for big CLIs, subdomain-isolated previews.
+VFS persistence (IndexedDB/OPFS snapshots; the npm cache already persists), npm cache size cap/LRU, HMR (React Fast Refresh), lockfile-driven installs + workspaces, PostCSS/Tailwind, more Node compat (zlib, child_process via jsh), real Node via WASM for big CLIs, subdomain-isolated previews.
 
 ## License
 

@@ -5,7 +5,8 @@ import { PortTable, type PortHandler, type SwRequest } from './ports'
 import { createProcess, EMPTY_STDIN, type Command, type CommandContext, type ContainerProcess, type SpawnOptions } from './process'
 import { builtins } from './shell/builtins'
 import { COMMANDS } from './commands'
-import { HttpRegistry, type Registry } from './npm/registry'
+import { dropLegacyCache, HttpRegistry, type Registry } from './npm/registry'
+import { sharedIdbCache } from './npm/cache'
 import { clearPackageCache, isBare, type ResolveFs } from './resolve'
 import { bundleVfs, DEFAULT_WASM_URL, type BuildOptions as EsbuildOptions, type OutputFile } from './esbuild'
 import { createDevServer, type DevServerHandle, type DevServerOptions } from './dev/server'
@@ -21,6 +22,8 @@ export interface BootOptions {
   registry?: string
   /** Project directory. Default '/home/project'. */
   workdir?: string
+  /** Persist npm tarballs + packuments in IndexedDB across reloads. Default true; silently off if IndexedDB is unavailable. */
+  npmCache?: boolean
 }
 
 export interface ContainerEvents {
@@ -77,7 +80,8 @@ export class Container {
 
   private constructor(opts: BootOptions) {
     this.workdir = normalize(opts.workdir ?? '/home/project')
-    this.registry = new HttpRegistry(opts.registry ?? 'https://registry.npmjs.org')
+    this.registry = new HttpRegistry(opts.registry ?? 'https://registry.npmjs.org', { cache: opts.npmCache === false ? null : sharedIdbCache() })
+    dropLegacyCache()
     this.esbuildWasmUrl = opts.esbuildWasmUrl ?? DEFAULT_WASM_URL
     this.ports = new PortTable(this.instanceId, {
       open: (port, url) => {

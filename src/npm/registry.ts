@@ -1,4 +1,5 @@
-// npm registry client: abbreviated packuments + tarballs, cached in memory (and Cache API for tarballs).
+// npm registry client: abbreviated packuments + tarballs, cached in memory and (optionally) in a persistent PackageCache.
+import { tarballKey, type PackageCache } from './cache'
 
 export interface Manifest {
   name: string
@@ -27,28 +28,51 @@ export interface Registry {
   tarball(url: string, integrity?: string): Promise<Uint8Array>
 }
 
-const PACKUMENT_TTL = 5 * 60_000
+/** Packuments are reused for 5 minutes (the registry's own `max-age`), in memory and across reloads. */
+export const PACKUMENT_TTL = 5 * 60_000
 const packuments = new Map<string, { at: number; p: Promise<Packument> }>()
 const tarballs = new Map<string, Promise<Uint8Array>>()
-const CACHE_NAME = 'cresslet-npm-tarballs-v1'
+
+export interface HttpRegistryOptions {
+  /** Persistent cache for tarballs + packuments; `null` = in-memory only. */
+  cache?: PackageCache | null
+}
 
 export class HttpRegistry implements Registry {
-  constructor(public base = 'https://registry.npmjs.org') {
+  readonly cache: PackageCache | null
+
+  constructor(
+    public base = 'https://registry.npmjs.org',
+    opts: HttpRegistryOptions = {},
+  ) {
     this.base = base.replace(/\/+$/, '')
+    this.cache = opts.cache ?? null
   }
 
   packument(name: string): Promise<Packument> {
     const key = `${this.base}|${name}`
     const hit = packuments.get(key)
     if (hit && Date.now() - hit.at < PACKUMENT_TTL) return hit.p
+    const at = Date.now()
     const p = (async () => {
+      const stored = await this.cache?.get<{ at: number; data: Packument }>('packuments', key).catch(() => undefined)
+      if (stored && Date.now() - stored.at < PACKUMENT_TTL) return stored.data
       const url = `${this.base}/${name.startsWith('@') ? '@' + encodeURIComponent(name.slice(1)) : encodeURIComponent(name)}`
-      const res = await fetchRetry(url, { headers: { accept: 'application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8' } })
+      let res: Response
+      try {
+        res = await fetchRetry(url, { headers: { accept: 'application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8' } })
+      } catch (e) {
+        if (stored) return stored.data // offline: a stale packument beats failing
+        throw e
+      }
       if (res.status === 404) throw new Error(`404 Not Found - ${name} is not in the npm registry`)
+      if (!res.ok && stored) return stored.data
       if (!res.ok) throw new Error(`${res.status} ${res.statusText} fetching ${name}`)
-      return (await res.json()) as Packument
+      const data = (await res.json()) as Packument
+      this.cache?.put('packuments', key, { at: Date.now(), data }).catch(() => {})
+      return data
     })()
-    packuments.set(key, { at: Date.now(), p })
+    packuments.set(key, { at, p })
     p.catch(() => packuments.delete(key))
     return p
   }
@@ -57,14 +81,18 @@ export class HttpRegistry implements Registry {
     let p = tarballs.get(url)
     if (!p) {
       p = (async () => {
-        const cache = await openCache()
-        let res = cache ? await cache.match(url).catch(() => undefined) : undefined
-        const fromCache = !!res
-        if (!res) res = await fetchRetry(url)
+        const key = tarballKey(url, integrity)
+        const stored = await this.cache?.get<Uint8Array>('tarballs', key).catch(() => undefined)
+        if (stored instanceof Uint8Array) {
+          // never trust the cache blindly: a corrupt/mismatched entry is evicted and refetched
+          if (!integrity || (await verify(stored, integrity, url).then(() => true, () => false))) return stored
+          await this.cache?.delete('tarballs', key).catch(() => {})
+        }
+        const res = await fetchRetry(url)
         if (!res.ok) throw new Error(`${res.status} ${res.statusText} fetching ${url}`)
-        const buf = new Uint8Array(await res.clone().arrayBuffer())
+        const buf = new Uint8Array(await res.arrayBuffer())
         if (integrity) await verify(buf, integrity, url)
-        if (cache && !fromCache) cache.put(url, new Response(buf as BlobPart)).catch(() => {})
+        this.cache?.put('tarballs', key, buf).catch(() => {})
         return buf
       })()
       tarballs.set(url, p)
@@ -74,10 +102,9 @@ export class HttpRegistry implements Registry {
   }
 }
 
-let cachePromise: Promise<Cache | null> | null = null
-function openCache(): Promise<Cache | null> {
-  if (!cachePromise) cachePromise = typeof caches !== 'undefined' ? caches.open(CACHE_NAME).catch(() => null) : Promise.resolve(null)
-  return cachePromise
+/** Drop the pre-IndexedDB Cache Storage tarball cache (superseded by the IndexedDB cache). */
+export function dropLegacyCache(): void {
+  if (typeof caches !== 'undefined') caches.delete('cresslet-npm-tarballs-v1').catch(() => {})
 }
 
 async function fetchRetry(url: string, init?: RequestInit, tries = 3): Promise<Response> {

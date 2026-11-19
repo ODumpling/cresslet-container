@@ -16,6 +16,8 @@ export interface BootOptions {
     registry?: string;
     /** Project directory. Default '/home/project'. */
     workdir?: string;
+    /** Persist npm tarballs + packuments in IndexedDB across reloads. Default true; silently off if IndexedDB is unavailable. */
+    npmCache?: boolean;
 }
 export interface ContainerEvents {
     'server-ready': (port: number, url: string) => void;
