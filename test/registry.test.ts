@@ -180,6 +180,22 @@ describe('HttpRegistry persistent cache', () => {
     expect(data.get(`tarballs:${B}`)).toEqual(bodyB)
   })
 
+  it('finds a tarball stored under a later accepted digest after a reload', async () => {
+    const b = base()
+    const url = `${b}/a/-/a-1.0.0.tgz`
+    const other = sri(new TextEncoder().encode('other'))
+    const calls = mockFetch({ [url]: () => new Response(body) })
+    const data = new Map<string, unknown>()
+    const [c1, c2] = [new MemoryCache(), new MemoryCache()]
+    Object.assign(c1, { data }), Object.assign(c2, { data })
+    expect(await new HttpRegistry(b, { cache: c1 }).tarball(url, `${other} ${sri(body)}`)).toEqual(body)
+    await Promise.resolve()
+    expect(data.has(`tarballs:${sri(body)}`)).toBe(true)
+    // fresh memo over the same store (reload): probes every accepted token, so no refetch
+    expect(await new HttpRegistry(b, { cache: c2 }).tarball(url, `${other} ${sri(body)}`)).toEqual(body)
+    expect(calls).toEqual([url])
+  })
+
   it('keys by URL when the digest cannot be verified (no WebCrypto)', async () => {
     const b = base()
     const url = `${b}/a/-/a-1.0.0.tgz`

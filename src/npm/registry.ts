@@ -112,11 +112,14 @@ export class HttpRegistry implements Registry {
       p = (async () => {
         const digest = selectDigest(integrity)
         const key = tarballKey(url, integrity)
-        const stored = await this.cache?.get<Uint8Array>('tarballs', key).catch(() => undefined)
-        if (stored instanceof Uint8Array) {
+        // bytes are stored under the token that verified them: probe every accepted token, not only the first
+        const keys = key !== url && digest ? digest.hashes.map((h) => `${digest.algo}-${h}`) : [key]
+        for (const k of this.cache ? keys : []) {
+          const stored = await this.cache!.get<Uint8Array>('tarballs', k).catch(() => undefined)
+          if (!(stored instanceof Uint8Array)) continue
           // never trust the cache blindly: a corrupt/mismatched entry is evicted and refetched
           if (await verify(stored, digest, url).then(() => true, () => false)) return stored
-          await this.cache?.delete('tarballs', key).catch(() => {})
+          await this.cache!.delete('tarballs', k).catch(() => {})
         }
         const res = await fetchRetry(url)
         if (!res.ok) throw new Error(`${res.status} ${res.statusText} fetching ${url}`)
