@@ -293,6 +293,47 @@ describe('dev server HMR', () => {
     expect(upd(await s.next())).toEqual(['/src/App.tsx'])
   })
 
+  // two transforms of different versions inside one debounce window (no flush between), the older finishing last
+  const outOfOrder = async (s: Awaited<ReturnType<typeof devServer>>, v1: string, v2: string, v2Check: (code: string) => void) => {
+    let release!: () => void
+    gate.hold = new Promise((r) => (release = r))
+    const built = gate.built
+    s.write('src/App.tsx', v1)
+    const older = s.get('/src/App.tsx') // transforms v1, held
+    while (gate.built === built) await new Promise((r) => setTimeout(r, 5))
+    gate.hold = null
+    s.write('src/App.tsx', v2)
+    v2Check(await s.get('/src/App.tsx')) // newer transform finishes first
+    release()
+    await older
+  }
+
+  it('an older transform within the debounce window does not restore obsolete edges/accept', async () => {
+    const s = await devServer({ 'src/main.ts': "import App from './App'\n", 'src/App.tsx': comp('App') })
+    for (const p of ['/src/main.ts', '/src/App.tsx']) await s.get(p)
+    // v1: not a boundary; v2: a boundary again
+    await outOfOrder(s, 'export const helper = 1\n' + comp('App', 'return 1'), comp('App', 'return 2'), () => {})
+    expect(upd(await s.next())).toEqual(['/src/App.tsx'])
+  })
+
+  it('an older successful transform within the debounce window does not clear a newer error', async () => {
+    const s = await devServer({ 'src/main.ts': "import App from './App'\n", 'src/App.tsx': comp('App') })
+    for (const p of ['/src/main.ts', '/src/App.tsx']) await s.get(p)
+    await outOfOrder(s, comp('App', 'return 1'), 'export default function App( {\n', (code) => expect(code).toContain('moduleError'))
+    expect(await s.get('/@cresslet/last-error')).toContain('App.tsx')
+  })
+
+  it('a string containing "createElement(" does not make a .js module a boundary', async () => {
+    const s = await devServer({
+      'src/main.ts': "import App from './App'\n",
+      'src/App.tsx': comp('App', 'return FormatTag', "import { FormatTag } from './format.js'"),
+      'src/format.js': 'export function FormatTag() { return "createElement(" }\n',
+    })
+    for (const p of ['/src/main.ts', '/src/App.tsx', '/src/format.js']) await s.get(p)
+    s.write('src/format.js', 'export function FormatTag() { return "createElement( " }\n')
+    expect(upd(await s.next())).toEqual(['/src/App.tsx'])
+  })
+
   it('detects entries after env substitution in index.html', async () => {
     const s = await devServer({ '.env': 'VITE_ENTRY=/src/App.tsx\n', 'index.html': '<script type="module" src="%VITE_ENTRY%"></script>', 'src/App.tsx': comp('App') })
     expect(await s.get('/')).toContain('src="/src/App.tsx"')

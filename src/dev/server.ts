@@ -85,6 +85,9 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     }, 60)
   }
   const scheduleHmr = (abs: string) => {
+    // the source revision changes now, not at the flush: a transform started inside the debounce window must be
+    // newer than one started before the change (publication order, last-error set/clear)
+    bump(abs)
     pending.add(abs)
     if (flushTimer) clearTimeout(flushTimer)
     flushTimer = setTimeout(flushHmr, 60)
@@ -237,8 +240,14 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   })
 
   const SCRIPT_LOADERS = new Set(['ts', 'tsx', 'jsx', 'js'])
-  /** esbuild's JSX output (automatic or classic runtime): a module without it is not a component module. */
-  const JSX_CALL = /(?<![\w$.])(?:jsxs?|jsxDEV|createElement)\d*\s*\(|(?<![\w$.])React\d*\.createElement\s*\(/ // not document.createElement
+  /** Whether esbuild's output has JSX: an import of the automatic runtime, or a call of the classic factory (outside strings/comments). */
+  const hasJsx = (code: string, importsRuntime: boolean) => {
+    if (importsRuntime) return true
+    const [head, ...rest] = (cfg.jsxFactory ?? 'React.createElement').split('.').map((p) => p.replace(/[$]/g, '\\$'))
+    const call = new RegExp(`(?<![\\w$.])${[head + '\\d*', ...rest].join('\\s*\\.\\s*')}\\s*\\(`) // not document.createElement
+    return call.test(code.replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\[\s\S])*`/g, ' '))
+  }
+  const jsxRuntimes = () => new Set([cfg.jsxImportSource, 'react'].flatMap((s) => [`${s}/jsx-runtime`, `${s}/jsx-dev-runtime`]))
   const loaderOf = (p: string) => {
     const e = extname(p)
     return e === '.tsx' ? 'tsx' : e === '.ts' || e === '.mts' || e === '.cts' ? 'ts' : e === '.jsx' ? 'jsx' : 'jsx'
@@ -265,6 +274,12 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     const es = await loadEsbuild(c.esbuildWasmUrl)
     const locals = new Set<string>()
     unresolved.delete(abs)
+    const runtimes = jsxRuntimes()
+    let importsRuntime = false
+    const jsxRuntimePlugin: Plugin = {
+      name: 'cresslet-jsx-runtime',
+      setup: (b) => b.onResolve({ filter: /jsx-(dev-)?runtime$/ }, (a) => void (importsRuntime ||= runtimes.has(a.path))),
+    }
     const r = await es.build({
       entryPoints: [abs],
       bundle: true,
@@ -277,7 +292,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       ...jsxOptions(cfg),
       tsconfigRaw: cfg.tsconfigRaw as never,
       define: defines,
-      plugins: [importsPlugin(abs, locals, () => unresolved.add(abs))],
+      plugins: [jsxRuntimePlugin, importsPlugin(abs, locals, () => unresolved.add(abs))],
       logLevel: 'silent',
       absWorkingDir: root,
     })
@@ -288,7 +303,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       const rr = refreshTransform(code, toUrl(abs))
       code = rr.code
       // only component modules can be boundaries: a .ts/.js module exporting API_URL / an enum must not self-accept
-      boundary = rr.boundary && (loaderOf(abs) === 'jsx' || loaderOf(abs) === 'tsx') && JSX_CALL.test(r.outputFiles[0].text)
+      boundary = rr.boundary && (loaderOf(abs) === 'jsx' || loaderOf(abs) === 'tsx') && hasJsx(r.outputFiles[0].text, importsRuntime)
     }
     // the graph describes the code the page actually runs, even if the file changed meanwhile
     publish(abs, locals, boundary, gen, page)
