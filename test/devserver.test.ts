@@ -68,8 +68,8 @@ async function devServer(files: Record<string, string>) {
   return { vfs, write, get, next, quiet, rm: (p: string) => vfs.rm(join(ROOT, p), { recursive: true }) }
 }
 
-// no JSX / bare imports: keeps the dependency optimizer out of it
-const comp = (name: string, body = 'return null', imports = '') => `${imports}\nexport default function ${name}() { ${body} }\n`
+// classic createElement instead of JSX syntax (no bare jsx-runtime import): keeps the dependency optimizer out of it
+const comp = (name: string, body = 'return null', imports = '') => `${imports}\nexport default function ${name}() { React.createElement('i'); ${body} }\n`
 const upd = (m: Msg) => (m.type === 'update' ? m.updates!.map((u) => u.url) : m.type)
 
 describe('dev server HMR', () => {
@@ -187,13 +187,58 @@ describe('dev server HMR', () => {
   })
 
   it('a module edited during its first transform still gets its graph node (later edits update)', async () => {
-    const s = await devServer({ 'src/main.ts': "import App from './App'\n", 'src/App.tsx': comp('App') })
-    await s.get('/src/main.ts')
+    const s = await devServer({ 'src/main.ts': "import Page from './Page'\n", 'src/Page.tsx': comp('Page', 'return App', "import App from './App'"), 'src/App.tsx': comp('App') })
+    for (const p of ['/src/main.ts', '/src/Page.tsx']) await s.get(p)
     await inFlight(s, '/src/App.tsx', async () => {
       s.write('src/App.tsx', comp('App', 'return 1'))
-      await s.quiet() // flush runs (bumps the generation) while the transform is held
+      expect(upd(await s.next())).toEqual(['/src/Page.tsx']) // flush runs (bumps the generation) while the transform is held
     })
     s.write('src/App.tsx', comp('App', 'return 2'))
+    expect(upd(await s.next())).toEqual(['/src/App.tsx'])
+  })
+
+  it('a change to a module whose first transform is in flight (no graph node yet) is not ignored', async () => {
+    const s = await devServer({ 'src/App.tsx': comp('App') })
+    await inFlight(s, '/src/App.tsx', async () => {
+      s.write('src/App.tsx', comp('App', 'return 1'))
+      expect(upd(await s.next())).toBe('reload') // the page is about to run the old code and nothing accepts the change
+    })
+  })
+
+  it('a first transform finishing after a full reload does not leave an orphan boundary', async () => {
+    const s = await devServer({
+      'index.html': '<script type="module" src="/src/main.ts"></script>',
+      'src/main.ts': "import Widget from './Widget'\n",
+      'src/Widget.tsx': comp('Widget'),
+    })
+    for (const p of ['/', '/src/main.ts']) await s.get(p)
+    await inFlight(s, '/src/Widget.tsx', async () => {
+      s.write('src/main.ts', 'export {}\n')
+      expect(upd(await s.next())).toBe('reload')
+      gate.hold = null // only the first Widget transform stays held
+      for (const p of ['/', '/src/main.ts']) await s.get(p) // the reloaded page no longer imports Widget
+    })
+    s.write('src/Widget.tsx', comp('Widget', 'return 1'))
+    expect(await s.quiet()).toEqual([])
+  })
+
+  it('an older transform finishing after a newer one does not overwrite its graph edges/accept', async () => {
+    const s = await devServer({ 'src/main.ts': "import App from './App'\n", 'src/App.tsx': comp('App') })
+    for (const p of ['/src/main.ts', '/src/App.tsx']) await s.get(p)
+    s.write('src/App.tsx', 'export const helper = 1\n' + comp('App', 'return 1')) // v1: not a boundary
+    expect(upd(await s.next())).toEqual(['/src/App.tsx'])
+    let release!: () => void
+    gate.hold = new Promise((r) => (release = r))
+    const built = gate.built
+    const older = s.get('/src/App.tsx?t=1') // transforms v1, held
+    while (gate.built === built) await new Promise((r) => setTimeout(r, 5))
+    gate.hold = null
+    s.write('src/App.tsx', comp('App', 'return 2')) // v2: a boundary again
+    expect(upd(await s.next())).toEqual(['/src/App.tsx'])
+    await s.get('/src/App.tsx?t=2') // newer transform publishes first
+    release()
+    await older
+    s.write('src/App.tsx', comp('App', 'return 3'))
     expect(upd(await s.next())).toEqual(['/src/App.tsx'])
   })
 
@@ -206,6 +251,46 @@ describe('dev server HMR', () => {
     })
     expect(code).toContain('moduleError')
     expect(await s.get('/@cresslet/last-error')).toBe('')
+  })
+
+  it('a stale successful transform does not clear a newer error', async () => {
+    const s = await devServer({ 'src/main.ts': "import App from './App'\n", 'src/App.tsx': comp('App') })
+    for (const p of ['/src/main.ts', '/src/App.tsx']) await s.get(p)
+    s.write('src/App.tsx', comp('App', 'return 1'))
+    expect(upd(await s.next())).toEqual(['/src/App.tsx'])
+    let release!: () => void
+    gate.hold = new Promise((r) => (release = r))
+    const built = gate.built
+    const older = s.get('/src/App.tsx?t=1') // succeeds, held
+    while (gate.built === built) await new Promise((r) => setTimeout(r, 5))
+    gate.hold = null
+    s.write('src/App.tsx', 'export default function App( {\n')
+    expect(upd(await s.next())).toEqual(['/src/App.tsx'])
+    expect(await s.get('/src/App.tsx?t=2')).toContain('moduleError')
+    release()
+    await older
+    expect(await s.get('/@cresslet/last-error')).toContain('App.tsx')
+  })
+
+  it('an error from a transform started before a full reload is not published to last-error', async () => {
+    const s = await devServer({ 'index.html': '<script type="module" src="/src/main.ts"></script>', 'src/main.ts': "import App from './App'\n", 'src/App.tsx': 'export default function App( {\n' })
+    for (const p of ['/', '/src/main.ts']) await s.get(p)
+    await inFlight(s, '/src/App.tsx', async () => {
+      s.write('index.html', '<script type="module" src="/src/main.ts"></script>\n')
+      expect(upd(await s.next())).toBe('reload')
+    })
+    expect(await s.get('/@cresslet/last-error')).toBe('')
+  })
+
+  it('a plain .js constants module is not a boundary: edits hot-update through the importing component', async () => {
+    const s = await devServer({
+      'src/main.ts': "import App from './App'\n",
+      'src/App.tsx': comp('App', 'return API_URL', "import { API_URL } from './constants.js'"),
+      'src/constants.js': "export const API_URL = '/a'\n",
+    })
+    for (const p of ['/src/main.ts', '/src/App.tsx', '/src/constants.js']) await s.get(p)
+    s.write('src/constants.js', "export const API_URL = '/b'\n")
+    expect(upd(await s.next())).toEqual(['/src/App.tsx'])
   })
 
   it('detects entries after env substitution in index.html', async () => {

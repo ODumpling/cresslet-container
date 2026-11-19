@@ -44,6 +44,14 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   /** Bumped per module by each HMR flush: an in-flight transform from an older generation must not be cached or report errors. */
   const generation = new Map<string, number>()
   const bump = (f: string) => generation.set(f, (generation.get(f) ?? 0) + 1)
+  /** Bumped by every full reload (graph reset): work started for the previous page must not touch the new one's state. */
+  let pageGen = 0
+  /** Generation of the transform that last published a module's graph edges/accept (current page only). */
+  const published = new Map<string, number>()
+  /** Modules with a transform in flight (current page): a change to one isn't "never served", even without a graph node. */
+  const inflight = new Map<string, number>()
+  /** Whether a transform of `f` started at generation `gen` during page `page` is still current. */
+  const fresh = (f: string, gen: number, page: number) => page === pageGen && (generation.get(f) ?? 0) === gen
   let lastError = ''
   let lastErrorFile = ''
 
@@ -70,6 +78,9 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       pending.clear()
       lastError = lastErrorFile = '' // the page starts over; a still-broken module reports again when requested
       graph.reset() // so is its module graph: edges/boundaries are re-learnt from what the new page requests
+      pageGen++
+      published.clear()
+      inflight.clear()
       post({ type: 'reload' })
     }, 60)
   }
@@ -96,6 +107,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     const gone = files.filter((f) => graph.nodes.has(f) && !vfs.isFile(f))
     for (const f of gone) {
       graph.remove(f)
+      published.delete(f)
       hmrStamp.delete(f)
       transformCache.delete(f)
       unresolved.delete(f)
@@ -106,7 +118,8 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     const chain = new Set<string>()
     for (let i = 0; i < files.length; i++) {
       const f = files[i]
-      if (!graph.nodes.has(f)) {
+      // a module whose first transform is in flight has no node yet, but the page is about to run it
+      if (!graph.nodes.has(f) && !inflight.has(f)) {
         // never served to the page, so it can't affect it, unless it's something loaded outside the module graph
         // or a module whose import of it failed to resolve
         if (vfs.isDir(f)) continue
@@ -224,6 +237,8 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   })
 
   const SCRIPT_LOADERS = new Set(['ts', 'tsx', 'jsx', 'js'])
+  /** esbuild's JSX output (automatic or classic runtime): a module without it is not a component module. */
+  const JSX_CALL = /(?<![\w$.])(?:jsxs?|jsxDEV|createElement)\d*\s*\(|(?<![\w$.])React\d*\.createElement\s*\(/ // not document.createElement
   const loaderOf = (p: string) => {
     const e = extname(p)
     return e === '.tsx' ? 'tsx' : e === '.ts' || e === '.mts' || e === '.cts' ? 'ts' : e === '.jsx' ? 'jsx' : 'jsx'
@@ -231,12 +246,22 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
 
   const transformScript = async (abs: string): Promise<string> => {
     const st = vfs.stat(abs)
+    const gen = generation.get(abs) ?? 0
+    const page = pageGen
     const hit = transformCache.get(abs)
     if (hit && hit.mtime === st.mtimeMs) {
-      publish(abs, hit.imports, hit.boundary)
+      publish(abs, hit.imports, hit.boundary, gen, page)
       return hit.code
     }
-    const gen = generation.get(abs) ?? 0
+    inflight.set(abs, (inflight.get(abs) ?? 0) + 1)
+    try {
+      return await buildScript(abs, st.mtimeMs, gen, page)
+    } finally {
+      const k = (inflight.get(abs) ?? 0) - 1
+      if (page === pageGen) k > 0 ? inflight.set(abs, k) : inflight.delete(abs) // a reset already cleared it
+    }
+  }
+  const buildScript = async (abs: string, mtime: number, gen: number, page: number): Promise<string> => {
     const es = await loadEsbuild(c.esbuildWasmUrl)
     const locals = new Set<string>()
     unresolved.delete(abs)
@@ -262,17 +287,23 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     if (cfg.refresh && SCRIPT_LOADERS.has(loaderOf(abs))) {
       const rr = refreshTransform(code, toUrl(abs))
       code = rr.code
-      // only component modules can be boundaries: a .ts module exporting API_URL / an enum must not self-accept
-      boundary = rr.boundary && (loaderOf(abs) === 'jsx' || loaderOf(abs) === 'tsx')
+      // only component modules can be boundaries: a .ts/.js module exporting API_URL / an enum must not self-accept
+      boundary = rr.boundary && (loaderOf(abs) === 'jsx' || loaderOf(abs) === 'tsx') && JSX_CALL.test(r.outputFiles[0].text)
     }
     // the graph describes the code the page actually runs, even if the file changed meanwhile
-    publish(abs, locals, boundary)
+    publish(abs, locals, boundary, gen, page)
     // changed while this transform was in flight: serve it, but don't cache stale code
-    if ((generation.get(abs) ?? 0) !== gen) return code
-    transformCache.set(abs, { mtime: st.mtimeMs, code, imports: locals, boundary })
+    if (!fresh(abs, gen, page)) return code
+    transformCache.set(abs, { mtime, code, imports: locals, boundary })
     return code
   }
-  const publish = (abs: string, imports: Set<string>, boundary: boolean) => {
+  /**
+   * Record a transform's edges/accept, unless it is from a previous page (after a full reload) or a newer transform of
+   * the module already published; a stale transform still publishes when nothing newer has (its code is what runs).
+   */
+  const publish = (abs: string, imports: Set<string>, boundary: boolean, gen: number, page: number) => {
+    if (page !== pageGen || gen < (published.get(abs) ?? -1)) return
+    published.set(abs, gen)
     graph.setImports(abs, imports)
     graph.ensure(abs).accept = boundary ? 'self' : null
   }
@@ -460,14 +491,16 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       }
       if (SCRIPT_EXT.test(abs)) {
         const gen = generation.get(abs) ?? 0
+        const page = pageGen
         try {
           const code = await transformScript(abs)
-          if (lastErrorFile === abs) lastError = lastErrorFile = ''
+          // a stale success (file changed / page reloaded meanwhile) must not clear a newer error
+          if (lastErrorFile === abs && fresh(abs, gen, page)) lastError = lastErrorFile = ''
           return new Response(code, { headers: JS })
         } catch (e) {
           const msg = formatErrors(e)
-          // the file changed while this transform ran: its error is not the page's current problem
-          if ((generation.get(abs) ?? 0) === gen) {
+          // the file changed / the page reloaded while this transform ran: its error is not the page's current problem
+          if (fresh(abs, gen, page)) {
             lastError = msg
             lastErrorFile = abs
           }
