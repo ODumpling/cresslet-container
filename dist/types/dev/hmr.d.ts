@@ -16,6 +16,8 @@ export declare class ModuleGraph {
     private entries;
     setEntries(html: string, files: Iterable<string>): void;
     isEntry(file: string): boolean;
+    /** Forget everything page-scoped (a full reload): the new page's requests rebuild it. */
+    reset(): void;
     /** Drop a deleted/renamed module: its node and the edges pointing at it. */
     remove(file: string): void;
     ensure(file: string, kind?: ModuleNode['kind']): ModuleNode;

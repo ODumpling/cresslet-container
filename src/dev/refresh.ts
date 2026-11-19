@@ -113,10 +113,11 @@ const shapes = new Map();
 const shapeChanged = new Set();
 /** Record a boundary's exports (name -> refresh family); a different shape than last time means it can't hot-update. */
 export function exportsOf(id, mod) {
-  const next = Object.keys(mod).sort().map((k) => [k, R.getFamilyByType(mod[k])]);
+  const next = Object.keys(mod).sort().map((k) => [k, R.getFamilyByType(mod[k]), mod[k]]);
   const prev = shapes.get(id);
   shapes.set(id, next);
-  if (prev && (prev.length !== next.length || prev.some(([k, f], i) => next[i][0] !== k || next[i][1] !== f))) shapeChanged.add(id);
+  // an export with no known family (unregistered component) can't be refreshed in place: a new value is a change
+  if (prev && (prev.length !== next.length || prev.some(([k, f, v], i) => next[i][0] !== k || next[i][1] !== f || (!f && next[i][2] !== v)))) shapeChanged.add(id);
   else shapeChanged.delete(id);
 }
 /** Whether the last evaluation of module \`id\` added/removed exports or re-pointed one to another component. */

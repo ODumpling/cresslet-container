@@ -28,6 +28,12 @@ export class ModuleGraph {
     return false
   }
 
+  /** Forget everything page-scoped (a full reload): the new page's requests rebuild it. */
+  reset(): void {
+    this.nodes.clear()
+    this.entries.clear()
+  }
+
   /** Drop a deleted/renamed module: its node and the edges pointing at it. */
   remove(file: string): void {
     const n = this.nodes.get(file)

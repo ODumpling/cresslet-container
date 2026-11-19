@@ -139,6 +139,12 @@ describe('refresh runtime: export shape', () => {
     expect(load({ default: 'Main' })).toBe(false)
     expect(load({ default: 'Main', Extra: 'Extra' })).toBe(true) // export added
     expect(load({ default: 'Main' })).toBe(true) // export removed
+    // unknown refresh family (unregistered component): a changed export value is a change
+    const unreg = (mod: Record<string, unknown>) => (rt.exportsOf('/u.tsx', mod), rt.exportsChanged('/u.tsx'))
+    const same = comp('Y')
+    expect(unreg({ default: comp('X') })).toBe(false) // initial load
+    expect(unreg({ default: same })).toBe(true)
+    expect(unreg({ default: same })).toBe(false)
   })
 })
 

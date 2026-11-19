@@ -39,8 +39,9 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   let defines = { ...envDefines(env), 'process.env.NODE_ENV': '"development"' }
   const deps = new DepOptimizer(vfs, fs, root, { wasmURL: c.esbuildWasmUrl, define: { 'process.env.NODE_ENV': '"development"' } })
   deps.onStale = () => scheduleReload('dependencies re-optimized')
-  const transformCache = new Map<string, { mtime: number; code: string }>()
-  /** Bumped per module by each HMR flush: an in-flight transform from an older generation must not publish. */
+  /** Transformed scripts, with what the graph needs to re-learn them after a full reload resets it. */
+  const transformCache = new Map<string, { mtime: number; code: string; imports: Set<string>; boundary: boolean }>()
+  /** Bumped per module by each HMR flush: an in-flight transform from an older generation must not be cached or report errors. */
   const generation = new Map<string, number>()
   const bump = (f: string) => generation.set(f, (generation.get(f) ?? 0) + 1)
   let lastError = ''
@@ -52,6 +53,8 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   const hmrStamp = new Map<string, number>()
   /** Modules with a relative import that didn't resolve (yet). */
   const unresolved = new Set<string>()
+  /** Files served as-is (e.g. a runtime `fetch('/data.json')`): outside the module graph, but the page uses them. */
+  const served = new Set<string>()
   let reloadTimer: ReturnType<typeof setTimeout> | null = null
   let depsTimer: ReturnType<typeof setTimeout> | null = null
   let flushTimer: ReturnType<typeof setTimeout> | null = null
@@ -66,6 +69,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       reloadTimer = null
       pending.clear()
       lastError = lastErrorFile = '' // the page starts over; a still-broken module reports again when requested
+      graph.reset() // so is its module graph: edges/boundaries are re-learnt from what the new page requests
       post({ type: 'reload' })
     }, 60)
   }
@@ -106,6 +110,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
         // never served to the page, so it can't affect it, unless it's something loaded outside the module graph
         // or a module whose import of it failed to resolve
         if (vfs.isDir(f)) continue
+        if (served.has(f)) return scheduleReload(f)
         if (!SCRIPT_EXT.test(f) && !f.endsWith('.css')) {
           if (ASSET_EXT.test(f)) return scheduleReload(f)
           continue // README, dotfiles, editor temp files...
@@ -227,7 +232,10 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   const transformScript = async (abs: string): Promise<string> => {
     const st = vfs.stat(abs)
     const hit = transformCache.get(abs)
-    if (hit && hit.mtime === st.mtimeMs) return hit.code
+    if (hit && hit.mtime === st.mtimeMs) {
+      publish(abs, hit.imports, hit.boundary)
+      return hit.code
+    }
     const gen = generation.get(abs) ?? 0
     const es = await loadEsbuild(c.esbuildWasmUrl)
     const locals = new Set<string>()
@@ -254,14 +262,19 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     if (cfg.refresh && SCRIPT_LOADERS.has(loaderOf(abs))) {
       const rr = refreshTransform(code, toUrl(abs))
       code = rr.code
-      boundary = rr.boundary
+      // only component modules can be boundaries: a .ts module exporting API_URL / an enum must not self-accept
+      boundary = rr.boundary && (loaderOf(abs) === 'jsx' || loaderOf(abs) === 'tsx')
     }
-    // changed while this transform was in flight: serve it, but don't publish stale code / edges
+    // the graph describes the code the page actually runs, even if the file changed meanwhile
+    publish(abs, locals, boundary)
+    // changed while this transform was in flight: serve it, but don't cache stale code
     if ((generation.get(abs) ?? 0) !== gen) return code
-    graph.setImports(abs, locals)
-    graph.ensure(abs).accept = boundary ? 'self' : null
-    transformCache.set(abs, { mtime: st.mtimeMs, code })
+    transformCache.set(abs, { mtime: st.mtimeMs, code, imports: locals, boundary })
     return code
+  }
+  const publish = (abs: string, imports: Set<string>, boundary: boolean) => {
+    graph.setImports(abs, imports)
+    graph.ensure(abs).accept = boundary ? 'self' : null
   }
 
   const transformInline = async (code: string, htmlPath: string): Promise<string> => {
@@ -351,7 +364,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   }
 
   const transformHtml = async (abs: string): Promise<string> => {
-    let html = vfs.readText(abs)
+    let html = vfs.readText(abs).replace(/%(\w+)%/g, (m, k) => (k in env ? String(env[k]) : m))
     graph.setEntries(
       abs,
       findModuleScripts(html).map((src) => {
@@ -359,7 +372,6 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
         return p.startsWith('/') ? fromUrl(p) : join(dirname(abs), p)
       }),
     )
-    html = html.replace(/%(\w+)%/g, (m, k) => (k in env ? String(env[k]) : m))
     // transform inline module scripts
     const inline = /<script\b([^>]*\btype\s*=\s*["']?module["']?[^>]*)>([\s\S]*?)<\/script>/gi
     const parts: Promise<string>[] = []
@@ -447,14 +459,19 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
         if (ASSET_EXT.test(abs) || !SCRIPT_EXT.test(abs)) return new Response(`export default ${JSON.stringify(pathname)}`, { headers: JS })
       }
       if (SCRIPT_EXT.test(abs)) {
+        const gen = generation.get(abs) ?? 0
         try {
           const code = await transformScript(abs)
           if (lastErrorFile === abs) lastError = lastErrorFile = ''
           return new Response(code, { headers: JS })
         } catch (e) {
-          lastError = formatErrors(e)
-          lastErrorFile = abs
-          return new Response(errorModule(lastError), { headers: JS })
+          const msg = formatErrors(e)
+          // the file changed while this transform ran: its error is not the page's current problem
+          if ((generation.get(abs) ?? 0) === gen) {
+            lastError = msg
+            lastErrorFile = abs
+          }
+          return new Response(errorModule(msg), { headers: JS })
         }
       }
       return fileResponse(abs)
@@ -466,7 +483,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     }
   }
 
-  const fileResponse = (abs: string) => new Response(vfs.readFile(abs) as BodyInit, { headers: { 'content-type': mimeType(abs), ...NO_CACHE } })
+  const fileResponse = (abs: string) => (served.add(abs), new Response(vfs.readFile(abs) as BodyInit, { headers: { 'content-type': mimeType(abs), ...NO_CACHE } }))
 
   const url = c.ports.open(port, handler, 'dev-server')
   return {

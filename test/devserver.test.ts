@@ -11,10 +11,11 @@ vi.mock('../src/esbuild', async (orig) => {
   const es = {
     ...real,
     build: async (o: Parameters<typeof real.build>[0]) => {
-      const r = await real.build(o)
+      const r = await real.build(o).then((v) => ({ v }), (e: unknown) => ({ e }))
       gate.built++
       if (gate.hold) await gate.hold // simulates a transform still in flight
-      return r
+      if ('e' in r) throw r.e
+      return r.v
     },
   }
   return { ...m, loadEsbuild: async () => es }
@@ -121,7 +122,7 @@ describe('dev server HMR', () => {
     s.write('src/main.ts', "import App from './App'\n")
     s.rm('src/Old.tsx')
     expect(upd(await s.next())).toBe('reload')
-    await s.get('/src/main.ts')
+    for (const p of ['/src/main.ts', '/src/App.tsx', '/src/util.ts']) await s.get(p) // the reloaded page
     s.write('src/util.ts', 'export default 2\n')
     expect(upd(await s.next())).toEqual(['/src/App.tsx'])
   })
@@ -158,6 +159,84 @@ describe('dev server HMR', () => {
     s.vfs.mkdir(join(ROOT, 'src/newdir'), { recursive: true })
     expect(await s.quiet()).toEqual([])
     s.write('src/logo.svg', '<svg/>')
+    expect(upd(await s.next())).toBe('reload')
+  })
+
+  /** Run `get(path)` with its transform held in flight while `during` runs; resolves to the served code. */
+  const inFlight = async (s: Awaited<ReturnType<typeof devServer>>, path: string, during: () => Promise<unknown>) => {
+    let release!: () => void
+    gate.hold = new Promise((r) => (release = r))
+    const built = gate.built
+    const res = s.get(path)
+    while (gate.built === built) await new Promise((r) => setTimeout(r, 5))
+    await during()
+    gate.hold = null
+    release()
+    return res
+  }
+
+  it('only jsx/tsx modules can be refresh boundaries (a .ts constants module is not)', async () => {
+    const s = await devServer({
+      'src/main.ts': "import App from './App'\n",
+      'src/App.tsx': comp('App', 'return API_URL', "import { API_URL } from './constants'"),
+      'src/constants.ts': "export const API_URL = '/a'\nexport enum Color { Red }\n",
+    })
+    for (const p of ['/src/main.ts', '/src/App.tsx', '/src/constants.ts']) await s.get(p)
+    s.write('src/constants.ts', "export const API_URL = '/b'\nexport enum Color { Red }\n")
+    expect(upd(await s.next())).toEqual(['/src/App.tsx'])
+  })
+
+  it('a module edited during its first transform still gets its graph node (later edits update)', async () => {
+    const s = await devServer({ 'src/main.ts': "import App from './App'\n", 'src/App.tsx': comp('App') })
+    await s.get('/src/main.ts')
+    await inFlight(s, '/src/App.tsx', async () => {
+      s.write('src/App.tsx', comp('App', 'return 1'))
+      await s.quiet() // flush runs (bumps the generation) while the transform is held
+    })
+    s.write('src/App.tsx', comp('App', 'return 2'))
+    expect(upd(await s.next())).toEqual(['/src/App.tsx'])
+  })
+
+  it('an error from a stale transform is not published to last-error', async () => {
+    const s = await devServer({ 'src/main.ts': "import App from './App'\n", 'src/App.tsx': 'export default function App( {\n' })
+    await s.get('/src/main.ts')
+    const code = await inFlight(s, '/src/App.tsx', async () => {
+      s.write('src/App.tsx', comp('App'))
+      await s.quiet()
+    })
+    expect(code).toContain('moduleError')
+    expect(await s.get('/@cresslet/last-error')).toBe('')
+  })
+
+  it('detects entries after env substitution in index.html', async () => {
+    const s = await devServer({ '.env': 'VITE_ENTRY=/src/App.tsx\n', 'index.html': '<script type="module" src="%VITE_ENTRY%"></script>', 'src/App.tsx': comp('App') })
+    expect(await s.get('/')).toContain('src="/src/App.tsx"')
+    await s.get('/src/App.tsx')
+    s.write('src/App.tsx', comp('App', 'return 1'))
+    expect(upd(await s.next())).toBe('reload')
+  })
+
+  it('a full reload resets the graph: a module that lost its last importer is no longer a boundary', async () => {
+    const s = await devServer({
+      'index.html': '<script type="module" src="/src/main.ts"></script>',
+      'src/main.ts': "import Widget from './Widget'\n",
+      'src/Widget.tsx': comp('Widget'),
+    })
+    for (const p of ['/', '/src/main.ts', '/src/Widget.tsx']) await s.get(p)
+    s.write('src/main.ts', 'export {}\n')
+    expect(upd(await s.next())).toBe('reload')
+    for (const p of ['/', '/src/main.ts']) await s.get(p) // the reloaded page no longer imports Widget
+    s.write('src/Widget.tsx', comp('Widget', 'return 1'))
+    expect(await s.quiet()).toEqual([])
+  })
+
+  it('a served file outside the module graph (runtime fetch) reloads when changed', async () => {
+    const s = await devServer({ 'src/App.tsx': comp('App'), 'src/data.json': '{"a":1}', 'src/other.json': '{}' })
+    await s.get('/src/App.tsx')
+    expect(await s.get('/src/data.json')).toBe('{"a":1}')
+    s.write('src/other.json', '{"b":1}') // never served
+    expect(await s.quiet()).toEqual([])
+    s.write('src/data.json', '{"a":2}')
     expect(upd(await s.next())).toBe('reload')
   })
 })
