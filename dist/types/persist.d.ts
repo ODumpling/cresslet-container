@@ -22,6 +22,8 @@ export interface Persistence {
 export declare const DEFAULT_KEY = "default";
 /** Serialize `dir` (recursively, without `node_modules`) into one snapshot blob. */
 export declare function encodeSnapshot(vfs: VFS, dir: string): Uint8Array;
+/** When a snapshot was saved (0 if unreadable). */
+export declare function savedAt(bytes: Uint8Array): number;
 /** Write a snapshot's files into `dir`. Throws (having written nothing) if the blob isn't a valid snapshot. */
 export declare function restoreSnapshot(vfs: VFS, dir: string, bytes: Uint8Array): void;
 export interface SnapshotStore {
@@ -41,6 +43,8 @@ export declare function opfsStore(create?: boolean): Promise<SnapshotStore | nul
 export declare function idbStore(create?: boolean): Promise<SnapshotStore | null>;
 /** The store snapshots go to: OPFS, else IndexedDB, else null. */
 export declare function pickStore(): Promise<SnapshotStore | null>;
+/** The backend not in use, to read or delete what it holds (written while the one in use wasn't usable). */
+export declare function otherStore(inUse: SnapshotStore['backend']): Promise<SnapshotStore | null>;
 /**
  * Delete a key's snapshot from every backend (one in use may differ from the one that wrote it), and from `inUse`.
  * Creates no storage.
@@ -49,11 +53,10 @@ export declare function clearSnapshot(key: string, inUse?: SnapshotStore | null)
 export declare function persistKey(key?: unknown): string;
 export declare class VfsPersistence implements Persistence {
     private readonly vfs;
-    private readonly dir;
     /** Reports a snapshot that failed to store outside `flush()` (debounced and page-hide writes). */
     private readonly onError;
     private readonly getStore;
-    private readonly readFallback;
+    private readonly getOther;
     readonly key: string;
     backend: 'opfs' | 'indexeddb' | null;
     restored: boolean;
@@ -69,11 +72,14 @@ export declare class VfsPersistence implements Persistence {
     private queue;
     /** A write waiting for the one in progress. It serializes the workdir when it starts, so later changes join it. */
     private queued;
+    /** The other backend holds a copy of this key: dropped after the first save. */
+    private otherCopy;
     private stops;
     private closed;
+    private readonly dir;
     constructor(vfs: VFS, dir: string, opts: PersistOptions, 
     /** Reports a snapshot that failed to store outside `flush()` (debounced and page-hide writes). */
-    onError: (message: string) => void, getStore?: () => Promise<SnapshotStore | null>, readFallback?: (key: string) => Promise<Uint8Array | null>);
+    onError: (message: string) => void, getStore?: () => Promise<SnapshotStore | null>, getOther?: (inUse: SnapshotStore['backend']) => Promise<SnapshotStore | null>);
     /** Pick the store, restore the workdir from its snapshot, then start watching for changes. */
     start(): Promise<void>;
     private changed;

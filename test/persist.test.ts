@@ -112,11 +112,11 @@ describe('snapshot codec', () => {
 describe('VfsPersistence', () => {
   afterEach(() => vi.useRealTimers())
 
-  async function setup(opts = {}, store = new MemoryStore(), fallback = new MemoryStore()) {
+  async function setup(opts = {}, store = new MemoryStore(), other = new MemoryStore('indexeddb'), dir = W) {
     const fs = new VFS()
     fs.mkdir(W, { recursive: true })
     const errors: string[] = []
-    const p = new VfsPersistence(fs, W, opts, (m) => errors.push(m), async () => store, (k) => fallback.read(k))
+    const p = new VfsPersistence(fs, dir, opts, (m) => errors.push(m), async () => store, async () => other)
     await p.start()
     return { fs, p, store, errors }
   }
@@ -274,12 +274,57 @@ describe('VfsPersistence', () => {
     expect(back.readdir(W).length).toBe(505)
   })
 
-  it('restores from IndexedDB when OPFS has no snapshot', async () => {
-    const fallback = new MemoryStore()
-    fallback.data.set('default', encodeSnapshot(project(), W))
-    const { fs, p } = await setup({}, new MemoryStore('opfs'), fallback)
-    expect(p).toMatchObject({ restored: true, backend: 'opfs' })
-    expect(fs.readText(`${W}/src/main.ts`)).toBe('console.log(1)')
+  it('restores the newer of the two backends\' snapshots; the first save drops the other copy', async () => {
+    const snap = (text: string, t: number) => {
+      vi.useFakeTimers({ toFake: ['Date'] })
+      vi.setSystemTime(t)
+      try {
+        const fs = new VFS()
+        fs.writeFile(`${W}/a`, text, { mkdirp: true })
+        return encodeSnapshot(fs, W)
+      } finally {
+        vi.useRealTimers()
+      }
+    }
+    for (const [mineAt, theirsAt, want] of [[null, 100, 'theirs'], [100, 200, 'theirs'], [200, 100, 'mine']] as const) {
+      const store = new MemoryStore('opfs')
+      const other = new MemoryStore('indexeddb')
+      if (mineAt) store.data.set('default', snap('mine', mineAt))
+      other.data.set('default', snap('theirs', theirsAt))
+      const { fs, p } = await setup({ debounceMs: 60_000 }, store, other)
+      expect(p).toMatchObject({ restored: true, backend: 'opfs' })
+      expect(fs.readText(`${W}/a`)).toBe(want)
+      fs.writeFile(`${W}/a`, 'new')
+      await p.flush()
+      expect(other.data.has('default')).toBe(false)
+      expect(store.data.has('default')).toBe(true)
+    }
+  })
+
+  it('normalizes the workdir path (trailing slash, relative)', async () => {
+    for (const dir of [`${W}/`, W.slice(1)]) {
+      const store = new MemoryStore()
+      const { fs, p } = await setup({ debounceMs: 60_000 }, store, undefined, dir)
+      fs.writeFile(`${W}/a`, '1')
+      await p.flush()
+      expect(store.writes).toBe(1)
+    }
+  })
+
+  it('teardown retries a write in progress that fails', async () => {
+    const store = new MemoryStore()
+    const { fs, p } = await setup({ debounceMs: 60_000 }, store)
+    fs.writeFile(`${W}/a`, '1')
+    store.failures = 1
+    const gate = deferred()
+    store.gate = gate.p
+    const write = p.flush()
+    await new Promise((r) => setTimeout(r)) // in progress, nothing else pending
+    p.close()
+    gate.open()
+    await expect(write).rejects.toThrow()
+    await new Promise((r) => setTimeout(r, 10))
+    expect(store.writes).toBe(1)
   })
 
   it('close() writes pending changes and stops watching', async () => {

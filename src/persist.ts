@@ -4,6 +4,7 @@
 // on teardown / page hide (best effort). Each one replaces the previous snapshot as a whole (one OPFS file or one
 // IndexedDB record), so a write cut short leaves the previous snapshot.
 import type { VFS } from './vfs'
+import { normalize } from './path'
 
 export interface PersistOptions {
   /** Snapshot name: one per project. Default 'default'. Containers with the same key share (overwrite) one snapshot. */
@@ -33,7 +34,8 @@ const DEFAULT_MAX_WRITES = 100
 
 // ---------------- snapshot format ----------------
 // 'CVFS' | u32 LE header length | header JSON | file bytes (in header order)
-// header: { v: 1, entries: [relPath, 'd' | 'f' | 'l', mtime, size (f) | target (l)][] }, parents before children.
+// header: { v: 1, t: saved at (ms), entries: [relPath, 'd' | 'f' | 'l', mtime, size (f) | target (l)][] }, parents
+// before children.
 const MAGIC = [0x43, 0x56, 0x46, 0x53]
 type Entry = [path: string, type: 'd' | 'f' | 'l', mtime: number, extra?: number | string]
 
@@ -61,7 +63,7 @@ export function encodeSnapshot(vfs: VFS, dir: string): Uint8Array {
     }
   }
   if (vfs.isDir(dir)) walk(dir, '') // a removed workdir is an empty one
-  const header = new TextEncoder().encode(JSON.stringify({ v: 1, entries }))
+  const header = new TextEncoder().encode(JSON.stringify({ v: 1, t: Date.now(), entries }))
   let size = 8 + header.byteLength
   for (const c of chunks) size += c.byteLength
   const out = new Uint8Array(size)
@@ -76,13 +78,28 @@ export function encodeSnapshot(vfs: VFS, dir: string): Uint8Array {
   return out
 }
 
-/** Write a snapshot's files into `dir`. Throws (having written nothing) if the blob isn't a valid snapshot. */
-export function restoreSnapshot(vfs: VFS, dir: string, bytes: Uint8Array): void {
+function readHeader(bytes: Uint8Array): { len: number; header: { v: number; t?: number; entries: Entry[] } } {
   if (bytes.byteLength < 8 || MAGIC.some((b, i) => bytes[i] !== b)) throw new Error('not a VFS snapshot')
   const len = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(4, true)
   if (8 + len > bytes.byteLength) throw new Error('truncated VFS snapshot')
-  const header = JSON.parse(new TextDecoder().decode(bytes.subarray(8, 8 + len))) as { v: number; entries: Entry[] }
-  if (header.v !== 1 || !Array.isArray(header.entries)) throw new Error(`unsupported VFS snapshot version ${header.v}`)
+  const header = JSON.parse(new TextDecoder().decode(bytes.subarray(8, 8 + len)))
+  if (header?.v !== 1 || !Array.isArray(header.entries)) throw new Error(`unsupported VFS snapshot version ${header?.v}`)
+  return { len, header }
+}
+
+/** When a snapshot was saved (0 if unreadable). */
+export function savedAt(bytes: Uint8Array): number {
+  try {
+    const t = readHeader(bytes).header.t
+    return typeof t === 'number' ? t : 0
+  } catch {
+    return 0
+  }
+}
+
+/** Write a snapshot's files into `dir`. Throws (having written nothing) if the blob isn't a valid snapshot. */
+export function restoreSnapshot(vfs: VFS, dir: string, bytes: Uint8Array): void {
+  const { len, header } = readHeader(bytes)
   // validate everything before touching the VFS
   let off = 8 + len
   const files: Uint8Array[] = []
@@ -153,8 +170,11 @@ export async function opfsStore(create = true): Promise<SnapshotStore | null> {
     if (create) {
       // createWritable() can exist and still be refused: probe it (a name of its own, so concurrent boots don't collide)
       const probe = `probe-${Math.random().toString(36).slice(2)}`
-      await (await (await dir.getFileHandle(probe, { create: true })).createWritable()).abort()
-      await dir.removeEntry(probe).catch(() => {})
+      try {
+        await (await (await dir.getFileHandle(probe, { create: true })).createWritable()).abort()
+      } finally {
+        await dir.removeEntry(probe).catch(() => {})
+      }
     }
     return {
       backend: 'opfs',
@@ -248,14 +268,9 @@ export async function pickStore(): Promise<SnapshotStore | null> {
   return (await opfsStore()) ?? (await idbStore())
 }
 
-/** Read a snapshot IndexedDB holds without creating the database (written while OPFS wasn't usable). */
-async function readIdbFallback(key: string): Promise<Uint8Array | null> {
-  const s = await idbStore(false)
-  try {
-    return (await s?.read(key)) ?? null
-  } finally {
-    s?.close()
-  }
+/** The backend not in use, to read or delete what it holds (written while the one in use wasn't usable). */
+export function otherStore(inUse: SnapshotStore['backend']): Promise<SnapshotStore | null> {
+  return inUse === 'opfs' ? idbStore(false) : opfsStore(false)
 }
 
 /**
@@ -294,18 +309,23 @@ export class VfsPersistence implements Persistence {
   private queue: Promise<void> = Promise.resolve()
   /** A write waiting for the one in progress. It serializes the workdir when it starts, so later changes join it. */
   private queued: Promise<void> | null = null
+  /** The other backend holds a copy of this key: dropped after the first save. */
+  private otherCopy = false
   private stops: (() => void)[] = []
   private closed = false
+  private readonly dir: string
 
   constructor(
     private readonly vfs: VFS,
-    private readonly dir: string,
+    dir: string,
     opts: PersistOptions,
     /** Reports a snapshot that failed to store outside `flush()` (debounced and page-hide writes). */
     private readonly onError: (message: string) => void,
     private readonly getStore: () => Promise<SnapshotStore | null> = pickStore,
-    private readonly readFallback: (key: string) => Promise<Uint8Array | null> = readIdbFallback,
+    private readonly getOther: (inUse: SnapshotStore['backend']) => Promise<SnapshotStore | null> = otherStore,
   ) {
+    // '/home/project/', 'home/project': the watcher compares absolute paths without a trailing slash
+    this.dir = normalize('/' + dir).replace(/(.)\/$/, '$1')
     this.key = persistKey(opts.key)
     this.debounceMs = opts.debounceMs ?? DEFAULT_DEBOUNCE
     this.maxWrites = opts.maxWrites ?? DEFAULT_MAX_WRITES
@@ -318,16 +338,21 @@ export class VfsPersistence implements Persistence {
     this.store = await this.getStore()
     this.backend = this.store?.backend ?? null
     if (!this.store || this.closed) return
+    const other = await this.getOther(this.store.backend).catch(() => null)
     try {
-      let bytes = await this.store.read(this.key)
-      // saved to IndexedDB while OPFS wasn't usable (e.g. before a browser update): the next save moves it to OPFS
-      if (!bytes && this.store.backend === 'opfs') bytes = await this.readFallback(this.key)
+      // the other backend may hold a copy saved while this one wasn't usable (OPFS before a browser update, or
+      // read-only for a while): restore the newer one
+      const [mine, theirs] = await Promise.all([this.store.read(this.key), other?.read(this.key).catch(() => null) ?? null])
+      this.otherCopy = !!theirs
+      const bytes = theirs && (!mine || savedAt(theirs) > savedAt(mine)) ? theirs : mine
       if (bytes) {
         restoreSnapshot(this.vfs, this.dir, bytes)
         this.restored = true
       }
     } catch (e) {
       console.warn(`[cresslet] VFS snapshot '${this.key}' not restored:`, e)
+    } finally {
+      other?.close()
     }
     if (this.closed) return
     // from the root: removing or renaming an ancestor (`rm -rf /home`) changes the workdir too
@@ -393,6 +418,13 @@ export class VfsPersistence implements Persistence {
       if (gen === this.gen) this.pending += n // the next change, flush() or teardown retries
       throw e
     }
+    if (this.otherCopy) {
+      // older than what was just saved; best effort (newest-wins at boot covers a copy that can't be deleted)
+      this.otherCopy = false
+      const other = await this.getOther(store.backend).catch(() => null)
+      await other?.delete(this.key).catch(() => {})
+      other?.close()
+    }
   }
 
   clear(): Promise<void> {
@@ -400,6 +432,7 @@ export class VfsPersistence implements Persistence {
     this.pending = 0
     this.gen++
     this.queued = null
+    this.otherCopy = false // deleted too
     const store = this.store
     const p = this.queue.catch(() => {}).then(() => clearSnapshot(this.key, store))
     this.queue = p
@@ -412,9 +445,11 @@ export class VfsPersistence implements Persistence {
     this.closed = true
     for (const s of this.stops.splice(0)) s()
     this.cancelTimer()
-    // the container's listeners are gone by the time this fails: warn instead
-    if (this.pending) this.flush().catch((e) => console.warn(`[cresslet] VFS snapshot '${this.key}' not saved on teardown:`, e))
+    // also when nothing is pending: a write in progress that fails is retried. The container's listeners are gone
+    // by the time this fails: warn instead
     const store = this.store
-    void this.queue.catch(() => {}).then(() => store?.close())
+    void this.flush()
+      .catch((e) => console.warn(`[cresslet] VFS snapshot '${this.key}' not saved on teardown:`, e))
+      .then(() => store?.close())
   }
 }

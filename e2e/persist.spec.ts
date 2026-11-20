@@ -77,7 +77,7 @@ for (const backend of ['opfs', 'indexeddb'] as const) {
   })
 }
 
-test('a snapshot saved to IndexedDB (no OPFS writes then) is restored once OPFS is in use', async ({ browser, browserName }) => {
+test('switching between OPFS and IndexedDB (OPFS unwritable for a while) restores the newest snapshot', async ({ browser, browserName }) => {
   test.skip(browserName === 'webkit', "Playwright's WebKit has no OPFS")
   const ctx = await browser.newContext()
   const page = await ctx.newPage()
@@ -101,8 +101,25 @@ test('a snapshot saved to IndexedDB (no OPFS writes then) is restored once OPFS 
     await c.fs.writeFile('src/App.tsx', 'saved in opfs')
     await c.persistence!.flush()
   })
-  // clearing works on an OPFS snapshot even where OPFS can't be written (writable streams gone again)
+  // OPFS unwritable again: its snapshot is still restored, newer work goes to IndexedDB and wins once OPFS is back
   await page.evaluate(() => (sessionStorage.noOpfs = '1'))
+  await page.reload()
+  expect(await boot(page, { key: 'up' })).toMatchObject({ backend: 'indexeddb', restored: true, app: 'saved in opfs' })
+  await page.evaluate(async () => {
+    const { c } = window as unknown as Win
+    await c.fs.writeFile('src/App.tsx', 'saved in idb again')
+    await c.persistence!.flush()
+    sessionStorage.removeItem('noOpfs')
+  })
+  await page.reload()
+  expect(await boot(page, { key: 'up' })).toMatchObject({ backend: 'opfs', restored: true, app: 'saved in idb again' })
+  // clearing works on an OPFS snapshot even where OPFS can't be written (writable streams gone again)
+  await page.evaluate(async () => {
+    const { c } = window as unknown as Win
+    await c.fs.writeFile('src/App.tsx', 'saved in opfs again')
+    await c.persistence!.flush()
+    sessionStorage.noOpfs = '1'
+  })
   await page.reload()
   await page.evaluate(async () => {
     const { Container } = await import('/dist/cresslet-container.js')
