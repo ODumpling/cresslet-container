@@ -198,6 +198,12 @@ const collect = (child) => new Promise((resolve) => {
   await new Promise((res) => slow.on('close', res))
   r.slowAtClose = slowOut
   await reading
+  // a reader that pauses gets the rest after exit, then 'close'
+  const pauser = cp.spawn('node', ['-e', "process.stdout.write('a'); setTimeout(() => process.stdout.write('b'), 30)"])
+  let paused = ''
+  pauser.stdout.on('data', (d) => { paused += d; pauser.stdout.pause() })
+  await new Promise((res) => pauser.on('close', res))
+  r.pausedAtClose = paused
   r.timeout = await new Promise((res) => cp.exec('sleep 5', { timeout: 200 }, (e) => res({ killed: e.killed, signal: e.signal })))
   // a child blocked reading stdin still dies when killed
   r.catTimeout = await new Promise((res) => cp.exec('cat', { timeout: 100 }, (e) => res(e.signal)))
@@ -242,6 +248,7 @@ function checkChild(r: Record<string, unknown>, out: string) {
   expect(r.probe).toBe(true)
   expect(r.sigkill).toEqual(['SIGKILL', ''])
   expect(r.slowAtClose).toBe('line 0\nline 1\nline 2\nline 3\nline 4\n')
+  expect(r.pausedAtClose).toBe('ab')
   expect(r.timeout).toEqual({ killed: true, signal: 'SIGTERM' })
   expect(r.catTimeout).toBe('SIGTERM')
   expect(r.sigterm).toMatchObject({ out: 'got SIGTERM\n' })
