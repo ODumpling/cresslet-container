@@ -95,6 +95,16 @@ describe('IdbCache size cap', () => {
     expect(await meta()).toEqual({ ids: ['tarballs:b'], total: 40, sum: 40 })
   })
 
+  it('a hit bigger than a lowered cap is dropped, not kept at the expense of smaller entries', async () => {
+    const big = new IdbCache({ maxBytes: 100 })
+    await big.put('tarballs', 'small', bytes(10))
+    await big.put('tarballs', 'huge', bytes(60))
+    const small = new IdbCache({ maxBytes: 50 })
+    expect(await small.get('tarballs', 'huge')).toEqual(bytes(60))
+    expect(await small.get('tarballs', 'huge')).toBeUndefined()
+    expect(await meta()).toEqual({ ids: ['tarballs:small'], total: 10, sum: 10 })
+  })
+
   it('evicts across stores (packuments count, sized by their JSON)', async () => {
     const c = new IdbCache({ maxBytes: 100 })
     const pk = { at: 1, data: { name: 'x', versions: {} } }

@@ -160,8 +160,15 @@ export class IdbCache implements PackageCache {
       const state = meta.get(STATE)
       state.onsuccess = () => {
         const st = readState(state.result)
-        const e = entry.result as MetaEntry | undefined
-        if (req.result !== undefined && e) meta.put({ ...e, used: ++st.seq } satisfies MetaEntry)
+        let e = entry.result as MetaEntry | undefined
+        if (req.result === undefined || !e) return void (st.bytes > this.maxBytes && this.settle(t, st))
+        if (e.size > this.maxBytes) {
+          // bigger than a cap lowered since it was stored: it could never fit (this read still returns it)
+          t.objectStore(store).delete(key)
+          meta.delete(id)
+          st.bytes = Math.max(0, st.bytes - e.size)
+          e = undefined
+        } else meta.put({ ...e, used: ++st.seq } satisfies MetaEntry)
         this.settle(t, st, e) // also trims a cache over a cap lowered since it was filled
       }
       return () => req.result as T
