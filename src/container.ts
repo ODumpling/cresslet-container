@@ -434,7 +434,8 @@ export class Container {
       // the active worker as before: a newer one stuck in waiting (e.g. a custom SW without skipWaiting) must not hang boot
       const active = reg.active ?? (await newestWorker(reg, () => sw.ready))
       active.postMessage({ type: 'cresslet-register', instanceId: this.instanceId })
-      this.cleanups.push(() => active.postMessage({ type: 'cresslet-unregister', instanceId: this.instanceId }))
+      // to whichever worker is active by then (a newer one may have taken over since boot)
+      this.cleanups.push(() => (reg.active ?? active).postMessage({ type: 'cresslet-unregister', instanceId: this.instanceId }))
     } catch (e) {
       this.emit('error', { message: `Service worker registration failed (${url}): ${e instanceof Error ? e.message : e}` })
     }

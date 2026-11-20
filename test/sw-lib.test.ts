@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { isolate, isRelayClient, isReserved, receiveResponse, RESERVED, XORIGIN_HEADERS } from '../src/sw-lib'
+import { injectStrip, isolate, isRelayClient, isReserved, receiveResponse, RESERVED, XORIGIN_HEADERS } from '../src/sw-lib'
 import { isSwRequest, PortTable, rejectRequest, type SwRequest } from '../src/ports'
 
 const P = 'https://preview.example.net'
@@ -221,5 +221,18 @@ describe('ports: answer', () => {
     expect(f.sent.map((m) => m.type)).toEqual(['head'])
     expect(f.closes()).toBe(1)
     expect(f.reply.onmessage).toBeNull()
+  })
+})
+
+describe('injectStrip', () => {
+  it('injects the prefix-strip script into HTML', async () => {
+    const r = await injectStrip(new Response('<html><head></head><body>x</body></html>', { headers: { 'content-type': 'text/html' } }))
+    expect(await r.text()).toMatch(/<head><script>/)
+  })
+  it('passes null-body responses (205 Reset Content with an HTML type) through unchanged', async () => {
+    const res = new Response(null, { status: 205, headers: { 'content-type': 'text/html' } })
+    const r = await injectStrip(res)
+    expect(r.status).toBe(205)
+    expect(r.body).toBeNull()
   })
 })

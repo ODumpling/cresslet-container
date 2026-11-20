@@ -3,7 +3,7 @@
 // mapped back to their preview via the requesting client id (remembered per document, persisted in Cache
 // Storage so SW restarts keep working), falling back to the Referer.
 /// <reference lib="webworker" />
-import { isolate, isRelayClient, isReserved, PREFIX, receiveResponse, XORIGIN_HEADERS } from './sw-lib'
+import { injectStrip, isolate, isRelayClient, isReserved, PREFIX, receiveResponse, XORIGIN_HEADERS } from './sw-lib'
 declare const self: ServiceWorkerGlobalScope
 
 /** Registered by cresslet-relay.html on a separate preview origin: previews are embedded cross-origin by the host. */
@@ -157,18 +157,6 @@ function stripPrefix(u: string): string {
   } catch {
     return u
   }
-}
-
-/** Injected first into preview HTML: hide the preview prefix from the app (routers see "/"). */
-const STRIP_SCRIPT = `<script>(function(){var l=location,m=/^\\/__cresslet__\\/[^/]+\\/\\d+/.exec(l.pathname);if(m)history.replaceState(history.state,'',(l.pathname.slice(m[0].length)||'/')+l.search+l.hash)})()</script>`
-
-async function injectStrip(res: Response): Promise<Response> {
-  const html = await res.text()
-  const at = html.search(/<head[^>]*>/i)
-  const body = at >= 0 ? html.replace(/<head[^>]*>/i, (h) => h + STRIP_SCRIPT) : STRIP_SCRIPT + html
-  const headers = new Headers(res.headers)
-  headers.delete('content-length')
-  return new Response(body, { status: res.status, statusText: res.statusText, headers })
 }
 
 async function handleRelative(e: FetchEvent, t: Target, url: URL): Promise<Response> {

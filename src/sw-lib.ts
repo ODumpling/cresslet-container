@@ -121,3 +121,18 @@ export function receiveResponse(port: MessagePort, o: ReceiveOptions): Promise<R
     }
   })
 }
+
+/** Injected first into preview HTML: hide the preview prefix from the app (routers see "/"). */
+const STRIP_SCRIPT = `<script>(function(){var l=location,m=/^\\/__cresslet__\\/[^/]+\\/\\d+/.exec(l.pathname);if(m)history.replaceState(history.state,'',(l.pathname.slice(m[0].length)||'/')+l.search+l.hash)})()</script>`
+
+export async function injectStrip(res: Response): Promise<Response> {
+  // Null-body statuses (204/205/304) can't carry the script: pass them through unchanged.
+  if (res.body === null || [101, 204, 205, 304].includes(res.status)) return res
+  const html = await res.text()
+  const at = html.search(/<head[^>]*>/i)
+  const body = at >= 0 ? html.replace(/<head[^>]*>/i, (h) => h + STRIP_SCRIPT) : STRIP_SCRIPT + html
+  const headers = new Headers(res.headers)
+  headers.delete('content-length')
+  return new Response(body, { status: res.status, statusText: res.statusText, headers })
+}
+
