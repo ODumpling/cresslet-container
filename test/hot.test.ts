@@ -203,7 +203,7 @@ describe('single-file components (worker)', () => {
     expect(a.code).toContain('url(/abs.png) url(data:x)')
     expect(a.code).toContain('url(\\"/src/a b.svg\\")')
     expect(a.code).toContain('content: \\"url(text)\\"')
-    expect(a.code).toContain('@import \\"/src/theme.css\\"')
+    expect(a.code).toContain('","@import \\"/src/theme.css\\"') // its own sheet: an @import must start one
     expect(a.code).toContain('__VUE_HMR_RUNTIME__.rerender(')
     const hashOf = (code: string) => /__cressletScript = "(\w+)"/.exec(code)![1]
     const b = await worker.compileSfc({ root, file: join(root, 'src/App.vue'), hmrId: 'abc', source: sfc('b') })

@@ -666,13 +666,17 @@ function located(e, file) {
   }
   return e
 }
-/** A component's styles go in a `<style>` it owns (relative `url()`s made root-relative: the page isn't in its dir). */
-function injectStyle(req, id, css) {
-  const sel = JSON.stringify(`style[data-cresslet-id="${id}"]`)
-  if (!css) return `{ const el = document.querySelector(${sel}); if (el) el.remove() }\n`
+/**
+ * A component's styles go in `<style>`s it owns, one per block (an `@import` must start its sheet), in order; extra
+ * ones from its previous copy are removed. Relative `url()`s / `@import`s are made root-relative (the page isn't in
+ * the component's dir).
+ */
+function injectStyle(req, id, sheets) {
   const urlOf = (p) => (p.startsWith(req.root + '/') ? p.slice(req.root.length) : '/@fs' + p)
-  css = rebaseUrls(css, path.dirname(req.file), null, { cssImports: true, toUrl: urlOf }) // url()s and @imports
-  return `{ let el = document.querySelector(${sel}); if (!el) { el = document.createElement('style'); el.setAttribute('data-cresslet-id', ${JSON.stringify(id)}); document.head.appendChild(el); } el.textContent = ${JSON.stringify(css)} }\n`
+  const css = sheets.filter(Boolean).map((s) => rebaseUrls(s, path.dirname(req.file), null, { cssImports: true, toUrl: urlOf }))
+  return `{ const sheets = ${JSON.stringify(css)}, have = [...document.querySelectorAll(${JSON.stringify(`style[data-cresslet-id="${id}"]`)})]
+  sheets.forEach((css, i) => { let el = have[i]; if (!el) { el = document.createElement('style'); el.setAttribute('data-cresslet-id', ${JSON.stringify(id)}); document.head.appendChild(el) } el.textContent = css })
+  for (const el of have.slice(sheets.length)) el.remove() }\n`
 }
 const missing = (pkg, e) => (e && e.code === 'MODULE_NOT_FOUND' && String(e.message).includes(pkg) ? new Error(`compiling this file needs the \`${pkg.split('/')[0]}\` package: npm install ${pkg.split('/')[0]}`) : e)
 
@@ -696,7 +700,7 @@ function compileSvelte(req) {
     throw located(e, req.file)
   }
   // the style after the module body: a module that throws as it runs leaves the old one
-  return { code: r.js.code + '\n' + injectStyle(req, req.hmrId, r.css ? r.css.code : ''), lang: 'js', deps: [], warnings: (r.warnings || []).map((w) => w.message) }
+  return { code: r.js.code + '\n' + injectStyle(req, req.hmrId, [r.css ? r.css.code : '']), lang: 'js', deps: [], warnings: (r.warnings || []).map((w) => w.message) }
 }
 
 /**
@@ -729,21 +733,22 @@ async function compileVue(req) {
       throw located(e, req.file)
     }
   }
-  const scriptHash = hash(code + (scoped ? '\0scoped' : ''))
+  // (a removed <template> must reload: re-rendering with no render function keeps the old one)
+  const scriptHash = hash(code + (scoped ? '\0scoped' : '') + (descriptor.template ? '\0template' : ''))
   if (descriptor.template) {
     const t = sfc.compileTemplate({ source: descriptor.template.content, filename: req.file, id, scoped, slotted: descriptor.slotted, isProd: false, compilerOptions: { bindingMetadata: bindings, scopeId: scoped ? `data-v-${id}` : undefined, expressionPlugins: ts ? ['typescript'] : undefined } })
     if (t.errors.length) throw typeof t.errors[0] === 'string' ? new Error(`${req.file}: ${t.errors[0]}`) : located(t.errors[0], req.file)
     code += '\n' + t.code.replace(/\nexport (function|const) render\b/, '\n$1 _sfc_render') + '\n_sfc_main.render = _sfc_render'
   }
   const out = { deps: new Set(), dirs: new Set(), tailwind: [], warnings: [], attempted: new Set() }
-  let css = ''
+  const css = []
   for (const st of descriptor.styles) {
     if (st.module) throw new Error(`${req.file}: <style module> is not supported by the dev server yet`)
     const lang = st.lang || 'css'
     const source = lang === 'css' ? st.content : await preprocess({ root: req.root, file: `${req.file}.${lang}`, css: st.content, plugins: req.plugins }, out)
     const r = await sfc.compileStyleAsync({ source, filename: req.file, id: `data-v-${id}`, scoped: !!st.scoped, isProd: false })
     if (r.errors.length) throw located(r.errors[0], req.file)
-    css += r.code + '\n'
+    css.push(r.code)
   }
   code += `
 _sfc_main.__hmrId = ${JSON.stringify(id)}
