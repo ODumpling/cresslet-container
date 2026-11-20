@@ -39,8 +39,11 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   let defines = { ...envDefines(env), 'process.env.NODE_ENV': '"development"' }
   const deps = new DepOptimizer(vfs, fs, root, { wasmURL: c.esbuildWasmUrl, define: { 'process.env.NODE_ENV': '"development"' } })
   deps.onStale = () => scheduleReload('dependencies re-optimized')
-  /** Transformed scripts, with what the graph needs to re-learn them after a full reload resets it. */
-  const transformCache = new Map<string, { mtime: number; code: string; imports: Set<string>; boundary: boolean }>()
+  /**
+   * Transformed scripts, with what the graph needs to re-learn them after a full reload resets it. Valid only for the
+   * same mtime and source revision: two writes in one millisecond keep the mtime, the revision still moves.
+   */
+  const transformCache = new Map<string, { mtime: number; gen: number; code: string; imports: Set<string>; boundary: boolean }>()
   /** Bumped per module by each HMR flush: an in-flight transform from an older generation must not be cached or report errors. */
   const generation = new Map<string, number>()
   const bump = (f: string) => generation.set(f, (generation.get(f) ?? 0) + 1)
@@ -240,7 +243,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   })
 
   const SCRIPT_LOADERS = new Set(['ts', 'tsx', 'jsx', 'js'])
-  /** Whether esbuild's output has JSX: an import of the automatic runtime, or a call of the classic factory (outside strings/comments). */
+  /** Whether esbuild's output has JSX: a static import of the automatic runtime, or a call of the classic factory (outside strings/comments). */
   const hasJsx = (code: string, importsRuntime: boolean) => {
     if (importsRuntime) return true
     const [head, ...rest] = (cfg.jsxFactory ?? 'React.createElement').split('.').map((p) => p.replace(/[$]/g, '\\$'))
@@ -258,7 +261,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     const gen = generation.get(abs) ?? 0
     const page = pageGen
     const hit = transformCache.get(abs)
-    if (hit && hit.mtime === st.mtimeMs) {
+    if (hit && hit.mtime === st.mtimeMs && hit.gen === gen) {
       publish(abs, hit.imports, hit.boundary, gen, page)
       return hit.code
     }
@@ -278,7 +281,8 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     let importsRuntime = false
     const jsxRuntimePlugin: Plugin = {
       name: 'cresslet-jsx-runtime',
-      setup: (b) => b.onResolve({ filter: /jsx-(dev-)?runtime$/ }, (a) => void (importsRuntime ||= runtimes.has(a.path))),
+      // static imports only: esbuild's JSX output imports the runtime statically; a dynamic `import()` of it isn't JSX
+      setup: (b) => b.onResolve({ filter: /jsx-(dev-)?runtime$/ }, (a) => void (importsRuntime ||= a.kind === 'import-statement' && runtimes.has(a.path))),
     }
     const r = await es.build({
       entryPoints: [abs],
@@ -309,7 +313,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     publish(abs, locals, boundary, gen, page)
     // changed while this transform was in flight: serve it, but don't cache stale code
     if (!fresh(abs, gen, page)) return code
-    transformCache.set(abs, { mtime, code, imports: locals, boundary })
+    transformCache.set(abs, { mtime, gen, code, imports: locals, boundary })
     return code
   }
   /**

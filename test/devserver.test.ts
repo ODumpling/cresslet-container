@@ -365,4 +365,29 @@ describe('dev server HMR', () => {
     s.write('src/data.json', '{"a":2}')
     expect(upd(await s.next())).toBe('reload')
   })
+
+  it('a dynamic import() of the JSX runtime does not make a module a boundary', async () => {
+    const s = await devServer({
+      'src/main.ts': "import App from './App'\n",
+      'src/App.tsx': comp('App', 'return Helper', "import { Helper } from './Helper.jsx'"),
+      'src/Helper.jsx': 'export function Helper() { return import("react/jsx-runtime") }\n',
+    })
+    for (const p of ['/src/main.ts', '/src/App.tsx', '/src/Helper.jsx']) await s.get(p)
+    s.write('src/Helper.jsx', 'export function Helper() { return import("react/jsx-runtime").then(() => 1) }\n')
+    expect(upd(await s.next())).toEqual(['/src/App.tsx'])
+  })
+
+  it('a same-millisecond rewrite (unchanged mtime) is not served from the transform cache', async () => {
+    const s = await devServer({ 'src/main.ts': "import App from './App'\n", 'src/App.tsx': comp('App', 'return "v1"') })
+    await s.get('/src/main.ts')
+    const abs = join(ROOT, 'src/App.tsx')
+    expect(await s.get('/src/App.tsx')).toContain('"v1"')
+    const mtime = s.vfs.stat(abs).mtimeMs
+    s.write('src/App.tsx', comp('App', 'return "v2"'))
+    s.vfs.utimes(abs, mtime) // as if both writes landed in the same millisecond
+    // requested inside the debounce window, before the flush drops the cache entry
+    const code = await s.get('/src/App.tsx')
+    expect(code).toContain('"v2"')
+    expect(code).not.toContain('"v1"')
+  })
 })
