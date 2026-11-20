@@ -15,6 +15,8 @@ export interface VfsPluginOptions {
     external?: (spec: string, importer: string, kind: string) => string | undefined | false;
     /** Node builtins: 'empty' (browser shim) or 'external'. */
     builtins?: 'empty' | 'external';
+    /** Post-process every loaded stylesheet (PostCSS / Tailwind). */
+    transformCss?: (path: string, css: string) => Promise<string>;
 }
 /** Resolve + load everything from the VFS. */
 export declare function vfsPlugin(vfs: VFS, opts?: VfsPluginOptions): Plugin;

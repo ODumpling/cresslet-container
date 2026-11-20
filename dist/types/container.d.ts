@@ -7,6 +7,7 @@ import { type ResolveFs } from './resolve';
 import { type BuildOptions as EsbuildOptions } from './esbuild';
 import { type DevServerHandle, type DevServerOptions } from './dev/server';
 import { type BuildOptions } from './build/build';
+import { type CssBackend } from './css/pipeline';
 export interface BootOptions {
     /** Service worker URL served by the host at its origin root. Default '/cresslet-sw.js'. `false` disables previews. */
     serviceWorkerUrl?: string | false;
@@ -130,6 +131,9 @@ export declare class Container {
     }>;
     /** esbuild over the VFS. Relative entry points resolve against workdir. */
     bundle(options: BundleOptions): Promise<BundleResult>;
+    private css;
+    /** The CSS worker (PostCSS / Tailwind) shared by dev servers and builds; a `node` process started on first use. */
+    cssWorker(): CssBackend;
     /** Create a runtime worker shipped next to this module (dist/node-worker.js). */
     createWorker(_name: 'node-worker.js'): Worker;
     /**

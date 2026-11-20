@@ -11,6 +11,7 @@ import { clearPackageCache, isBare, type ResolveFs } from './resolve'
 import { bundleVfs, DEFAULT_WASM_URL, type BuildOptions as EsbuildOptions, type OutputFile } from './esbuild'
 import { createDevServer, type DevServerHandle, type DevServerOptions } from './dev/server'
 import { build, type BuildOptions } from './build/build'
+import { nodeCssBackend, type CssBackend } from './css/pipeline'
 import { dirname, join, normalize, resolve } from './path'
 import { acceptHello, BROADCAST, BROADCAST_CLOSE, newestWorker, RELAY_ERROR, RELAY_INIT, RELAY_READY, relayErrorText, relayUrl, THIRD_PARTY_HINT, toOrigin } from './relay-protocol'
 
@@ -312,6 +313,16 @@ export class Container {
   }
 
   // ---------------- workers ----------------
+  private css: ReturnType<typeof nodeCssBackend> | null = null
+  /** The CSS worker (PostCSS / Tailwind) shared by dev servers and builds; a `node` process started on first use. */
+  cssWorker(): CssBackend {
+    if (!this.css) {
+      const css = (this.css = nodeCssBackend(this))
+      this.cleanups.push(() => css.close())
+    }
+    return this.css
+  }
+
   /** Create a runtime worker shipped next to this module (dist/node-worker.js). */
   createWorker(_name: 'node-worker.js'): Worker {
     const url = new URL('./node-worker.js', import.meta.url)
