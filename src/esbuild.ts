@@ -3,7 +3,7 @@ import * as esbuild from 'esbuild-wasm'
 import type { BuildOptions, Loader, Plugin } from 'esbuild-wasm'
 import type { VFS } from './vfs'
 import { toText } from './vfs'
-import { dirname, extname, normalize } from './path'
+import { dirname, extname, join, normalize } from './path'
 import { BROWSER_OPTS, isBare, resolveModule, ResolveError, type ResolveOptions } from './resolve'
 
 export type { BuildOptions, BuildResult, Plugin, Loader, Metafile, OutputFile } from 'esbuild-wasm'
@@ -77,7 +77,7 @@ export interface VfsPluginOptions {
   external?: (spec: string, importer: string, kind: string) => string | undefined | false
   /** Node builtins: 'empty' (browser shim) or 'external'. */
   builtins?: 'empty' | 'external'
-  /** Post-process every loaded stylesheet (PostCSS / Tailwind). */
+  /** Post-process every loaded stylesheet (Sass/Less, PostCSS, Tailwind). */
   transformCss?: (path: string, css: string) => Promise<string>
 }
 
@@ -101,6 +101,9 @@ export function vfsPlugin(vfs: VFS, opts: VfsPluginOptions = {}): Plugin {
         }
         const fromDir = args.resolveDir || (importer ? dirname(importer) : '/')
         const [clean, query] = splitQuery(spec)
+        // a url() / @import is relative to its stylesheet first (`url(img.png)`, `@import "x.css"`, as Less writes them;
+        // vite's preferRelative), then a package
+        if ((args.kind === 'url-token' || args.kind === 'import-rule') && isBare(clean) && vfs.isFile(join(fromDir, clean))) return { path: join(fromDir, clean), namespace: 'cresslet-vfs', suffix: query }
         try {
           const r = resolveModule(fsAdapter, clean, fromDir, ropts)
           if (r === false) return { path: spec, namespace: 'cresslet-empty' }
@@ -113,7 +116,8 @@ export function vfsPlugin(vfs: VFS, opts: VfsPluginOptions = {}): Plugin {
       build.onLoad({ filter: /.*/, namespace: 'cresslet-empty' }, () => ({ contents: 'module.exports = {}', loader: 'js' }))
       build.onLoad({ filter: /.*/, namespace: 'cresslet-vfs' }, async (args) => {
         const custom = build.initialOptions.loader ?? {}
-        const loader = ((/\.module\.css$/.test(args.path) && custom['.module.css']) || custom[extname(args.path)] || loaderFor(args.path)) as Loader
+        const mod = /\.module\.[a-z]+$/.exec(args.path)?.[0]
+        const loader = ((mod && custom[mod]) || custom[extname(args.path)] || loaderFor(args.path)) as Loader
         const data = vfs.readFile(args.path)
         if ((loader === 'css' || loader === 'local-css') && opts.transformCss) {
           try {

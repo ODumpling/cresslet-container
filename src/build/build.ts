@@ -6,7 +6,7 @@ import { basename, dirname, extname, join, normalize } from '../path'
 import { BROWSER_OPTS, resolveModule } from '../resolve'
 import { envDefines, jsxOptions, loadEnv, matchPaths, readProjectConfig, type ProjectConfig } from '../dev/project'
 import { contentHash, findTags, isLocalRef, rewriteHtmlForBuild } from './html'
-import { CssPipeline } from '../css/pipeline'
+import { CssPipeline, STYLE_RE } from '../css/pipeline'
 
 export interface BuildOptions {
   root?: string
@@ -53,7 +53,7 @@ export async function build(c: Container, o: BuildOptions = {}): Promise<{ files
   const localPath = (ref: string) => normalize(ref.startsWith('/') ? join(root, ref.split(/[?#]/)[0]) : join(root, ref.split(/[?#]/)[0]))
   const scriptRefs = tags.filter((t) => t.name === 'script' && t.attrs.type === 'module' && isLocalRef(t.attrs.src ?? '')).map((t) => t.attrs.src)
   const styleRefs = tags
-    .filter((t) => t.name === 'link' && /\bstylesheet\b/i.test(t.attrs.rel ?? '') && isLocalRef(t.attrs.href ?? '') && extname(t.attrs.href.split('?')[0]) === '.css')
+    .filter((t) => t.name === 'link' && /\bstylesheet\b/i.test(t.attrs.rel ?? '') && isLocalRef(t.attrs.href ?? '') && STYLE_RE.test(t.attrs.href.split(/[?#]/)[0]))
     .map((t) => t.attrs.href)
     .filter((h) => vfs.isFile(localPath(h)) && !vfs.isFile(join(root, 'public', h)))
   const entryFor = new Map<string, string>() // abs -> ref
@@ -82,9 +82,10 @@ export async function build(c: Container, o: BuildOptions = {}): Promise<{ files
       ...jsxOptions(cfg),
       tsconfigRaw: cfg.tsconfigRaw as never,
       define: { ...envDefines(env), 'process.env.NODE_ENV': '"production"', global: 'globalThis' },
-      loader: { '.module.css': 'local-css' },
+      // Sass/Less are compiled to CSS by transformCss (the pipeline), then bundled as CSS
+      loader: { '.scss': 'css', '.sass': 'css', '.less': 'css', '.module.css': 'local-css', '.module.scss': 'local-css', '.module.sass': 'local-css', '.module.less': 'local-css' },
       plugins: [pathsPlugin(c, cfg)],
-      vfsPlugin: { resolve: PROD_RESOLVE, transformCss: css.active ? async (p, text) => (await css.process(p, text)).css : undefined },
+      vfsPlugin: { resolve: PROD_RESOLVE, transformCss: async (p, text) => (await css.process(p, text)).css },
     })
   } catch (e) {
     throw new Error(`build failed:\n${formatErrors(e)}`)

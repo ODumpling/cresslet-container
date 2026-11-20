@@ -9,7 +9,7 @@ import { DepOptimizer, scanImports } from './deps'
 import { ASSET_EXT, envDefines, jsxOptions, loadEnv, matchPaths, mimeType, readProjectConfig, SCRIPT_EXT, type ProjectConfig } from './project'
 import { findModuleScripts } from '../build/html'
 import { ModuleGraph, type HmrUpdate } from './hmr'
-import { CSS_CONFIG_RE, CssPipeline, type CssError } from '../css/pipeline'
+import { CSS_CONFIG_RE, CSS_MODULE_RE, CssPipeline, STYLE_RE, type CssError } from '../css/pipeline'
 import { refreshRuntimeModule, refreshTransform, refreshUtilsCode, REFRESH_RUNTIME_URL, REFRESH_UTILS_URL } from './refresh'
 import refreshRuntimeCjs from 'react-refresh/cjs/react-refresh-runtime.development.js?raw'
 
@@ -46,7 +46,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   let cfg: ProjectConfig = readProjectConfig(vfs, root)
   let env = loadEnv(vfs, root, 'development')
   let defines = { ...envDefines(env), 'process.env.NODE_ENV': '"development"' }
-  const deps = new DepOptimizer(vfs, fs, root, { wasmURL: c.esbuildWasmUrl, define: { 'process.env.NODE_ENV': '"development"' } })
+  const deps = new DepOptimizer(vfs, fs, root, { wasmURL: c.esbuildWasmUrl, define: { 'process.env.NODE_ENV': '"development"' }, preprocess: async (f, text) => (await cssPipe.process(f, text)).css })
   deps.onStale = () => scheduleReload('dependencies re-optimized')
   /**
    * Transformed scripts, with what the graph needs to re-learn them after a full reload resets it. Valid only for the
@@ -149,14 +149,14 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       const f = files[i]
       // a stylesheet whose first build (on this page) is in flight: that build redoes (or re-serves) it when it sees the
       // change; an importer's edge alone doesn't make it a published node
-      if (f.endsWith('.css') && inflight.has(f) && !published.has(f)) continue
+      if (STYLE_RE.test(f) && inflight.has(f) && !published.has(f)) continue
       // a module whose first transform is in flight has no node yet, but the page is about to run it
       if (!graph.nodes.has(f) && !inflight.has(f)) {
         // never served to the page, so it can't affect it, unless it's something loaded outside the module graph
         // or a module whose import of it failed to resolve
         if (vfs.isDir(f)) continue
         if (served.has(f)) return scheduleReload(f)
-        if (!SCRIPT_EXT.test(f) && !f.endsWith('.css')) {
+        if (!SCRIPT_EXT.test(f) && !STYLE_RE.test(f)) {
           if (ASSET_EXT.test(f)) return scheduleReload(f)
           continue // README, dotfiles, editor temp files...
         }
@@ -206,6 +206,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     if (/^(tsconfig.*\.json|jsconfig\.json|package\.json)$/.test(file)) cfg = readProjectConfig(vfs, root)
     if (file === 'package.json' || CSS_CONFIG_RE.test(file)) {
       cssPipe.reset()
+      deps.invalidate() // the dependency bundle holds packages' Sass/Less, compiled through the pipeline
       return scheduleReload(file)
     }
     if (/^\.env/.test(file)) {
@@ -260,7 +261,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       return toUrl(local) + (t ? `${q ? q + '&' : '?'}t=${t}` : q)
     }
     if (isNodeBuiltin(clean)) return '/@cresslet/empty'
-    if (/\.(css)$/.test(clean)) return `/@modules/${clean}${query ? query + '&import' : '?import'}`
+    if (STYLE_RE.test(clean)) return `/@modules/${clean}${query ? query + '&import' : '?import'}`
     return `/@modules/${clean}${query}`
   }
 
@@ -276,7 +277,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
           if (!local && /^\.\.?\//.test(a.path)) onUnresolved?.()
           if (url.startsWith('/@modules/')) {
             const s = splitQuery(url.slice('/@modules/'.length))[0]
-            if (!s.endsWith('.css')) deps.add([s])
+            if (!STYLE_RE.test(s)) deps.add([s])
           }
           return { path: url, external: true }
         } catch (e) {
@@ -407,7 +408,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
    */
   const cssModule = async (abs: string, asModule: boolean, link = false): Promise<string> => {
     const tracked = abs.startsWith(root + '/')
-    const isModule = /\.module\.css$/.test(abs)
+    const isModule = CSS_MODULE_RE.test(abs)
     const accept = isModule ? null : asModule ? 'self' : 'link'
     const firstPage = pageGen
     inflight.set(abs, (inflight.get(abs) ?? 0) + 1)
@@ -455,7 +456,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     const addDeps = (from: string, deps: string[] = [], dirs: string[] = []) => {
       for (const d of deps) {
         if (!d.startsWith(root + '/') || d.includes('/node_modules/') || d === from) continue
-        if (/\.(css|pcss|postcss)$/.test(d)) cssDeps.add(d)
+        if (/\.(css|pcss|postcss|s[ac]ss|less)$/.test(d)) cssDeps.add(d)
         else uses.files.add(d)
       }
       uses.dirs.push(...dirs.filter((d) => d === root || d.startsWith(root + '/')))
@@ -471,7 +472,10 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
             const [clean] = splitQuery(a.path)
             let target: string | null = null
             try {
-              target = isBare(clean) && !matchPaths(cfg, clean) ? (resolveModule(fs, clean, dirname(importer), { ...BROWSER_OPTS, conditions: ['style', ...BROWSER_OPTS.conditions] }) as string) : resolveLocal(clean, importer)
+              // a url() / @import is relative to its stylesheet first (`url(img.png)`, `@import "x.css"`, as Less writes
+              // them; vite's preferRelative), then a package
+              if ((a.kind === 'url-token' || a.kind === 'import-rule') && isBare(clean) && !matchPaths(cfg, clean) && vfs.isFile(join(dirname(importer), clean))) target = join(dirname(importer), clean)
+              else target = isBare(clean) && !matchPaths(cfg, clean) ? (resolveModule(fs, clean, dirname(importer), { ...BROWSER_OPTS, conditions: ['style', ...BROWSER_OPTS.conditions] }) as string) : resolveLocal(clean, importer)
             } catch {
               target = null
             }
@@ -481,7 +485,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
               return { path: a.path, external: true }
             }
             if (a.kind === 'import-rule') return cssDeps.add(target), { path: target, namespace: 'cresslet-entry' }
-            return { path: toUrl(target), external: true }
+            return { path: toUrl(target) + a.path.slice(clean.length), external: true } // keeps `?query` / `#fragment`
           }
           if (a.kind === 'composes-from') {
             const t = resolveLocal(a.path, importer)
@@ -501,11 +505,11 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
             addDeps(a.path, (e as CssError).deps, (e as CssError).dirs)
             return { errors: [{ text: e instanceof Error ? e.message : String(e) }] }
           }
-          return { contents, loader: /\.module\.css$/.test(a.path) ? 'local-css' : 'css', resolveDir: dirname(a.path) }
+          return { contents, loader: CSS_MODULE_RE.test(a.path) ? 'local-css' : 'css', resolveDir: dirname(a.path) }
         })
       },
     }
-    if (/\.module\.css$/.test(abs)) {
+    if (CSS_MODULE_RE.test(abs)) {
       const r = await es.build({
         stdin: { contents: `export { default } from ${JSON.stringify(abs)}`, resolveDir: root, loader: 'js' },
         bundle: true,
@@ -604,7 +608,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
           const text = await deps.chunk(spec.split('/').pop()!)
           if (text !== undefined) return new Response(text, { headers: JS })
         }
-        if (spec.endsWith('.css')) {
+        if (STYLE_RE.test(spec)) {
           const file = resolveModule(fs, spec, root, { ...BROWSER_OPTS, conditions: ['style', ...BROWSER_OPTS.conditions] })
           if (!file) return new Response('', { headers: JS })
           return new Response(has('import') ? await cssModule(file, true) : await cssModule(file, false, true), { headers: has('import') ? JS : { 'content-type': 'text/css', ...NO_CACHE } })
@@ -626,7 +630,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       if (ext === '.html' || ext === '.htm') return new Response(await transformHtml(abs), { headers: { 'content-type': 'text/html; charset=utf-8', ...NO_CACHE } })
       if (has('url')) return new Response(`export default ${JSON.stringify(pathname)}`, { headers: JS })
       if (has('raw')) return new Response(`export default ${JSON.stringify(vfs.readText(abs))}`, { headers: JS })
-      if (ext === '.css') {
+      if (STYLE_RE.test(abs)) {
         if (has('import')) return new Response(await cssModule(abs, true), { headers: JS })
         try {
           return new Response(await cssModule(abs, false, true), { headers: { 'content-type': 'text/css; charset=utf-8', ...NO_CACHE } })

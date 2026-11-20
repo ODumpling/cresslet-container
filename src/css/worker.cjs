@@ -1,7 +1,8 @@
 'use strict'
-// CSS worker: PostCSS (the project's own `postcss` + config plugins) and Tailwind CSS v4 (the project's own
-// `tailwindcss`, via its pure-JS `compile()` API) over the VFS. Runs as a long-lived `node` process in cresslet's node
-// worker (requests/responses as JSON lines on stdin/stdout), and in plain Node for the unit tests (`handle()`).
+// CSS worker: Sass / Less (the project's own `sass` / `less`), then PostCSS (the project's own `postcss` + config
+// plugins) and Tailwind CSS v4 (the project's own `tailwindcss`, via its pure-JS `compile()` API) over the VFS.
+// Runs as a long-lived `node` process in cresslet's node worker (requests/responses as JSON lines on stdin/stdout),
+// and in plain Node for the unit tests (`handle()`).
 // Content scanning (Tailwind's native "oxide" scanner) is done by the caller: requests carry the candidate list.
 const fs = require('fs')
 const path = require('path')
@@ -101,17 +102,28 @@ function resolveStylesheet(id, base) {
 
 /** Whether a url() reference is relative to its stylesheet (not absolute, data:, a fragment, protocol-relative, ...). */
 const isRelativeUrl = (u) => !!u && !/^(?:[a-z][a-z\d+.-]*:|\/|#|~|%23)/i.test(u) && !u.startsWith('{{')
+/** Sass/Less source: a url() built from a variable or interpolation is resolved by the compiler, not a path here. */
+const isDynamicUrl = (u) => /^[$@]/.test(u) || u.includes('#{') || u.includes('@{')
 
 /**
  * Inlined `@import`s: make relative `url()`s relative to the importing stylesheet again (as vite does), package CSS
  * included. A CSS tokenizer's view of url(): unquoted, or a single/double-quoted string (spaces, escapes); comments,
  * other strings and `@import` preludes (resolved by the compiler against their own file) are left alone.
+ * `o.sass`: Sass source (url()s from variables/interpolation left alone, `//` comments skipped, relative plain-CSS
+ * `@import`s rebased: `./x`, or a bare `x.css` that is beside it); `o.indented`: the indented syntax (a prelude ends at the line's end); `o.cssImports`: CSS
+ * that Sass loads (every relative `@import` in it is plain CSS, rebased).
  */
-function rebaseUrls(css, fromDir, toDir) {
+function rebaseUrls(css, fromDir, toDir, o = {}) {
   if (fromDir === toDir) return css
   let out = ''
   let last = 0
   const n = css.length
+  let importUrl = false
+  /** A bare `x` / `x.css` that is a file beside this stylesheet (not a package specifier). */
+  const beside = (ref) => {
+    const p = path.resolve(fromDir, ref.replace(/[?#].*$/s, ''))
+    return isFile(p) || isFile(p + '.css')
+  }
   const rebase = (ref) => {
     const m = /^([^?#]*)(.*)$/s.exec(ref)
     let rel = path.relative(toDir, path.resolve(fromDir, m[1]))
@@ -121,12 +133,48 @@ function rebaseUrls(css, fromDir, toDir) {
   for (let i = 0; i < n; ) {
     const ch = css[i]
     if (ch === '/' && css[i + 1] === '*') {
+      // (the indented syntax's `/*` may have no `*/`: it ends with its indented lines; the line end is near enough)
       const e = css.indexOf('*/', i + 2)
-      i = e < 0 ? n : e + 2
+      const nl = o.indented ? css.indexOf('\n', i) : -1
+      i = nl >= 0 && (e < 0 || nl < e) ? nl : e < 0 ? n : e + 2
+    } else if (o.sass && ch === '/' && css[i + 1] === '/') {
+      const e = css.indexOf('\n', i)
+      i = e < 0 ? n : e // a Sass line comment
     } else if (ch === '"' || ch === "'") i = skipString(css, i)
     else if (ch === '@' && /^@import\b/i.test(css.slice(i, i + 8))) {
-      // to the end of the prelude
-      for (i += 7; i < n && css[i] !== ';' && css[i] !== '{'; ) i = css[i] === '"' || css[i] === "'" ? skipString(css, i) : i + 1
+      // to the end of the prelude. In Sass, plain-CSS imports (`x.css`, `url(...)`, with a media query) stay in the
+      // output, to be resolved from the entry: an explicitly relative one is rebased (a package specifier such as
+      // `tailwindcss/utilities.css` is left alone; Sass resolves the other imports itself)
+      const imports = o.sass || o.cssImports
+      const end = (k) => k >= n || css[k] === ';' || css[k] === '{' || (o.indented ? css[k] === '\n' : css[k] === '}')
+      for (i += 7; !end(i); ) {
+        if (imports && /^url\(/i.test(css.slice(i, i + 4))) {
+          importUrl = true // the url() branch below rebases it (a bare one only if it is a file beside this one)
+          break
+        }
+        if (css[i] !== '"' && css[i] !== "'") {
+          i++
+          continue
+        }
+        const e = skipString(css, i)
+        const ref = unescapeCss(css.slice(i + 1, e - 1))
+        // what follows it (spaces and comments skipped): a media query / supports() / layer() makes it plain CSS
+        let k = e
+        for (;;) {
+          if (k < n && (o.indented ? /[ \t]/ : /\s/).test(css[k])) k++ // (SCSS: a media query may start on the next line)
+          else if (css[k] === '/' && css[k + 1] === '*') k = css.indexOf('*/', k + 2) < 0 ? n : css.indexOf('*/', k + 2) + 2
+          else if (o.sass && css[k] === '/' && css[k + 1] === '/') k = css.indexOf('\n', k) < 0 ? n : css.indexOf('\n', k)
+          else break
+        }
+        const plain = o.cssImports || /\.css(?:[?#].*)?$/i.test(ref) || !(end(k) || css[k] === ',' || css[k] === '\n' || css[k] === '\r')
+        // explicitly relative, or a bare path that is a file beside this one (not a package specifier)
+        const local = /^\.\.?\//.test(ref) || (isRelativeUrl(ref) && beside(ref))
+        if (imports && plain && local && !isDynamicUrl(ref)) {
+          out += css.slice(last, i) + css[i] + escapeString(rebase(ref), css[i]) + css[i]
+          last = e
+        }
+        i = e
+      }
     } else if ((ch === 'u' || ch === 'U') && /^url\(/i.test(css.slice(i, i + 4)) && !/[\w-]/.test(css[i - 1] || '')) {
       let j = i + 4
       while (j < n && /\s/.test(css[j])) j++
@@ -155,7 +203,9 @@ function rebaseUrls(css, fromDir, toDir) {
         }
         end = k
       }
-      if (isRelativeUrl(ref)) {
+      const inImport = importUrl
+      importUrl = false
+      if (isRelativeUrl(ref) && !(o.sass && isDynamicUrl(ref)) && !(inImport && !/^\.\.?\//.test(ref) && !beside(ref))) {
         const next = rebase(ref)
         const quote = q || (/[\s"'()\\\x00-\x1f\x7f]/.test(next) ? '"' : '')
         out += css.slice(last, i) + `url(${quote}${quote ? escapeString(next, quote) : next}${quote})`
@@ -372,6 +422,177 @@ function plugins(config, root) {
     .map(([name, o]) => load(name, o))
 }
 
+/** Stylesheets a preprocessor compiles first (keep in sync with PREPROCESSED_RE in pipeline.ts). */
+const PREPROCESSED_RE = /\.(s[ac]ss|less)$/
+
+/** A preprocessor from the project's own deps. */
+function loadPreprocessor(root, name, file) {
+  try {
+    return interop(projectRequire(root)(name))
+  } catch (e) {
+    throw new Error(`${path.basename(file)} needs the \`${name}\` package (npm install -D ${name}): ${e.message}`)
+  }
+}
+
+/**
+ * Where a Sass load of path `p` (no extension, or .sass/.scss/.css) may be, as Sass looks: tiers in order, the first
+ * tier with a file wins and more than one file in it is ambiguous. `.import` files first for `@import`; then the path
+ * with extensions (.sass/.scss, else .css), each as a partial too; then the directory's index files.
+ */
+function sassTiers(p, fromImport) {
+  const both = (q) => [q, path.join(path.dirname(q), '_' + path.basename(q))]
+  const withExts = (q) => [[...both(q + '.sass'), ...both(q + '.scss')], both(q + '.css')]
+  const ext = path.extname(p)
+  if (ext === '.sass' || ext === '.scss' || ext === '.css') return [...(fromImport ? [both(p.slice(0, -ext.length) + '.import' + ext)] : []), both(p)]
+  return [...(fromImport ? withExts(p + '.import') : []), ...withExts(p), ...(fromImport ? withExts(path.join(p, 'index.import')) : []), ...withExts(path.join(p, 'index'))]
+}
+
+/**
+ * Sass (the project's `sass`, pure JS): its loads go through one importer over the file system, which records what
+ * the output read (and, for a failed load, every path it tried), resolves package paths from node_modules (`~` too),
+ * and rebases relative url()s in loaded files to the entry stylesheet (as vite does).
+ */
+async function compileSass(req, out) {
+  const sass = loadPreprocessor(req.root, 'sass', req.file)
+  const { pathToFileURL, fileURLToPath } = require('url')
+  const toDir = path.dirname(req.file)
+  const syntaxOf = (p) => (p.endsWith('.sass') ? 'indented' : p.endsWith('.css') ? 'css' : 'scss')
+  const find = (p, fromImport) => {
+    for (const tier of sassTiers(p, fromImport)) {
+      const found = tier.filter(isFile)
+      for (const c of tier) if (!found.includes(c)) out.attempted.add(c)
+      if (found.length > 1) {
+        for (const f of found) out.attempted.add(f) // removing one resolves it
+        throw new Error(`It's not clear which file to import. Found:\n${found.map((f) => '  ' + path.relative(toDir, f)).join('\n')}`)
+      }
+      if (found.length) return found[0]
+    }
+    return null
+  }
+  const importer = {
+    canonicalize(url, ctx) {
+      if (url.startsWith('file:')) {
+        const f = find(fileURLToPath(url), ctx.fromImport)
+        return f && pathToFileURL(f)
+      }
+      if (/^[a-z][a-z\d+.-]*:/i.test(url)) return null // pkg:, http: ...: not ours
+      if (/^(?:\.\.?)?\//.test(url)) return null // `../x`, `/x` that missed: not a package (Sass passes `./x` as `x`)
+      // a package path (`bootstrap/scss/bootstrap`, `~bootstrap/...`): node_modules from the importing file up
+      const id = url.replace(/^~\/?/, '')
+      const from = ctx.containingUrl && ctx.containingUrl.protocol === 'file:' ? path.dirname(fileURLToPath(ctx.containingUrl)) : req.root
+      const name = id.startsWith('@') ? id.split('/').slice(0, 2).join('/') : id.split('/')[0]
+      for (let dir = from; ; dir = path.dirname(dir)) {
+        const pkgDir = path.join(dir, 'node_modules', name)
+        const f = find(path.join(dir, 'node_modules', id), ctx.fromImport)
+        if (f) return pathToFileURL(f)
+        // a bare package (`@use "bootstrap"`): its package.json `sass` / `style` entry, as vite does
+        if (id === name && isFile(path.join(pkgDir, 'package.json'))) {
+          const pkg = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8'))
+          const entry = [pkg.sass, pkg.style].find((e) => typeof e === 'string' && /\.(s[ac]ss|css)$/.test(e))
+          if (entry && isFile(path.join(pkgDir, entry))) return pathToFileURL(path.join(pkgDir, entry))
+          out.attempted.add(path.join(pkgDir, 'package.json'))
+        }
+        if (dir === path.dirname(dir)) return null
+      }
+    },
+    load(url) {
+      const p = fileURLToPath(url)
+      const syntax = syntaxOf(p)
+      out.deps.add(p)
+      // a .css file Sass loads: CSS (no `//` comments), and each of its @imports is plain CSS left in the output
+      const o = syntax === 'css' ? { cssImports: true } : { sass: true, indented: syntax === 'indented' }
+      return { contents: rebaseUrls(fs.readFileSync(p, 'utf8'), path.dirname(p), toDir, o), syntax }
+    },
+  }
+  try {
+    const r = await sass.compileStringAsync(req.css, {
+      url: pathToFileURL(req.file),
+      syntax: syntaxOf(req.file),
+      importer,
+      importers: [importer],
+      style: 'expanded',
+      sourceMap: false,
+      logger: {
+        // packages' own warnings (Bootstrap's deprecations, on every rebuild) are not the project's to fix
+        warn(m, o) {
+          const at = o && o.span && o.span.url && o.span.url.protocol === 'file:' ? fileURLToPath(o.span.url) : null
+          const top = (o && o.stack ? o.stack.split('\n')[0] : '') || at || ''
+          if (/(?:^|[\\/])node_modules[\\/]/.test(top)) return
+          out.warnings.push(at ? `${m} (${at}:${o.span.start.line + 1})` : m)
+        },
+        debug: () => {},
+      },
+    })
+    return r.css
+  } catch (e) {
+    for (const p of out.attempted) out.deps.add(p)
+    if (e && e.span && e.span.url && String(e.span.url).startsWith('file:')) out.deps.add(fileURLToPath(e.span.url))
+    throw e
+  }
+}
+
+/**
+ * Less (the project's `less`, pure JS): relative url()s in imported files are rewritten to the entry stylesheet;
+ * `@plugin` runs project code, so `cssPlugins: false` refuses it. Inline JavaScript stays off (Less's default).
+ */
+async function compileLess(req, out) {
+  const less = loadPreprocessor(req.root, 'less', req.file)
+  // every file Less loads (imports, plugins) and, for one it can't find, the paths it tried: also when the compile fails
+  class Tracking extends less.FileManager {
+    supports(filename) {
+      return !/^(?:[a-z][a-z\d+.-]*:)?\/\//i.test(filename) // URLs: Less's own URL file manager
+    }
+    supportsSync(filename) {
+      return this.supports(filename)
+    }
+    loadFile(filename, dir, options, env, cb) {
+      const done = (r) => (r && typeof r.filename === 'string' && path.isAbsolute(r.filename) && out.deps.add(r.filename), r)
+      const failed = (e) => {
+        const tried = e && typeof e.message === 'string' && /wasn't found\. Tried - (.*)$/s.exec(e.message)
+        if (tried) for (const p of tried[1].split(',')) if (path.isAbsolute(p.trim())) out.attempted.add(p.trim())
+        return e
+      }
+      // Less's FileManager answers by promise, or (sync imports) by its return value / the callback
+      const r = super.loadFile(filename, dir, options, env, cb && ((e, x) => cb(e && failed(e), e ? x : done(x))))
+      if (r && typeof r.then === 'function') return r.then(done, (e) => Promise.reject(failed(e)))
+      if (r) r.error ? failed(r.error) : done(r)
+      return r
+    }
+  }
+  const plugins = [{ install: (_less, pm) => pm.addFileManager(new Tracking()) }]
+  if (req.plugins === false) {
+    const refuse = (id) => {
+      throw new Error(`@plugin '${id}' not loaded: project CSS plugins are disabled (boot({ cssPlugins: false }))`)
+    }
+    plugins.push({
+      install(_less, pm) {
+        pm.Loader = { loadPlugin: async (id) => refuse(id), loadPluginSync: refuse, evalPlugin: () => refuse('(inline)') }
+      },
+    })
+  }
+  try {
+    const r = await less.render(req.css, { filename: req.file, rewriteUrls: 'all', javascriptEnabled: false, plugins, paths: [path.join(req.root, 'node_modules')] })
+    for (const p of r.imports || []) if (path.isAbsolute(p)) out.deps.add(p)
+    for (const p of out.attempted) out.deps.add(p) // an `(optional)` import not found: creating it re-serves
+    return r.css
+  } catch (e) {
+    if (e && typeof e.filename === 'string' && path.isAbsolute(e.filename)) out.deps.add(e.filename)
+    // a missing import: creating one of the paths it tried retries the stylesheet
+    for (const p of out.attempted) out.deps.add(p)
+    if (!e || typeof e !== 'object' || e.line == null) throw e
+    // file:line:col, the message, and the lines around it (Less errors carry them apart)
+    const lines = (e.extract || []).map((l, i) => (l == null ? null : `${String(e.line - 1 + i).padStart(4)} | ${l}`)).filter((l) => l != null && !l.startsWith('   0 |'))
+    throw new Error(`${e.filename || req.file}:${e.line}:${(e.column ?? 0) + 1}: ${e.message}${lines.length ? '\n' + lines.join('\n') : ''}`)
+  }
+}
+
+/** Compile Sass/Less to CSS (anything else passes through). */
+function preprocess(req, out) {
+  if (/\.s[ac]ss$/.test(req.file)) return compileSass(req, out)
+  if (req.file.endsWith('.less')) return compileLess(req, out)
+  return req.css
+}
+
 /**
  * req: { root, file, css, candidates?, postcssConfig?: abs path | null, env?: 'development' | 'production' }
  * -> { css, deps: abs paths the output depends on, dirs: content directories (PostCSS `dir-dependency`),
@@ -390,9 +611,11 @@ async function handle(req) {
   }
   lastEnv = env
   process.env.NODE_ENV = env
-  const out = { deps: new Set(), dirs: new Set(), tailwind: [], warnings: [] }
+  const out = { deps: new Set(), dirs: new Set(), tailwind: [], warnings: [], attempted: new Set() }
   try {
     candidatesOf(req) // record the delta first: it was sent once, whatever happens to this request
+    // Sass/Less first, then PostCSS/Tailwind on their output (as vite does)
+    const source = await preprocess(req, out)
     let css
     if (req.postcssConfig && req.plugins !== false) {
       let postcss
@@ -404,7 +627,7 @@ async function handle(req) {
       const { plugins: list } = loadConfig(req.postcssConfig, req.root, req.env || 'development', !!req.tailwind)
       let res
       try {
-        res = await postcss(list).process(req.css, { from: req.file, to: req.file, map: false, cresslet: { req, out } })
+        res = await postcss(list).process(source, { from: req.file, to: req.file, map: false, cresslet: { req, out } })
       } catch (e) {
         if (e !== DISCOVERED) throw e
         return { css: '', deps: [...out.deps], dirs: [], tailwind: out.tailwind, warnings: [] }
@@ -416,7 +639,8 @@ async function handle(req) {
         else if (m.type === 'dir-dependency' && m.dir) out.dirs.add(m.dir)
       }
       for (const w of res.warnings()) out.warnings.push(w.toString())
-    } else css = await tailwind(req, req.css, req.file, out)
+    } else if (req.tailwind !== false && TAILWIND_RE.test(source)) css = await tailwind(req, source, req.file, out)
+    else css = source // a preprocessed stylesheet without Tailwind syntax (or in a project without Tailwind)
     return { css, deps: [...out.deps], dirs: [...out.dirs], tailwind: out.tailwind, warnings: out.warnings }
   } catch (e) {
     throw Object.assign(e && typeof e === 'object' ? e : new Error(String(e)), { deps: [...out.deps], dirs: [...out.dirs] })
@@ -465,5 +689,5 @@ function formatError(e) {
   return plugin + (e.message || String(e))
 }
 
-module.exports = { handle, release, resolveStylesheet, exportTarget, rebaseUrls, formatError, MARK, TAILWIND_RE }
+module.exports = { handle, release, resolveStylesheet, exportTarget, rebaseUrls, sassTiers, formatError, MARK, TAILWIND_RE, PREPROCESSED_RE }
 if (require.main === module) serve()

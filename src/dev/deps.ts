@@ -4,10 +4,10 @@
 import type { Plugin } from 'esbuild-wasm'
 import { parse as lexCjs } from 'cjs-lexer-js'
 import type { VFS } from '../vfs'
-import { bundleVfs, loadEsbuild, type VfsPluginOptions } from '../esbuild'
+import { bundleVfs, loadEsbuild, splitQuery, type VfsPluginOptions } from '../esbuild'
 import { BROWSER_OPTS, resolveModule, type ResolveFs } from '../resolve'
 import { isEsmFile } from '../esm'
-import { dirname } from '../path'
+import { dirname, join, normalize } from '../path'
 
 const RESERVED = new Set(
   'break case catch class const continue debugger default delete do else enum export extends false finally for function if import in instanceof new null return super switch this throw true try typeof var void while with yield let static implements interface package private protected public await arguments eval'.split(' '),
@@ -38,7 +38,7 @@ export class DepOptimizer {
     private vfs: VFS,
     private fs: ResolveFs,
     private root: string,
-    private opts: { wasmURL?: string; define: Record<string, string>; conditions?: string[] },
+    private opts: { wasmURL?: string; define: Record<string, string>; conditions?: string[]; preprocess?: (file: string, text: string) => Promise<string> },
   ) {}
 
   has(spec: string): boolean {
@@ -140,18 +140,52 @@ export class DepOptimizer {
       setup(build) {
         build.onResolve({ filter: /^cresslet-dep:/ }, (a) => ({ path: a.path.slice('cresslet-dep:'.length), namespace: 'cresslet-dep' }))
         build.onLoad({ filter: /.*/, namespace: 'cresslet-dep' }, (a) => ({ contents: virtual.get(a.path) ?? '', loader: 'js', resolveDir: '/' }))
-        // CSS imported from JS inside deps: inject as <style>
-        build.onLoad({ filter: /\.css$/, namespace: 'cresslet-vfs' }, async (a) => {
+        // CSS imported from JS inside deps: inject as <style> (Sass/Less compiled first)
+        build.onLoad({ filter: /\.(css|s[ac]ss|less)$/, namespace: 'cresslet-vfs' }, async (a) => {
           const es = await loadEsbuild()
-          const css = await es.transform(new TextDecoder().decode(vfsRead(a.path)), { loader: 'css', minify: false })
+          let text = new TextDecoder().decode(vfsRead(a.path))
+          if (!a.path.endsWith('.css')) {
+            if (!preprocess) throw new Error(`${a.path}: no Sass/Less compiler here`)
+            text = await preprocess(a.path, text)
+          }
+          // relative url()s point at the package's files: served from the root (`/node_modules/...`) or `/@fs`
+          const urlOf = (p: string) => (p.startsWith(root + '/') ? p.slice(root.length) : `/@fs${p}`)
+          const out = await es.build({
+            stdin: { contents: text, loader: 'css', resolveDir: dirname(a.path), sourcefile: a.path },
+            bundle: true,
+            write: false,
+            logLevel: 'silent',
+            plugins: [
+              {
+                name: 'cresslet-dep-css-urls',
+                setup(b) {
+                  b.onResolve({ filter: /.*/ }, (r) => {
+                    const [clean, query] = splitQuery(r.path)
+                    if (!clean || /^(?:[a-z][a-z\d+.-]*:|\/|#)/i.test(clean)) return { path: r.path, external: true }
+                    const file = normalize(join(r.resolveDir, clean))
+                    // the package's own `@import "./x.css"` (e.g. left by Sass): inlined, as the page can't resolve it
+                    // (an extensionless one Sass keeps for its media query, `@import "./x" print`, stays external)
+                    if (r.kind === 'import-rule' && !clean.startsWith('/') && clean.endsWith('.css') && vfs.isFile(file)) return { path: file, namespace: 'cresslet-dep-css' }
+                    if (r.kind !== 'url-token') return { path: r.path, external: true }
+                    return { path: vfs.isFile(file) ? urlOf(file) + query : r.path, external: true }
+                  })
+                  b.onLoad({ filter: /.*/, namespace: 'cresslet-dep-css' }, (l) => ({ contents: vfs.readText(l.path), loader: 'css', resolveDir: dirname(l.path) }))
+                },
+              },
+            ],
+          })
+          const css = out.outputFiles[0]?.text ?? ''
           return {
-            contents: `const s=document.createElement('style');s.setAttribute('data-cresslet-dep',${JSON.stringify(a.path)});s.textContent=${JSON.stringify(css.code)};document.head.appendChild(s);`,
+            contents: `const s=document.createElement('style');s.setAttribute('data-cresslet-dep',${JSON.stringify(a.path)});s.textContent=${JSON.stringify(css)};document.head.appendChild(s);`,
             loader: 'js',
           }
         })
       },
     }
     const vfsRead = (p: string) => this.vfs.readFile(p)
+    const preprocess = this.opts.preprocess
+    const vfs = this.vfs
+    const root = this.root
     const vopts: VfsPluginOptions = { resolve: ropts }
     try {
       const out = await bundleVfs(this.vfs, {

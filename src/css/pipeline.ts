@@ -1,4 +1,4 @@
-// CSS processing shared by the dev server and build: PostCSS (project config) and Tailwind CSS v4, run by a
+// CSS processing shared by the dev server and build: Sass/Less, PostCSS (project config) and Tailwind CSS v4, run by a
 // long-lived CSS worker (a `node` process running ./worker.cjs over the project's own packages).
 import type { Container } from '../container'
 import type { VFS } from '../vfs'
@@ -10,6 +10,13 @@ import workerSource from './worker.cjs?raw'
 
 /** CSS that needs Tailwind (keep in sync with TAILWIND_RE in worker.cjs). */
 export const TAILWIND_RE = /@(?:import\s+(?:url\(\s*)?["']tailwindcss(?:\/[^"']*)?["']|tailwind\b|theme\b|apply\b|utility\b|variant\b|custom-variant\b|plugin\b|config\b|source\b|reference\b)|--(?:theme|spacing|alpha)\(/
+
+/** Stylesheets a preprocessor compiles first: Sass (`sass`) and Less (`less`), from the project's deps (keep in sync with worker.cjs). */
+export const PREPROCESSED_RE = /\.(s[ac]ss|less)$/
+/** Every stylesheet extension the dev server and build treat as CSS. */
+export const STYLE_RE = /\.(css|s[ac]ss|less)$/
+/** CSS modules: `*.module.css`, `*.module.scss`, ... (class names are exports). */
+export const CSS_MODULE_RE = /\.module\.(css|s[ac]ss|less)$/
 
 export const POSTCSS_CONFIGS = ['postcss.config.js', 'postcss.config.mjs', 'postcss.config.cjs', 'postcss.config.ts', 'postcss.config.mts', '.postcssrc.js', '.postcssrc.cjs', '.postcssrc.mjs', '.postcssrc.json']
 /** Files whose change re-detects the CSS mode (and restarts the worker). */
@@ -110,10 +117,6 @@ export class CssPipeline {
     this.mode = detectCssMode(c.vfs, root, this.plugins)
   }
 
-  get active(): boolean {
-    return !!this.mode.postcssConfig || this.mode.tailwind
-  }
-
   /** Re-detect after package.json / PostCSS config / node_modules changes. */
   reset(): void {
     this.mode = detectCssMode(this.c.vfs, this.root, this.plugins)
@@ -129,8 +132,9 @@ export class CssPipeline {
     this.c.cssWorker().release?.(this.session)
   }
 
-  needs(text: string): boolean {
-    return !!this.mode.postcssConfig || (this.mode.tailwind && TAILWIND_RE.test(text))
+  /** Whether a stylesheet goes to the worker: Sass/Less always (compiled there), CSS for PostCSS/Tailwind. */
+  needs(file: string, text: string): boolean {
+    return PREPROCESSED_RE.test(file) || !!this.mode.postcssConfig || (this.mode.tailwind && TAILWIND_RE.test(text))
   }
 
   /** A project file changed: the scanners whose candidates it grew (their stylesheets need re-serving). */
@@ -142,7 +146,7 @@ export class CssPipeline {
   }
 
   async process(file: string, css: string): Promise<CssProcessed> {
-    if (!this.needs(css)) return { css, deps: [], dirs: [], scanner: null }
+    if (!this.needs(file, css)) return { css, deps: [], dirs: [], scanner: null }
     let known = this.rules.get(file)
     if (known && known.css !== css) known = undefined
     let r!: CssResult
@@ -150,7 +154,7 @@ export class CssPipeline {
     for (let attempt = 0, restarts = 0; attempt < 4; attempt++) {
       // the stylesheet's source rules come first (a discovery request when they aren't known for this text), so its
       // first build already has the candidates of exactly its sources
-      if (restarts && !this.needs(css)) return { css, deps: [], dirs: [], scanner: null } // the new mode doesn't process it
+      if (restarts && !this.needs(file, css)) return { css, deps: [], dirs: [], scanner: null } // the new mode doesn't process it
       const gen = this.generation
       const scanner = this.mode.tailwind && known?.key != null ? this.scannerFor(known.key, known.rules) : null
       const discover = this.mode.tailwind && !known
