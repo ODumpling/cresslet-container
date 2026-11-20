@@ -190,6 +190,7 @@ export async function runOp(c: Container, op: string, args: unknown[]): Promise<
 }
 
 let pidCounter = 100
+let evalCounter = 0
 
 /** The `node` command. */
 export async function nodeCommand(ctx: CommandContext): Promise<number> {
@@ -210,7 +211,7 @@ export async function nodeCommand(ctx: CommandContext): Promise<number> {
   }
   let entry: string
   if (evalCode !== null) {
-    entry = resolvePath(ctx.cwd, `[eval-${Date.now()}].js`)
+    entry = resolvePath(ctx.cwd, `[eval-${Date.now()}-${++evalCounter}].js`) // unique: children may run several at once
     c.vfs.writeFile(entry, evalCode)
   } else {
     if (!args.length) {
@@ -256,7 +257,9 @@ export async function runNode(ctx: CommandContext, entry: string, args: string[]
       resolveExit(code)
     }
     const onAbort = () => {
-      post({ type: 'signal', name: 'SIGINT' })
+      // Ctrl+C, or child_process kill(signal), which aborts with the signal's name as the reason
+      const reason: unknown = ctx.signal.reason
+      post({ type: 'signal', name: typeof reason === 'string' && /^SIG[A-Z0-9]+$/.test(reason) ? reason : 'SIGINT' })
       // give the process a moment to clean up, then hard-kill
       setTimeout(() => finish(130), 150)
     }
@@ -299,7 +302,9 @@ export async function runNode(ctx: CommandContext, entry: string, args: string[]
         }
         case 'child-spawn': {
           const spec = parseSpec(m)
-          if (typeof m.id === 'number' && spec) children.spawn(m.id, spec)
+          if (typeof m.id !== 'number') break
+          if (spec) children.spawn(m.id, spec)
+          else post({ type: 'child', id: m.id, ev: 'error', message: 'spawn EINVAL', code: 'EINVAL' })
           break
         }
         case 'child-stdin':

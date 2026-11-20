@@ -3,12 +3,11 @@
 // die with their parent process. Spawn requests may come from the preview relay (untrusted), so they're validated.
 import type { CommandContext, Writer } from '../process'
 import { Channel, errorMessage } from '../process'
-import { basename, dirname, resolve } from '../path'
+import { resolve } from '../path'
 import { Shell } from '../shell/jsh'
 import type { ChildEvent, ChildSpec, ChildStdio, ChildSyncResult } from './protocol'
 
 const STDIO = new Set<unknown>(['pipe', 'inherit', 'ignore'])
-const BIN_DIRS = new Set(['/usr/local/bin', '/usr/bin', '/bin'])
 const isStrings = (v: unknown): v is string[] => Array.isArray(v) && v.every((s) => typeof s === 'string')
 
 /** A spawn request from the worker, or null when malformed. */
@@ -54,11 +53,8 @@ export class ChildHost {
     if (!c.vfs.isDir(cwd)) return null
     const tty = (io: IO) => !!this.ctx.isTTY && io.stdout === this.ctx.stdout
     if (spec.shell) return (io) => new Shell(c, cwd, env).run(spec.file, { ...io, isTTY: tty(io) })
-    let name = spec.file
-    // `process.execPath` and friends: the built-in commands `which` reports under /usr/local/bin
-    if (!c.which(name, cwd, env) && BIN_DIRS.has(dirname(name)) && c.which(basename(name), cwd, { PATH: '' })) name = basename(name)
-    if (!c.which(name, cwd, env)) return null
-    return (io) => c.exec(name, { args: spec.args, cwd, env, ...io, container: c, isTTY: tty(io) })
+    if (!c.which(spec.file, cwd, env)) return null
+    return (io) => c.exec(spec.file, { args: spec.args, cwd, env, ...io, container: c, isTTY: tty(io) })
   }
 
   private writers(spec: ChildSpec, pipe: (fd: 1 | 2, s: string) => void): [Writer, Writer] {
@@ -134,7 +130,8 @@ export class ChildHost {
     const proc = this.procs.get(id)
     if (!proc || proc.killed) return
     proc.killed = signal
-    proc.abort.abort()
+    proc.abort.abort(signal) // a `node` child gets this signal (runNode)
+    proc.stdin.close() // commands blocked reading stdin unwind too
   }
 
   /** The parent exited: its children go with it. */

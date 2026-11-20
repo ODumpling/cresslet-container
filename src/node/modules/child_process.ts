@@ -5,6 +5,8 @@
 import { Buffer } from 'buffer'
 import { EventEmitter } from 'events'
 import { Readable, Writable } from 'readable-stream'
+import { StringDecoder } from 'string_decoder'
+import { resolve as resolvePath } from '../../path'
 import { nativeSetTimeout, post, ref, syncCall } from '../rpc'
 import type { ChildEvent, ChildSpec, ChildStdio, ChildSyncResult } from '../protocol'
 import { unsupportedFn } from './misc'
@@ -55,6 +57,7 @@ function makeSpec(file: unknown, args: unknown[], opts: Options, modes: ChildSpe
   for (const [k, v] of Object.entries(opts.env ?? proc().env)) if (v !== undefined) env[k] = String(v)
   let cwd = opts.cwd === undefined || opts.cwd === null ? proc().cwd() : String(opts.cwd)
   if (cwd.startsWith('file:')) cwd = decodeURIComponent(new URL(cwd).pathname)
+  cwd = resolvePath(proc().cwd(), cwd) // relative to this process's cwd now (after any chdir)
   const strArgs = args.map(String)
   if (opts.shell) return { file: [file, ...strArgs].join(' '), args: [], shell: true, cwd, env, stdio: modes }
   return { file, args: strArgs, shell: false, cwd, env, stdio: modes }
@@ -73,6 +76,7 @@ function normArgs(a: unknown[]): { args: unknown[]; opts: Options; cb?: (...r: u
   return { args, opts, cb }
 }
 
+const SIGNALS: Record<number, string> = { 1: 'SIGHUP', 2: 'SIGINT', 9: 'SIGKILL', 15: 'SIGTERM' }
 const children = new Map<number, ChildProcess>()
 let nextId = 0
 
@@ -103,17 +107,26 @@ export class ChildProcess extends EventEmitter {
     this.spawnfile = file
     this.spawnargs = [file, ...args]
     this.release = ref()
-    if (spec.stdio[0] === 'pipe')
+    if (spec.stdio[0] === 'pipe') {
+      const dec = new StringDecoder('utf8') // a character split across writes stays whole
+      let eof = false
+      const end = () => {
+        if (eof) return
+        eof = true
+        const rest = dec.end()
+        if (rest) post({ type: 'child-stdin', id, data: rest })
+        post({ type: 'child-stdin', id, data: null })
+      }
       this.stdin = new Writable({
         write: (chunk: unknown, _enc: string, cb: () => void) => {
-          post({ type: 'child-stdin', id, data: typeof chunk === 'string' ? chunk : Buffer.from(chunk as Uint8Array).toString() })
+          const data = typeof chunk === 'string' ? chunk : dec.write(chunk as Buffer)
+          if (data) post({ type: 'child-stdin', id, data })
           cb()
         },
-        final: (cb: () => void) => {
-          post({ type: 'child-stdin', id, data: null })
-          cb()
-        },
+        final: (cb: () => void) => (end(), cb()),
+        destroy: (err: Error | null, cb: (e: Error | null) => void) => (end(), cb(err)),
       })
+    }
     if (spec.stdio[1] === 'pipe') this.stdout = new Readable({ read() {} })
     if (spec.stdio[2] === 'pipe') this.stderr = new Readable({ read() {} })
     this.stdio = [this.stdin, this.stdout, this.stderr, null, null]
@@ -121,7 +134,7 @@ export class ChildProcess extends EventEmitter {
 
   kill(signal: string | number = 'SIGTERM'): boolean {
     if (this.ended || this.exitCode !== null || this.signalCode !== null) return false
-    post({ type: 'child-kill', id: this.id, signal: typeof signal === 'number' ? 'SIGTERM' : String(signal) })
+    post({ type: 'child-kill', id: this.id, signal: typeof signal === 'number' ? (SIGNALS[signal] ?? 'SIGTERM') : String(signal) })
     this.killed = true
     return true
   }
@@ -162,17 +175,23 @@ export class ChildProcess extends EventEmitter {
     }
   }
 
-  /** End stdio, then 'close' once what's buffered for flowing readers has been delivered. */
+  /** End stdio, then 'close' once stdout and stderr have ended (as in Node, output nobody reads is discarded). */
   private close(code: number | null, signal: string | null): void {
     this.ended = true
     children.delete(this.id)
-    this.stdout?.push(null)
-    this.stderr?.push(null)
     this.stdin?.destroy()
-    nativeSetTimeout(() => {
-      this.emit('close', code, signal)
-      this.unref()
-    }, 0)
+    const outs = [this.stdout, this.stderr].filter((s): s is Readable => !!s)
+    const ended = outs.map((s) => new Promise<void>((r) => (s.readableEnded || s.destroyed ? r() : (s.once('end', r), s.once('close', r)))))
+    for (const s of outs) {
+      s.push(null)
+      if (s.readableFlowing === null) s.resume()
+    }
+    Promise.all(ended).then(() =>
+      nativeSetTimeout(() => {
+        this.emit('close', code, signal)
+        this.unref()
+      }, 0),
+    )
   }
 }
 
@@ -193,7 +212,7 @@ function start(file: unknown, args: unknown[], opts: Options): ChildProcess {
   const killSignal = typeof opts.killSignal === 'string' ? opts.killSignal : 'SIGTERM'
   if (typeof opts.timeout === 'number' && opts.timeout > 0) {
     const t = nativeSetTimeout(() => cp.kill(killSignal), opts.timeout)
-    cp.once('exit', () => clearTimeout(t))
+    cp.once('close', () => clearTimeout(t))
   }
   const signal = opts.signal
   if (signal) {
@@ -203,7 +222,7 @@ function start(file: unknown, args: unknown[], opts: Options): ChildProcess {
     if (signal.aborted) queueMicrotask(onAbort)
     else {
       signal.addEventListener('abort', onAbort, { once: true })
-      cp.once('exit', () => signal.removeEventListener('abort', onAbort))
+      cp.once('close', () => signal.removeEventListener('abort', onAbort))
     }
   }
   return cp
@@ -324,5 +343,4 @@ export default {
   execFile,
   execFileSync,
   fork: unsupportedFn('child_process.fork'),
-  _forkChild: unsupportedFn('child_process._forkChild'),
 }

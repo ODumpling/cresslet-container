@@ -78,10 +78,10 @@ describe('child_process host side', () => {
   const forever: Command = (ctx) => new Promise((r) => ctx.signal.addEventListener('abort', () => r(130)))
   const tick = () => new Promise((r) => setTimeout(r, 0))
 
-  it('spawn: spawn, piped output, exit; cwd and env as given; process.execPath maps to node', async () => {
-    const { host, events } = setup({ echo, node: echo })
+  it('spawn: spawn, piped output, exit; cwd and env as given', async () => {
+    const { host, events } = setup({ echo })
     host.spawn(1, spec({ args: ['a', 'b'], cwd: 'sub', env: { HOME: '/x' } }))
-    host.spawn(2, spec({ file: '/usr/local/bin/node', args: ['-v'] }))
+    host.spawn(2, spec({ args: ['-v'] }))
     await tick()
     expect(events.filter((e) => e.id === 1)).toEqual([
       { type: 'child', id: 1, ev: 'spawn' },
@@ -116,8 +116,20 @@ describe('child_process host side', () => {
     expect(parentOut()).toBe('hi @/home/project /home\n')
   })
 
-  it('kill reports the signal; killAll ends every child and refuses new ones', async () => {
-    const { host, events } = setup({ forever })
+  it('kill reports the signal, aborts with it and ends stdin; killAll ends every child and refuses new ones', async () => {
+    const { host, events } = setup({ forever, cat })
+    host.spawn(9, spec({ file: 'cat' }))
+    await tick()
+    host.kill(9, 'SIGHUP') // cat ignores the signal; it ends because its stdin does
+    await tick()
+    expect(events.at(-1)).toEqual({ type: 'child', id: 9, ev: 'exit', code: null, signal: 'SIGHUP' })
+    let reason: unknown
+    const h2 = setup({ forever: (ctx) => new Promise((r) => ctx.signal.addEventListener('abort', () => ((reason = ctx.signal.reason), r(1)))) })
+    h2.host.spawn(1, spec({ file: 'forever' }))
+    await tick()
+    h2.host.kill(1, 'SIGTERM')
+    await tick()
+    expect(reason).toBe('SIGTERM')
     host.spawn(1, spec({ file: 'forever' }))
     host.spawn(2, spec({ file: 'forever' }))
     await tick()

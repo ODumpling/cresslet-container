@@ -149,6 +149,8 @@ export declare class Container {
     which(name: string, cwd: string, env: Record<string, string | undefined>): string | null;
     /** Run a command by name in an existing context (used by jsh, npm run, …). */
     exec(name: string, ctx: CommandContext): Promise<number>;
+    /** `/usr/local/bin/node` and the like (`process.execPath`, what `which` reports): the built-in command's name, else null. */
+    private virtualBin;
     private runFile;
     servePort(port: number, handler: PortHandler): {
         url: string;

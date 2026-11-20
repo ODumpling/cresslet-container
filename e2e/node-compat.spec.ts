@@ -183,6 +183,24 @@ const collect = (child) => new Promise((resolve) => {
   r.kill = await collect(sleeper)
   r.killed = sleeper.killed
   r.timeout = await new Promise((res) => cp.exec('sleep 5', { timeout: 200 }, (e) => res({ killed: e.killed, signal: e.signal })))
+  // a child blocked reading stdin still dies when killed
+  r.catTimeout = await new Promise((res) => cp.exec('cat', { timeout: 100 }, (e) => res(e.signal)))
+  // the signal reaches a node child
+  const term = cp.spawn('node', ['-e', "process.on('SIGTERM', () => { console.log('got SIGTERM'); process.exit(0) }); setInterval(() => {}, 1000)"])
+  setTimeout(() => term.kill('SIGTERM'), 300)
+  r.sigterm = await collect(term)
+  // process.execPath through the shell, several node -e children at once, cwd relative to process.cwd()
+  r.execPathShell = cp.execSync(process.execPath + ' -p "3 + 4"', { encoding: 'utf8' })
+  r.parallel = await Promise.all([1, 2, 3, 4, 5, 6].map((i) => promisify(cp.execFile)('node', ['-p', String(i * 10)]).then((x) => x.stdout)))
+  process.chdir('sub')
+  r.relCwd = cp.execSync('pwd', { cwd: '..', encoding: 'utf8' })
+  process.chdir('..')
+  // multibyte characters split across stdin writes
+  const utf = cp.spawn('cat')
+  const bytes = Buffer.from('héllo ✓')
+  utf.stdin.write(bytes.subarray(0, 2))
+  utf.stdin.end(bytes.subarray(2))
+  r.utf8 = (await collect(utf)).out
   console.log(JSON.stringify(r))
 })()
 `
@@ -206,6 +224,12 @@ function checkChild(r: Record<string, unknown>, out: string) {
   expect(r.kill).toMatchObject({ code: null, signal: 'SIGTERM', events: ['spawn', 'exit:null:SIGTERM'] })
   expect(r.killed).toBe(true)
   expect(r.timeout).toEqual({ killed: true, signal: 'SIGTERM' })
+  expect(r.catTimeout).toBe('SIGTERM')
+  expect(r.sigterm).toMatchObject({ out: 'got SIGTERM\n', signal: 'SIGTERM' })
+  expect(r.execPathShell).toBe('7\n')
+  expect(r.parallel).toEqual(['10\n', '20\n', '30\n', '40\n', '50\n', '60\n'])
+  expect(r.relCwd).toBe('/home/project\n')
+  expect(r.utf8).toBe('héllo ✓')
 }
 
 test.describe.serial('node zlib + child_process', () => {
