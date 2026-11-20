@@ -182,6 +182,20 @@ test.describe.serial('per-preview origins', () => {
     expect(out).toBe(origin(0))
   })
 
+  test('node rejects a port previews cannot use, as Node does', async () => {
+    const out = await p.evaluate(async () => {
+      const code = `try { require('http').createServer().listen(70000) } catch (e) { console.log(e.code) }`
+      const proc = await (window as unknown as Win).container.spawn('node', ['-e', code])
+      let s = ''
+      const piped = proc.output.pipeTo(new WritableStream({ write: (d) => void (s += d) }))
+      await proc.exit
+      await piped.catch(() => {})
+      return s.trim()
+    })
+    expect(out).toBe('ERR_SOCKET_BAD_PORT')
+    expect(await p.evaluate(() => (window as unknown as Win).container.ports.has(70000))).toBe(false)
+  })
+
   test("teardown unregisters each preview origin's service worker", async () => {
     // a plain page on preview A's origin, framed by the host (same storage partition as A's relay)
     await p.evaluate(
