@@ -3,6 +3,12 @@ import type { VFS } from '../vfs';
 import { type SourceRules } from './scan';
 /** CSS that needs Tailwind (keep in sync with TAILWIND_RE in worker.cjs). */
 export declare const TAILWIND_RE: RegExp;
+/** Stylesheets a preprocessor compiles first: Sass (`sass`) and Less (`less`), from the project's deps (keep in sync with worker.cjs). */
+export declare const PREPROCESSED_RE: RegExp;
+/** Every stylesheet extension the dev server and build treat as CSS. */
+export declare const STYLE_RE: RegExp;
+/** CSS modules: `*.module.css`, `*.module.scss`, ... (class names are exports). */
+export declare const CSS_MODULE_RE: RegExp;
 export declare const POSTCSS_CONFIGS: string[];
 /** Files whose change re-detects the CSS mode (and restarts the worker). */
 export declare const CSS_CONFIG_RE: RegExp;
@@ -84,12 +90,12 @@ export declare class CssPipeline {
     constructor(c: Pick<Container, 'vfs' | 'cssWorker'> & {
         cssPlugins?: boolean;
     }, root: string, env: CssRequest['env']);
-    get active(): boolean;
     /** Re-detect after package.json / PostCSS config / node_modules changes. */
     reset(): void;
     /** Free this pipeline's worker-side state. */
     release(): void;
-    needs(text: string): boolean;
+    /** Whether a stylesheet goes to the worker: Sass/Less always (compiled there), CSS for PostCSS/Tailwind. */
+    needs(file: string, text: string): boolean;
     /** A project file changed: the scanners whose candidates it grew (their stylesheets need re-serving). */
     update(file: string): string[];
     process(file: string, css: string): Promise<CssProcessed>;

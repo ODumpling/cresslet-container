@@ -26,6 +26,7 @@ export declare class DepOptimizer {
         wasmURL?: string;
         define: Record<string, string>;
         conditions?: string[];
+        preprocess?: (file: string, text: string) => Promise<string>;
     });
     has(spec: string): boolean;
     /** Add specs (e.g. from the initial scan) without serving. */

@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { VFS } from '../src/vfs'
 import { CandidateScanner, extractCandidates, globToRegExp } from '../src/css/scan'
-import { CssPipeline, detectCssMode, nodeCssBackend, TAILWIND_RE, type CssRequest, type CssResult, type CssWorkerSpawn } from '../src/css/pipeline'
+import { CssPipeline, detectCssMode, nodeCssBackend, PREPROCESSED_RE, TAILWIND_RE, type CssRequest, type CssResult, type CssWorkerSpawn } from '../src/css/pipeline'
 
 // The CSS worker script is plain CommonJS: run it in real Node against the repo's tailwindcss/postcss/autoprefixer.
 const workerPath = fileURLToPath(new URL('../src/css/worker.cjs', import.meta.url))
@@ -16,15 +16,17 @@ const worker = createRequire(import.meta.url)('../src/css/worker.cjs') as {
   release(session: string): void
   TAILWIND_RE: RegExp
   exportTarget(exp: unknown, sub: string): string | null
-  rebaseUrls(css: string, fromDir: string, toDir: string): string
+  rebaseUrls(css: string, fromDir: string, toDir: string, o?: { sass?: boolean; indented?: boolean }): string
+  sassTiers(p: string, fromImport: boolean): string[][]
+  PREPROCESSED_RE: RegExp
 }
 const repoModules = fileURLToPath(new URL('../node_modules', import.meta.url))
 
 /** A temp project: the repo's packages linked into node_modules, plus `files` (fake packages go in node_modules/). */
-function project(files: Record<string, string>): string {
+function project(files: Record<string, string>, packages = ['tailwindcss', 'postcss', 'autoprefixer', 'sass', 'less']): string {
   const dir = mkdtempSync(join(tmpdir(), 'cresslet-css-'))
   mkdirSync(join(dir, 'node_modules'))
-  for (const p of ['tailwindcss', 'postcss', 'autoprefixer']) symlinkSync(join(repoModules, p), join(dir, 'node_modules', p))
+  for (const p of packages) symlinkSync(join(repoModules, p), join(dir, 'node_modules', p))
   for (const [p, s] of Object.entries(files)) {
     mkdirSync(join(dir, p, '..'), { recursive: true })
     writeFileSync(join(dir, p), s)
@@ -378,6 +380,20 @@ describe('CSS mode', () => {
   })
 })
 
+describe('Sass/Less in the pipeline', () => {
+  it('Sass/Less always go to the worker (no Tailwind, no PostCSS config); plain CSS still skips it', async () => {
+    const v = new VFS()
+    v.writeFile('/p/package.json', JSON.stringify({ devDependencies: { sass: '*', less: '*' } }), { mkdirp: true })
+    const reqs: CssRequest[] = []
+    const backend = { restart() {}, process: async (r: CssRequest): Promise<CssResult> => (reqs.push(r), { css: 'compiled', deps: [], dirs: [], warnings: [], tailwind: [] }) }
+    const p = new CssPipeline({ vfs: v, cssWorker: () => backend }, '/p', 'development')
+    expect((await p.process('/p/src/a.css', 'a{}')).css).toBe('a{}')
+    for (const f of ['/p/src/a.scss', '/p/src/b.sass', '/p/src/c.less', '/p/src/d.module.scss']) expect((await p.process(f, '$x: 1;')).css).toBe('compiled')
+    expect(reqs.map((r) => [r.file, r.discover, r.tailwind])).toEqual(['/p/src/a.scss', '/p/src/b.sass', '/p/src/c.less', '/p/src/d.module.scss'].map((f) => [f, false, false]))
+    expect(PREPROCESSED_RE.source).toBe(worker.PREPROCESSED_RE.source)
+  })
+})
+
 describe('CSS worker (real tailwindcss / postcss / autoprefixer)', () => {
   it('exports: style condition first', () => {
     expect(worker.exportTarget({ '.': { types: './a.d.ts', style: './index.css', import: './x.mjs' } }, '.')).toBe('./index.css')
@@ -591,6 +607,185 @@ describe('CSS worker (real tailwindcss / postcss / autoprefixer)', () => {
     const file = join(dir, 'src/a.css')
     await expect(worker.handle({ root: dir, file, css: '@import "tailwindcss";\n@plugin "./plugin.cjs";\n', candidates: [], plugins: false })).rejects.toThrow(/@plugin '.\/plugin.cjs' not loaded: project CSS plugins are disabled/)
     expect((await worker.handle({ root: dir, file, css: '@import "tailwindcss";\n', candidates: ['flex'], plugins: false })).css).toMatch(/\.flex/)
+  })
+})
+
+describe('CSS worker: Sass / Less (real sass / less)', () => {
+  it('SCSS: partials from other dirs, variables, nesting; url()s in partials rebased, url($var) left to Sass', async () => {
+    const dir = project({
+      'src/styles/_vars.scss': '@import "./reset.css";\n$brand: #123456;\n$img: "./x.png";\n.from-partial { background: url(./bg.png); mask: url($img); }\n',
+      'src/styles/_index.scss': '@forward "vars";\n',
+    })
+    const file = join(dir, 'src/main.scss')
+    const r = await worker.handle({ root: dir, file, css: '@use "sass:math";\n@use "styles" as s;\n.a { color: s.$brand; .b { width: math.div(10px, 2); } }\n', candidates: [] })
+    expect(r.css).toContain('.a {\n  color: #123456;')
+    expect(r.css).toContain('.a .b {\n  width: 5px;')
+    expect(r.css).toContain('url(./styles/bg.png)')
+    expect(r.css).toContain('url("./x.png")') // a variable's value: as Sass emits it (relative to the entry)
+    expect(r.css).toContain('@import "./styles/reset.css";') // plain CSS Sass passes through, from the partial's dir
+    expect(r.deps).toEqual(expect.arrayContaining([join(dir, 'src/styles/_index.scss'), join(dir, 'src/styles/_vars.scss')]))
+    expect(r.tailwind).toEqual([])
+  })
+
+  it('the indented syntax (.sass), and .css loaded by Sass', async () => {
+    const dir = project({ 'src/lib/_mix.sass': '=box($w)\n  width: $w\n', 'src/lib/plain.css': '@import "./reset.css";\n.plain { color: red; background: url(./p.png) }\n', 'src/lib/_c.sass': '@import "./d"  // the d partial\n', 'src/lib/_d.sass': '.d\n  a: 1\n' })
+    const r = await worker.handle({ root: dir, file: join(dir, 'src/a.sass'), css: '@use "lib/mix" as *\n@use "lib/plain"\n@import "lib/c"\n.a\n  +box(3px)\n', candidates: [] })
+    expect(r.css).toContain('@import "./lib/reset.css";') // the loaded .css's own import, from its dir
+    // SCSS: a media query on the next line; a bare `x.css` beside the partial (not a package)
+    writeFileSync(join(dir, 'src/lib/beside.css'), '.b {}')
+    writeFileSync(join(dir, 'src/lib/theme.css'), '.t {}')
+    writeFileSync(join(dir, 'src/lib/_q.scss'), '@import "./print"\n  print;\n@import "beside.css";\n@import "kit/x.css";\n@import url(beside.css) print;\n@import url("kit/y.css");\n@import "theme" screen;\n')
+    const q = await worker.handle({ root: dir, file: join(dir, 'src/b.scss'), css: '@use "lib/q";\n', candidates: [] })
+    expect(q.css).toContain('@import "./lib/print" print;')
+    expect(q.css).toContain('@import "./lib/beside.css";')
+    expect(q.css).toContain('@import "kit/x.css";') // a package specifier
+    expect(q.css).toContain('@import url(./lib/beside.css) print;')
+    expect(q.css).toContain('@import url("kit/y.css");') // a package specifier in url()
+    expect(q.css).toContain('@import "./lib/theme" screen;') // theme.css beside it
+    expect(r.css).toContain('.d {') // a commented Sass import in a partial still resolves
+    expect(r.css).toContain('.a {\n  width: 3px;')
+    expect(r.css).toContain('.plain {')
+    expect(r.css).toContain('url(./lib/p.png)')
+  })
+
+  it('package paths resolve from node_modules (also ~pkg); @import finds .import files first', async () => {
+    const dir = project({
+      'node_modules/kit/scss/_colors.scss': '$kit: rgb(1, 2, 3);\n',
+      'node_modules/kit/package.json': '{"name":"kit"}',
+      'src/_theme.scss': '.theme { a: 1 }\n',
+      'src/_theme.import.scss': '.theme-import { a: 1 }\n',
+    })
+    const file = join(dir, 'src/a.scss')
+    const r = await worker.handle({ root: dir, file, css: '@use "kit/scss/colors";\n@use "~kit/scss/colors" as c2;\n.a { color: colors.$kit; }\n', candidates: [] })
+    expect(r.css).toContain('color: rgb(1, 2, 3);')
+    expect(r.deps).toContain(join(dir, 'node_modules/kit/scss/_colors.scss'))
+    // a package's own dependency, nested in its node_modules; a package's warnings stay quiet
+    mkdirSync(join(dir, 'node_modules/kit/node_modules/dep'), { recursive: true })
+    writeFileSync(join(dir, 'node_modules/kit/node_modules/dep/_index.scss'), '$dep: 4px;\n')
+    writeFileSync(join(dir, 'node_modules/kit/scss/_uses-dep.scss'), '@use "dep";\n@warn "from the package";\n.kit { width: dep.$dep; }\n')
+    const nested = await worker.handle({ root: dir, file, css: '@use "kit/scss/uses-dep";\n@warn "from the project";\n', candidates: [] })
+    expect(nested.css).toContain('width: 4px;')
+    expect(nested.warnings.join('\n')).toContain('from the project')
+    expect(nested.warnings.join('\n')).not.toContain('from the package')
+    // a bare package: its package.json `sass` entry (as `@use "bootstrap"` in vite)
+    mkdirSync(join(dir, 'node_modules/boot/scss'), { recursive: true })
+    writeFileSync(join(dir, 'node_modules/boot/package.json'), '{"name":"boot","sass":"scss/boot.scss"}')
+    writeFileSync(join(dir, 'node_modules/boot/scss/boot.scss'), '.boot { a: 1 }\n')
+    expect((await worker.handle({ root: dir, file, css: '@use "boot";\n', candidates: [] })).css).toContain('.boot {')
+    const imp = await worker.handle({ root: dir, file, css: '@import "theme";\n', candidates: [] })
+    expect(imp.css).toContain('.theme-import')
+    expect((await worker.handle({ root: dir, file, css: '@use "theme";\n', candidates: [] })).css).toMatch(/\.theme \{/)
+  })
+
+  it('a missing Sass import fails with Sass\'s message and reports the paths it tried (creating one retries)', async () => {
+    const dir = project({ 'src/_ok.scss': '.ok { a: 1 }\n' })
+    const file = join(dir, 'src/a.scss')
+    const e = await worker.handle({ root: dir, file, css: '@use "ok";\n@use "parts/missing";\n', candidates: [] }).then(() => null, (x) => x)
+    expect(e.message).toContain("Can't find stylesheet to import")
+    for (const p of ['src/parts/_missing.scss', 'src/parts/missing.scss', 'src/parts/missing/_index.scss', 'src/_ok.scss']) expect(e.deps).toContain(join(dir, p))
+    // a `../` or absolute load that misses never falls back to node_modules (or what `node_modules/..` is)
+    writeFileSync(join(dir, '_vars.scss'), '.root-vars { a: 1 }')
+    mkdirSync(join(dir, 'node_modules/nope'), { recursive: true })
+    writeFileSync(join(dir, 'node_modules/nope/_index.scss'), '.pkg { a: 1 }')
+    for (const css of ['@use "../vars";', '@use "../../nope";', `@use "${join(dir, 'src/nope')}";`])
+      await expect(worker.handle({ root: dir, file: join(dir, 'src/sub/a.scss'), css, candidates: [] })).rejects.toThrow(/Can't find stylesheet to import/)
+    const syntax = await worker.handle({ root: dir, file, css: '.a { color: ; }\n', candidates: [] }).then(() => null, (x) => x)
+    expect(syntax.message).toMatch(/Expected expression/)
+  })
+
+  it('Sass output goes on to Tailwind (plain-CSS @import of tailwindcss, @apply) and to a PostCSS config', async () => {
+    const dir = project({ 'postcss.config.cjs': "module.exports = { plugins: { autoprefixer: { overrideBrowserslist: ['safari 8'] } } }\n", 'src/lib/_tw.scss': '@import "tailwindcss/utilities.css";\n' })
+    const file = join(dir, 'src/a.scss')
+    // the Tailwind import from a partial in another dir: a package specifier, not rebased
+    const tw = await worker.handle({ root: dir, file, css: '@use "lib/tw";\n$pad: 4px;\n.btn { padding: $pad * 2; @apply flex; }\n', candidates: ['grid'], tailwind: true })
+    expect(tw.css).toMatch(/\.btn \{\s*padding: 8px;\s*display: flex;/)
+    expect(tw.css).toMatch(/\.grid\s*\{\s*display: grid/)
+    const pc = await worker.handle({ root: dir, file, css: '$d: flex;\n.a { display: $d; }\n', candidates: [], postcssConfig: join(dir, 'postcss.config.cjs') })
+    expect(pc.css).toContain('display: -webkit-flex')
+    // Tailwind syntax in a project without Tailwind: left as Sass emitted it
+    expect((await worker.handle({ root: dir, file, css: '.a { @apply flex; }\n', candidates: [], tailwind: false })).css).toContain('@apply flex')
+  })
+
+  it('Less: imports from other dirs (url()s rewritten), deps, errors with file:line, a missing import reports what it tried', async () => {
+    const dir = project({ 'src/styles/vars.less': '@brand: #654321;\n.from-import { background: url("./bg.png"); }\n' })
+    const file = join(dir, 'src/main.less')
+    const r = await worker.handle({ root: dir, file, css: '@import "styles/vars";\n.a { color: @brand; .b { width: (10px / 2); } }\n', candidates: [] })
+    expect(r.css).toContain('color: #654321;')
+    expect(r.css).toContain('.a .b {\n  width: 5px;')
+    expect(r.css).toContain('url("./styles/bg.png")')
+    expect(r.deps).toContain(join(dir, 'src/styles/vars.less'))
+    const syntax = await worker.handle({ root: dir, file, css: '.a {\n  color: @nope;\n}\n', candidates: [] }).then(() => null, (x) => x)
+    expect(syntax.message).toContain(`${file}:2:10: variable @nope is undefined`)
+    expect(syntax.message).toContain('   2 |   color: @nope;')
+    const missing = await worker.handle({ root: dir, file, css: '@import "parts/missing";\n', candidates: [] }).then(() => null, (x) => x)
+    expect(missing.message).toContain("wasn't found")
+    expect(missing.deps).toContain(join(dir, 'src/parts/missing.less'))
+    // an error after imports loaded keeps them as deps (the fix may go in one); a missing (optional) import is one too
+    const late = await worker.handle({ root: dir, file, css: '@import "styles/vars";\n@import (optional) "./opt";\n.a { color: @undefined-here; }\n', candidates: [] }).then(() => null, (x) => x)
+    expect(late.deps).toEqual(expect.arrayContaining([join(dir, 'src/styles/vars.less'), join(dir, 'src/opt.less')]))
+    const opt = await worker.handle({ root: dir, file, css: '@import (optional) "./opt";\n.a { b: 1 }\n', candidates: [] })
+    expect(opt.deps).toContain(join(dir, 'src/opt.less'))
+    // a file data-uri() inlines is a dep too
+    writeFileSync(join(dir, 'src/dot.svg'), '<svg xmlns="http://www.w3.org/2000/svg"/>')
+    const inlined = await worker.handle({ root: dir, file, css: '.a { background: data-uri("dot.svg"); }\n', candidates: [] })
+    expect(inlined.css).toContain('data:image/svg+xml')
+    expect(inlined.deps).toContain(join(dir, 'src/dot.svg'))
+  })
+
+  it('Less @plugin runs project code: loaded normally, refused with plugins: false; inline JavaScript stays off', async () => {
+    const dir = project({ 'src/plugin.js': "module.exports = { install(less, pm, functions) { functions.add('twice', (n) => new less.tree.Dimension(n.value * 2, n.unit)) } }\n" })
+    const file = join(dir, 'src/a.less')
+    const css = '@plugin "./plugin";\n.a { width: twice(3px); }\n'
+    expect((await worker.handle({ root: dir, file, css, candidates: [] })).css).toContain('width: 6px;')
+    await expect(worker.handle({ root: dir, file, css, candidates: [], plugins: false })).rejects.toThrow(/@plugin '.\/plugin' not loaded: project CSS plugins are disabled/)
+    await expect(worker.handle({ root: dir, file, css: '.a { width: `1 + 1`px; }\n', candidates: [] })).rejects.toThrow(/Inline JavaScript is not enabled/)
+  })
+
+  it('a project without the compiler says which package to install', async () => {
+    const dir = project({}, [])
+    await expect(worker.handle({ root: dir, file: join(dir, 'a.scss'), css: '.a{}', candidates: [] })).rejects.toThrow(/a\.scss needs the `sass` package \(npm install -D sass\)/)
+    await expect(worker.handle({ root: dir, file: join(dir, 'a.less'), css: '.a{}', candidates: [] })).rejects.toThrow(/a\.less needs the `less` package \(npm install -D less\)/)
+  })
+
+  it('url() rebasing for Sass source: variables and interpolation are left alone; an indented @import ends at its line', () => {
+    const r = (css: string, o = { sass: true }) => worker.rebaseUrls(css, '/p/src/a', '/p/src', o)
+    expect(r('.x { a: url(./i.png); b: url($v); c: url("#{$d}/i.png"); d: url("img/#{$n}.png"); }')).toBe('.x { a: url(./a/i.png); b: url($v); c: url("#{$d}/i.png"); d: url("img/#{$n}.png"); }')
+    expect(r('@import foo\n.x\n  a: url(./i.png)\n', { sass: true, indented: true } as never)).toBe('@import foo\n.x\n  a: url(./a/i.png)\n')
+    // Sass: `//` comments are skipped; a plain-CSS `@import "x.css"` (left in Sass's output) is rebased, Sass's own imports aren't
+    expect(r('.x {\n  // @import "note"\n  a: url(./i.png);\n}\n@import "./reset.css";\n@import "theme";\n@import url(./u.css) screen;\n@import url(v.css);\n')).toBe('.x {\n  // @import "note"\n  a: url(./a/i.png);\n}\n@import "./a/reset.css";\n@import "theme";\n@import url(./a/u.css) screen;\n@import url(v.css);\n') // (no v.css beside it: a package)
+    // a media query makes it plain CSS; a package specifier and Sass's own (comma-separated) imports are left alone
+    expect(r('@import "./print" print;\n@import "tailwindcss/utilities.css";\n@import "./a", "./b";\n')).toBe('@import "./a/print" print;\n@import "tailwindcss/utilities.css";\n@import "./a", "./b";\n')
+    // a comment after a Sass import is no media query
+    expect(r('@import "./e" /* e */;\n@import "./f" // f\n')).toBe('@import "./e" /* e */;\n@import "./f" // f\n')
+    expect(r('@import "./b"  // the b partial\n.x\n  a: b\n', { sass: true, indented: true } as never)).toBe('@import "./b"  // the b partial\n.x\n  a: b\n')
+    expect(r('.n { @import "./d" }\n')).toBe('.n { @import "./d" }\n') // a nested Sass import, no semicolon
+    // CSS that Sass loads: every relative @import in it is plain CSS
+    expect(r('@import "./reset";\n@import url(./r2.css);\n@import "pkg/x.css";\n', { cssImports: true } as never)).toBe('@import "./a/reset";\n@import url(./a/r2.css);\n@import "pkg/x.css";\n')
+    expect(worker.rebaseUrls('@import "./reset.css";', '/p/src/a', '/p/src')).toBe('@import "./reset.css";') // CSS: the compiler resolves it
+    // a `//****` banner isn't a block comment; the indented syntax's `/*` may never close
+    expect(r('//*********** Card\n.card { background: url(bg.png); }')).toBe('//*********** Card\n.card { background: url(./a/bg.png); }')
+    expect(r('/* Card styles\n.card\n  background: url(bg.png)\n', { sass: true, indented: true } as never)).toBe('/* Card styles\n.card\n  background: url(./a/bg.png)\n')
+    // plain CSS keeps rebasing what looks like a path
+    expect(worker.rebaseUrls('a { b: url($v) }', '/p/src/a', '/p/src')).toBe('a { b: url(./a/$v) }')
+  })
+
+  it('Sass load candidates follow Sass\'s tiers; two files in one tier are ambiguous, as in Sass', async () => {
+    expect(worker.sassTiers('/p/a/b', false)).toEqual([
+      ['/p/a/b.sass', '/p/a/_b.sass', '/p/a/b.scss', '/p/a/_b.scss'],
+      ['/p/a/b.css', '/p/a/_b.css'],
+      ['/p/a/b/index.sass', '/p/a/b/_index.sass', '/p/a/b/index.scss', '/p/a/b/_index.scss'],
+      ['/p/a/b/index.css', '/p/a/b/_index.css'],
+    ])
+    expect(worker.sassTiers('/p/a/b.scss', true)).toEqual([['/p/a/b.import.scss', '/p/a/_b.import.scss'], ['/p/a/b.scss', '/p/a/_b.scss']])
+    const dir = project({ 'src/_t.scss': 'a { b: 1 }', 'src/t.scss': 'a { b: 2 }', 'src/u.sass': 'a\n  b: 1\n', 'src/u.scss': 'a { b: 2 }', 'src/v.scss': 'a { b: 1 }', 'src/v.css': 'a { b: 2 }' })
+    const file = join(dir, 'src/a.scss')
+    for (const [css, found] of [['@use "t";', 'src/_t.scss'], ['@use "t.scss";', 'src/_t.scss'], ['@use "u";', 'src/u.sass']]) {
+      const e = await worker.handle({ root: dir, file, css, candidates: [] }).then(() => null, (x) => x)
+      expect(e?.message).toContain("It's not clear which file to import")
+      expect(e.deps).toContain(join(dir, found))
+    }
+    // .sass/.scss before .css: not ambiguous
+    expect((await worker.handle({ root: dir, file, css: '@use "v";', candidates: [] })).css).toContain('b: 1')
   })
 })
 

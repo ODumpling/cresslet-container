@@ -48,8 +48,9 @@ export interface BootOptions {
    */
   previewOrigin?: string
   /**
-   * Run project code when processing CSS: PostCSS configs (and their plugins), Tailwind `@plugin` / `@config`.
-   * Default true. `false`: PostCSS configs are ignored and `@plugin`/`@config` fail; Tailwind v4 itself still compiles.
+   * Load project plugins and configs when processing CSS: PostCSS configs (and their plugins), Tailwind `@plugin` /
+   * `@config`, Less `@plugin`. Default true. `false`: PostCSS configs are ignored and those `@plugin`/`@config` fail;
+   * Tailwind v4, Sass and Less themselves still compile (the installed packages' own code still runs).
    */
   cssPlugins?: boolean
 }

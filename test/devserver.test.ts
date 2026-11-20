@@ -56,6 +56,10 @@ async function devServer(files: Record<string, string>, o: { deps?: Record<strin
   bc.onmessage = (e) => void msgs.push(e.data)
   servers.push(server, bc)
   const get = async (path: string) => (await handler(new Request('http://localhost' + path))).text()
+  const res = async (path: string) => {
+    const r = await handler(new Request('http://localhost' + path))
+    return { type: r.headers.get('content-type') ?? '', text: await r.text() }
+  }
   /** Wait for the next message the page would receive. */
   const next = async (): Promise<Msg> => {
     const k = msgs.length
@@ -69,7 +73,7 @@ async function devServer(files: Record<string, string>, o: { deps?: Record<strin
     await new Promise((r) => setTimeout(r, 250))
     return msgs.slice(k)
   }
-  return { vfs, write, get, next, quiet, rm: (p: string) => vfs.rm(join(ROOT, p), { recursive: true }) }
+  return { vfs, write, get, res, next, quiet, rm: (p: string) => vfs.rm(join(ROOT, p), { recursive: true }) }
 }
 
 // classic createElement instead of JSX syntax (no bare jsx-runtime import): keeps the dependency optimizer out of it
@@ -447,6 +451,76 @@ describe('dev server CSS processing', () => {
     s.write('src/App.tsx', comp('App', 'return "y"'))
     const m = await s.next()
     expect(m.updates).toEqual(expect.arrayContaining([expect.objectContaining({ kind: 'js', url: '/src/App.tsx' }), expect.objectContaining({ kind: 'css', url: '/src/index.css?import' })]))
+  })
+
+  it('Sass/Less: compiled by the worker in any project; imported, <link>ed, CSS modules and packages; partials join the CSS graph', async () => {
+    let read: (p: string) => string | null = () => null
+    const reqs: string[] = []
+    const backend: CssBackend = {
+      restart() {},
+      async process(r) {
+        reqs.push(r.file)
+        if (r.file === ROOT + '/src/main.scss') {
+          const extra = read(ROOT + '/src/parts/_extra.scss')
+          // what a missing import reports: the paths Sass tried
+          if (r.css.includes('extra') && extra === null) throw Object.assign(new Error("Can't find stylesheet to import."), { deps: [ROOT + '/src/parts/_extra.scss', ROOT + '/src/parts/extra.scss'] })
+          return { css: `.a { color: ${read(ROOT + '/src/_vars.scss')} }\n${extra ?? ''}`, deps: [ROOT + '/src/_vars.scss', ...(extra === null ? [] : [ROOT + '/src/parts/_extra.scss'])], dirs: [], warnings: [], tailwind: [] }
+        }
+        // as Less rewrites an imported file's url(): relative to the entry, without ./
+        // and its plain-CSS imports: `@import "./parts/reset.css"` from an imported file comes out as `parts/reset.css`
+        if (r.file.endsWith('.less') && !r.file.includes('module')) return { css: '@import "parts/reset.css";\n.l { background: url("img/dot.svg"); mask: url("img/dot.svg#m"); cursor: url("/icons.svg#i"), auto }', deps: [], dirs: [], warnings: [], tailwind: [] }
+        return { css: `.${r.file.split('/').pop()!.replace(/\W/g, '_')} { x: 1 }`, deps: [], dirs: [], warnings: [], tailwind: [] }
+      },
+    }
+    const s = await devServer(
+      {
+        'index.html': '<link rel="stylesheet" href="/src/style.sass"><div id="root"></div><script type="module" src="/src/main.ts"></script>',
+        'src/main.ts': "import './main.scss'\nimport 'kit/kit.scss'\nimport cls from './b.module.less'\nexport default cls\n",
+        'src/main.scss': '@use "vars";\n',
+        'src/_vars.scss': 'red',
+        'src/b.module.less': '.x {}',
+        'src/style.sass': '.y\n  a: b\n',
+        'node_modules/kit/package.json': '{"name":"kit","version":"1.0.0"}',
+        'node_modules/kit/kit.scss': '.k {}',
+        'src/c.less': '@import "nested/x";',
+        'src/img/dot.svg': '<svg xmlns="http://www.w3.org/2000/svg"/>',
+        'src/parts/reset.css': '.reset { r: 1 }',
+        'public/icons.svg': '<svg xmlns="http://www.w3.org/2000/svg"/>',
+      },
+      { css: backend },
+    )
+    read = (p) => s.vfs.tryReadText(p)
+    const main = await s.get('/src/main.ts')
+    for (const u of ['/src/main.scss?import', '/@modules/kit/kit.scss?import', '/src/b.module.less?import']) expect(main).toContain(u)
+    expect(await s.get('/src/main.scss?import')).toContain('color: red')
+    expect(await s.get('/@modules/kit/kit.scss?import')).toContain('.kit_scss')
+    expect(await s.get('/src/b.module.less?import')).toMatch(/b_module_less/) // a CSS module: class names exported
+    const less = await s.get('/src/c.less?import')
+    expect(less).toContain('url(/src/img/dot.svg)') // url(img/dot.svg): relative first
+    expect(less).toContain('.reset {') // @import "parts/reset.css": relative first, inlined
+    expect(less).toContain('url(/src/img/dot.svg#m)') // its fragment kept
+    expect(less).toContain('url(/icons.svg#i)') // a public/ file: as written
+    expect(await s.get('/@modules/kit/kit.scss?raw&import')).toBe('export default ".k {}"') // ?raw: the source
+    const linked = await s.res('/src/style.sass')
+    expect(linked.type).toContain('text/css')
+    expect(linked.text).toContain('.style_sass')
+    // a partial the output read: editing it hot-updates the entry
+    s.write('src/_vars.scss', 'blue')
+    expect(upd(await s.next())).toEqual(['/src/main.scss?import'])
+    expect(await s.get('/src/main.scss?import&t=1')).toContain('color: blue')
+    // a missing import: the error reaches the module; creating one of the tried paths hot-updates it
+    s.write('src/main.scss', '@use "vars";\n@use "parts/extra";\n')
+    expect(upd(await s.next())).toEqual(['/src/main.scss?import'])
+    expect(await s.get('/src/main.scss?import&t=2')).toContain("Can't find stylesheet to import.")
+    s.write('src/parts/_extra.scss', '.extra { z: 1 }')
+    expect(upd(await s.next())).toEqual(['/src/main.scss?import'])
+    expect(await s.get('/src/main.scss?import&t=3')).toContain('.extra')
+    // the plain CSS the Less output imports: a CSS graph edge (editing it hot-updates the Less stylesheet)
+    s.write('src/parts/reset.css', '.reset { r: 2 }')
+    expect(upd(await s.next())).toEqual(['/src/c.less?import'])
+    // <link>ed: swapped in place
+    s.write('src/style.sass', '.y\n  a: c\n')
+    expect(await s.next()).toMatchObject({ type: 'update', updates: [{ kind: 'css-link', url: '/src/style.sass' }] })
   })
 
   it('plain CSS in a Tailwind project skips the worker; projects without Tailwind/PostCSS never use it', async () => {
