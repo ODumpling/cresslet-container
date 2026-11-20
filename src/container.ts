@@ -25,8 +25,12 @@ export interface BootOptions {
   registry?: string
   /** Project directory. Default '/home/project'. */
   workdir?: string
-  /** Persist npm tarballs + packuments in IndexedDB across reloads. Default true; silently off if IndexedDB is unavailable. */
-  npmCache?: boolean
+  /**
+   * Persist npm tarballs + packuments in IndexedDB across reloads. Default true; silently off if IndexedDB is unavailable.
+   * `{ maxBytes }` caps its total size (default 256 MiB, `Infinity` for no cap): past it, least-recently-used entries
+   * are evicted.
+   */
+  npmCache?: boolean | { maxBytes?: number }
   /**
    * Serve previews from this origin (e.g. 'https://preview.example.com') instead of the host page's, so preview code
    * can't read the host's storage. The container frames `${previewOrigin}/cresslet-relay.html`, which registers
@@ -116,7 +120,9 @@ export class Container {
 
   private constructor(opts: BootOptions) {
     this.workdir = normalize(opts.workdir ?? '/home/project')
-    this.registry = new HttpRegistry(opts.registry ?? 'https://registry.npmjs.org', { cache: opts.npmCache === false ? null : sharedIdbCache() })
+    const npmCache = opts.npmCache ?? true
+    const cache = npmCache === false ? null : sharedIdbCache(npmCache === true ? undefined : npmCache.maxBytes)
+    this.registry = new HttpRegistry(opts.registry ?? 'https://registry.npmjs.org', { cache })
     dropLegacyCache()
     this.esbuildWasmUrl = opts.esbuildWasmUrl ?? DEFAULT_WASM_URL
     this.cssPlugins = opts.cssPlugins !== false

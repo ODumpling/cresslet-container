@@ -53,3 +53,55 @@ test('boot({ npmCache: false }) bypasses the persistent cache', async ({ browser
   expect(out.code).toBe(0)
   expect(urls.some((u) => u.endsWith('.tgz'))).toBe(true)
 })
+
+test('boot({ npmCache: { maxBytes } }) keeps the persistent cache under the cap, evicting least recently used', async ({ browser }) => {
+  const page = await (await browser.newContext()).newPage()
+  await page.goto('/demo/blank.html')
+  const CAP = 4_000_000 // abbreviated packuments of react, react-dom, scheduler are ~3 MB each
+  const out = await page.evaluate(async (CAP) => {
+    const { Container } = await import('/dist/cresslet-container.js')
+    const c = await Container.boot({ serviceWorkerUrl: false, npmCache: { maxBytes: CAP } })
+    const install = async (deps: Record<string, string>) => {
+      await c.fs.writeFile('package.json', JSON.stringify({ dependencies: deps }))
+      await c.fs.rm('node_modules', { recursive: true, force: true })
+      const p = await c.spawn('npm', ['install'])
+      await p.output.pipeTo(new WritableStream())
+      return p.exit
+    }
+    const codes = [await install({ react: '19.1.0' })] // first, so the cache creates the database
+    const db = await new Promise<IDBDatabase>((res, rej) => {
+      const r = indexedDB.open('cresslet-npm')
+      r.onsuccess = () => res(r.result)
+      r.onerror = () => rej(r.error)
+    })
+    const read = <T,>(store: string) =>
+      new Promise<T[]>((res) => {
+        const r = db.transaction(store).objectStore(store).getAll()
+        r.onsuccess = () => res(r.result)
+      })
+    const ids = async () => (await read<{ id: string }>('meta')).map((e) => e.id)
+    const afterFirst = await ids()
+    codes.push(await install({ 'react-dom': '19.1.0' }))
+    const meta = await read<{ id: string; size?: number; bytes?: number }>('meta')
+    const tarballs = await read<Uint8Array>('tarballs')
+    db.close()
+    const entries = meta.filter((e) => e.id !== '#state')
+    return {
+      codes,
+      afterFirst,
+      total: meta.find((e) => e.id === '#state')?.bytes,
+      sum: entries.reduce((a, e) => a + (e.size ?? 0), 0),
+      tarballBytes: tarballs.reduce((a, t) => a + t.byteLength, 0),
+      ids: entries.map((e) => e.id),
+    }
+  }, CAP)
+  console.log(`cache after two installs: ${out.ids.length} entries, ${out.total} bytes (cap ${CAP})`)
+  expect(out.codes).toEqual([0, 0])
+  expect(out.total).toBe(out.sum)
+  expect(out.total).toBeLessThanOrEqual(CAP)
+  expect(out.tarballBytes).toBeLessThanOrEqual(out.total!)
+  expect(out.ids.length).toBeGreaterThan(0)
+  expect(out.afterFirst).toContain('packuments:https://registry.npmjs.org|react')
+  // the first install's packument is the least recently used entry once react-dom's (~3 MB) is written
+  expect(out.ids).not.toContain('packuments:https://registry.npmjs.org|react')
+})
