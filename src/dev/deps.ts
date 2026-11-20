@@ -290,7 +290,7 @@ export class DepOptimizer {
 }
 
 /** Collect bare imports reachable from entry files (vite-like dependency scan). */
-export async function scanImports(vfs: VFS, root: string, entries: string[], opts: { wasmURL?: string; jsx?: Record<string, string>; resolveLocal: (spec: string, importer: string) => string | null }): Promise<Set<string>> {
+export async function scanImports(vfs: VFS, root: string, entries: string[], opts: { wasmURL?: string; jsx?: Record<string, string>; resolveLocal: (spec: string, importer: string) => string | null; compile?: (file: string) => Promise<{ code: string }> }): Promise<Set<string>> {
   const found = new Set<string>()
   const plugin: Plugin = {
     name: 'cresslet-scan',
@@ -303,9 +303,18 @@ export async function scanImports(vfs: VFS, root: string, entries: string[], opt
           if (!/\.(css|scss|sass|less)$/.test(a.path.split('?')[0])) found.add(a.path.split('?')[0])
           return { path: a.path, external: true }
         }
-        if (!/\.(m?[jt]sx?|cjs|cts|mts)$/.test(local)) return { path: local, external: true }
+        // single-file components: scanned as compiled (their runtime imports, e.g. svelte/internal/client)
+        if (!/\.(m?[jt]sx?|cjs|cts|mts)$/.test(local) && !(opts.compile && /\.(vue|svelte)$/.test(local))) return { path: local, external: true }
         return { path: local, namespace: 'scan' }
       })
+      build.onLoad({ filter: /\.(vue|svelte)$/, namespace: 'scan' }, async (a) => ({
+        contents: await opts.compile!(a.path).then(
+          (r) => r.code,
+          () => '',
+        ),
+        loader: 'ts',
+        resolveDir: dirname(a.path),
+      }))
       build.onLoad({ filter: /.*/, namespace: 'scan' }, (a) => {
         const ext = a.path.slice(a.path.lastIndexOf('.'))
         return {

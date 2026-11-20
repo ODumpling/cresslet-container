@@ -137,8 +137,10 @@ export function vfsPlugin(vfs: VFS, opts: VfsPluginOptions = {}): Plugin {
 }
 
 export function splitQuery(p: string): [string, string] {
-  const i = p.search(/[?#]/)
-  return i < 0 ? [p, ''] : [p.slice(0, i), p.slice(i)]
+  // a leading `#` is a package subpath import (`#client/constants`), not a fragment
+  const from = p.startsWith('#') ? 1 : 0
+  const j = p.slice(from).search(/[?#]/)
+  return j < 0 ? [p, ''] : [p.slice(0, j + from), p.slice(j + from)]
 }
 
 /** Run esbuild over the VFS. Paths in entryPoints are resolved against `cwd`. */

@@ -159,9 +159,25 @@ With one `previewOrigin`, all previews share it, so one preview can script the r
 
 ## Dev server
 
-Serves `index.html` (+ live-reload client), `public/`, SPA fallback. Transforms `.ts/.tsx/.jsx/.js` with esbuild (automatic JSX; import source from tsconfig `jsxImportSource` or react/preact deps; tsconfig `paths` aliases). Bare imports → `/@modules/<spec>`: all deps pre-bundled together in one esbuild run with code splitting (one copy of react), CJS named exports via cjs-module-lexer; newly discovered deps re-optimize and reload. CSS imports inject `<style>`, CSS modules (`*.module.css`, `.module.scss`/`.sass`/`.less`), `?url`/`?raw`, asset and JSON imports, `import.meta.env` (`MODE`, `DEV`, `PROD`, `BASE_URL`, `VITE_*` from `.env*`), `%VITE_X%` in HTML, [Sass/Less, PostCSS and Tailwind CSS](#css-postcss--tailwind). Errors → overlay.
+Serves `index.html` (+ live-reload client), `public/`, SPA fallback. Transforms `.ts/.tsx/.jsx/.js` with esbuild (automatic JSX; import source from tsconfig `jsxImportSource` or react/preact deps; tsconfig `paths` aliases), and compiles `.vue` and `.svelte` single-file components with the project's own `vue` / `svelte` package (in the [CSS worker](#css-postcss--tailwind)). Bare imports → `/@modules/<spec>`: all deps pre-bundled together in one esbuild run with code splitting (one copy of react), CJS named exports via cjs-module-lexer; newly discovered deps re-optimize and reload. CSS imports inject `<style>`, CSS modules (`*.module.css`, `.module.scss`/`.sass`/`.less`), `?url`/`?raw`, asset and JSON imports, `import.meta.env` (`MODE`, `DEV`, `PROD`, `BASE_URL`, `VITE_*` from `.env*`), `%VITE_X%` in HTML, [Sass/Less, PostCSS and Tailwind CSS](#css-postcss--tailwind). Errors → overlay.
 
-**HMR**: the server keeps a module graph of what the page loaded and walks importers from a changed file to the nearest module that can accept the update. CSS (imported or `<link rel=stylesheet>`, incl. `@import`ed files) is swapped in place. React projects (`react-dom` dep, React JSX) get **React Fast Refresh**: `.jsx`/`.tsx` modules whose exports are all components are refresh boundaries, so component edits keep state; a changed hook signature remounts the component. Everything else falls back to the full reload: entry scripts and other modules no boundary accepts, `index.html`, `public/`, config/`.env`/`package.json`, dependency changes, deleted files, and any change after an error outside an update (failed initial load, uncaught runtime error). `import.meta.hot` is not exposed to app code.
+**HMR**: the server keeps a module graph of what the page loaded and walks importers from a changed file to the nearest module that can accept the update. CSS (imported or `<link rel=stylesheet>`, incl. `@import`ed files) is swapped in place. React projects (`react-dom` dep, React JSX) get **React Fast Refresh**: `.jsx`/`.tsx` modules whose exports are all components are refresh boundaries, so component edits keep state; a changed hook signature remounts the component. Everything else falls back to the full reload: entry scripts and other modules no boundary accepts, `index.html`, `public/`, config/`.env`/`package.json`, dependency changes, deleted files, and any change after an error outside an update (failed initial load, uncaught runtime error).
+
+**`import.meta.hot`**: the Vite-compatible subset, for app code and the framework integrations below:
+
+- `accept()` / `accept(cb)`: the module accepts its own updates. On an edit it is re-imported and the previous copy's `cb` gets the new module (`undefined` if it failed to load, e.g. a syntax error; the error shows in the overlay and the update is sent again once it's fixed).
+- `accept(dep, cb)` / `accept([deps], cb)`: the module accepts updates of its imports (relative or aliased specifiers). The importer isn't re-run; `cb` gets the new module (or an array, `undefined` for deps that didn't change).
+- `dispose(cb)`: runs before the module's next copy is imported, with `data`.
+- `data`: an object kept across the module's copies (pass state from `dispose` to the next copy).
+- `invalidate(message?)`: called during an update (in an accept callback), it tells the server this module can't take it: its importers are updated instead (a full reload when nothing accepts them, or when the invalidation comes back round to where it started). Called outside an update, or again in the same one, it's ignored.
+
+A module accepting itself is a boundary even when it's an HTML entry script (it opted in). `on`, `off` and `send` are no-ops (no custom events); `prune`, `decline` and `acceptExports` aren't implemented. `import.meta.hot` is `undefined` in `build` output, as in Vite.
+
+**Framework HMR**, built on `import.meta.hot`:
+
+- **Preact** (`preact` dep, Preact JSX via `jsxImportSource: "preact"`, no `react-dom`): component edits are hot-swapped by [prefresh](https://github.com/preactjs/prefresh) (bundled) with the same boundary and hook-signature rules as React Fast Refresh; an export change re-runs the importers or reloads.
+- **Vue SFC** (`vue` 3.3+ dep): `<script>` / `<script setup>` (TS too), `<template>`, `<style>` / `<style scoped>` (also `lang="scss"`/`"sass"`/`"less"`). A template- or style-only edit re-renders the component in place and keeps its state; a script edit reloads that component through Vue's HMR runtime (its state resets, the rest of the page keeps its own).
+- **Svelte 5** (`svelte` dep; `<script lang="ts">` stripped by Svelte itself): the compiler's own HMR: the edited component is re-mounted (its local state resets), its parents and siblings keep theirs. Svelte 4 compiles but full-reloads.
 
 ## CSS: PostCSS & Tailwind
 
@@ -172,7 +188,7 @@ Stylesheets (imported, `<link>`ed, `@import`ed, CSS modules) go through the proj
 - **Tailwind CSS v4** when the project depends on `tailwindcss` / `@tailwindcss/postcss` / `@tailwindcss/vite` and a stylesheet uses Tailwind syntax (`@import "tailwindcss"`, `@theme`, `@apply`, `@utility`, `@plugin`, `@config`, `@source`, …). It runs the installed `tailwindcss`'s own compiler (`compile()`, pure JS); `@import`s of packages resolve through their `style` export (`tailwindcss/theme.css`, `tw-animate-css`), `@plugin`/`@config` load through the `node` loader. Tailwind's native scanner (oxide) can't run here, so content detection is done by the container: every file under the project root except `node_modules/` and dot-dirs (at any depth), `dist/`, `build/`, `out/`, `coverage/` (at the root of the scanned dir), stylesheets, lockfiles, binaries and files over 2 MB, plus `@source` paths/globs, split into class candidates (a superset; non-utilities are ignored). Directory symlinks are followed, except into an ancestor or a loop. Each stylesheet's own source rules (`@source`, `@source not`, `source(none)`, `source("dir")`) are read before its first build and apply to it alone (stylesheets with different rules don't share candidates).
 - **PostCSS** when there's a `postcss.config.{js,mjs,cjs,ts}` / `.postcssrc.{js,cjs,mjs,json}`: its plugins (object or array form, function configs get `{ env }`) run on every stylesheet, from the project's `postcss` (an error says so if it isn't installed). `@tailwindcss/postcss` (which needs native oxide/lightningcss) is swapped for the built-in v4 compiler, whether named in an object config or `import`ed; a config without a Tailwind plugin in a Tailwind v4 project (as with `@tailwindcss/vite`) gets v4 compiled first, then its plugins. Tailwind v3 (`tailwindcss: {}` + `tailwind.config.*`) runs as the real v3 PostCSS plugin; its content globs (`dir-dependency`) drive HMR.
 
-These run in the **CSS worker**: one long-lived `node` process per container (started on the first stylesheet that needs it, restarted when `package.json`, the PostCSS config or `node_modules` change), so plugins get the same Node built-ins as `node` and stay off the main thread. Plain CSS in projects with neither never starts it. A request that takes over 30 s fails (and recycles the worker); requests a restart cuts off are retried on the new worker. `build` starts Tailwind from scratch (only its own sources' classes) with `NODE_ENV=production` for configs/plugins. Errors (syntax errors, a plugin that can't load or throws) go to the overlay: imported CSS throws from its module, `<link>`ed CSS is reported to the page.
+These run in the **CSS worker**: one long-lived `node` process per container (started on the first stylesheet that needs it, restarted when `package.json`, the PostCSS config or `node_modules` change), so plugins get the same Node built-ins as `node` and stay off the main thread. Plain CSS in projects with neither never starts it. A request that takes over 30 s fails (and recycles the worker); requests a restart cuts off are retried on the new worker. `build` starts Tailwind from scratch (only its own sources' classes) with `NODE_ENV=production` for configs/plugins. Errors (syntax errors, a plugin that can't load or throws) go to the overlay: imported CSS throws from its module, `<link>`ed CSS is reported to the page. The same worker compiles the dev server's `.vue` / `.svelte` components (the installed `vue` / `svelte` compiler's code runs there too).
 
 **HMR**: editing a stylesheet or anything it `@import`s (Sass partials and `@use`d/`@forward`ed files, Less imports; creating a missing one retries it) swaps it in place; so does editing a Tailwind config/plugin or (v3) a file in its content globs. A source file that brings **new** Tailwind class candidates re-serves the Tailwind stylesheets in the same update as the component's Fast Refresh, so new utilities apply without a reload (like Tailwind itself, the candidate set only grows during a session).
 
@@ -185,7 +201,8 @@ Parses `index.html`, bundles each `<script type="module" src>` and local stylesh
 ## Limitations
 
 - Not real Node: real `vite`, `next`, `tsc`, native addons, raw sockets don't run (built-ins cover the common workflow); `child_process` reaches container commands only, not real binaries.
-- HMR covers CSS and React Fast Refresh only (no `import.meta.hot` API, no Preact/Vue/Svelte HMR; those full-reload). Refresh signatures come from a light pass over esbuild output, not Babel: hook changes are detected per component, but unusual code shapes may remount or reload instead. No Stylus.
+- HMR: Refresh signatures (React and Preact) come from a light pass over esbuild output, not Babel: hook changes are detected per component, but unusual code shapes may remount or reload instead. No Stylus.
+- Vue/Svelte components: dev server only, not `build` yet. Vue: no `<style module>`, `<template lang>` (Pug), `src=` blocks, or types imported from other files in `defineProps<T>()`; SFC styles don't go through PostCSS/Tailwind. Svelte: no `.svelte.js`/`.svelte.ts` modules, `<style lang>` or other preprocessors (`svelte.config.js` isn't read).
 - CSS: PostCSS plugins must be pure JS (native addons, real binaries, workers don't run); `postcss-load-config`'s YAML/`.postcssrc` (no extension) and `package.json#postcss` aren't read. Tailwind v4 output isn't run through lightningcss (no `optimize`, nesting/`@property` left for the browser; minified by esbuild in `build`). Content detection ignores `.gitignore` (fixed skip list instead) and tokenizes generically (a superset of Tailwind's own candidates; classes assembled from string fragments are missed, as in Tailwind). Tailwind v3 works through PostCSS but is best-effort (tested: build + HMR of a React app).
 - `node` needs a cross-origin isolated page; without it sync fs/`require` fail with a clear error.
 - `npm`: no git/`file:` deps, no lifecycle scripts, no pnpm/yarn lockfiles, no `-w`/`--workspaces` flags. The package cache is cleared with `indexedDB.deleteDatabase('cresslet-npm')`; the browser may also evict it.
@@ -202,8 +219,8 @@ host page ───────────────────────�
      ├─ npm: resolver (semver, hoist) → registry fetch → gunzip/untar → VFS
      ├─ node → Web Worker (CJS loader, polyfills) ⇄ SAB/Atomics sync RPC (fs, resolve, esbuild transform)
      │    └─ with previewOrigin: started by the relay on the preview origin (it owns the SAB), proxied over a MessagePort
-     ├─ dev server (module graph, HMR, React Refresh) / build → esbuild-wasm (VFS plugin)
-     │    └─ stylesheets → CSS worker (`node` process: project's sass/less, postcss + plugins, tailwindcss compile(); candidates scanned on the main thread)
+     ├─ dev server (module graph, import.meta.hot, React Refresh / prefresh) / build → esbuild-wasm (VFS plugin)
+     │    └─ stylesheets, .vue/.svelte → CSS worker (`node` process: project's sass/less, postcss + plugins, tailwindcss compile(), vue/compiler-sfc, svelte/compiler; candidates scanned on the main thread)
      └─ PortTable ⇄ cresslet-sw.js ⇄ preview iframes (/__cresslet__/<id>/<port>/…)
           └─ or, with previewOrigin: ⇄ cresslet-relay.html (hidden iframe) ⇄ cresslet-sw.js on the preview origin
 ```
@@ -213,14 +230,14 @@ host page ───────────────────────�
 ```sh
 pnpm install
 pnpm build       # dist/: cresslet-container.js, node-worker.js, cresslet-sw.js, cresslet-relay.{html,js}, index.d.ts (+ types/)
-pnpm test        # vitest: VFS, parser, resolver/hoisting, lockfile + workspace installs, tar, html, module resolution, relay message validation, CSS scanning + worker (real tailwindcss/postcss/autoprefixer/sass/less), zlib/child_process host side, VFS snapshots
+pnpm test        # vitest: VFS, parser, resolver/hoisting, lockfile + workspace installs, tar, html, module resolution, relay message validation, CSS scanning + worker (real tailwindcss/postcss/autoprefixer/sass/less), import.meta.hot + SFC compile (real vue/svelte), zlib/child_process host side, VFS snapshots
 pnpm test:e2e    # Playwright (chromium); test:e2e:all adds firefox + webkit
 pnpm demo        # http://localhost:4400 (+ preview origin http://127.0.0.1:4401)
 ```
 
 ## Roadmap
 
-`import.meta.hot` API + non-React HMR, git/`file:` deps, pnpm lockfiles, real Node via WASM for big CLIs, per-preview origins.
+Vue/Svelte in `build`, git/`file:` deps, pnpm lockfiles, real Node via WASM for big CLIs, per-preview origins.
 
 ## License
 

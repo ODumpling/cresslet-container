@@ -8,6 +8,9 @@
 
 export const REFRESH_RUNTIME_URL = '/@cresslet/react-refresh'
 export const REFRESH_UTILS_URL = '/@cresslet/refresh'
+/** Preact: the same registration pass, against prefresh (@prefresh/core, served with its `preact` import shared). */
+export const PREFRESH_CORE_URL = '/@cresslet/prefresh-core'
+export const PREFRESH_UTILS_URL = '/@cresslet/prefresh'
 
 const BUILTIN_HOOKS = new Set(
   'useState useReducer useEffect useLayoutEffect useInsertionEffect useMemo useCallback useRef useContext useImperativeHandle useDebugValue useDeferredValue useTransition useId useSyncExternalStore useOptimistic useActionState useFormStatus useEffectEvent'.split(
@@ -42,7 +45,11 @@ export function parseExports(code: string): Map<string, string> | null {
 const isComponentName = (n: string) => /^[A-Z]/.test(n)
 const isHookName = (n: string) => /^use[A-Z0-9]/.test(n)
 
-export function refreshTransform(code: string, id: string): RefreshResult {
+/**
+ * `utilsUrl`: the registration module (React's, or prefresh's). `hot`: the module's `import.meta.hot` binding; a
+ * boundary then accepts itself through it (Preact), flushing prefresh or invalidating when its exports changed.
+ */
+export function refreshTransform(code: string, id: string, utilsUrl = REFRESH_UTILS_URL, hot?: string): RefreshResult {
   const lines = code.split('\n')
   const decls: { name: string; start: number }[] = []
   let end = lines.length
@@ -86,7 +93,9 @@ export function refreshTransform(code: string, id: string): RefreshResult {
   if (!tail.length) return { code, boundary: false, registered }
   // export shape (names + refresh families), compared on update: an added/removed/re-pointed export needs a reload
   if (boundary) tail.push(`${ns}.exportsOf(${JSON.stringify(id)}, { ${[...exports!].map(([exp, local]) => `${JSON.stringify(exp)}: typeof ${local} !== "undefined" ? ${local} : void 0`).join(', ')} });`)
-  const add = `\nimport * as ${ns} from ${JSON.stringify(REFRESH_UTILS_URL)};\n${tail.join('\n')}\n`
+  // m is undefined when the update failed (its error is on the overlay)
+  if (boundary && hot) tail.push(`${hot}.accept((m) => { if (!m) return; if (${ns}.canRefresh(${JSON.stringify(id)}, m)) ${ns}.flush(); else ${hot}.invalidate(); });`)
+  const add = `\nimport * as ${ns} from ${JSON.stringify(utilsUrl)};\n${tail.join('\n')}\n`
   const sm = code.lastIndexOf('\n//# sourceMappingURL=')
   return { code: sm < 0 ? code + add : code.slice(0, sm) + add + code.slice(sm), boundary, registered }
 }
@@ -135,6 +144,59 @@ export function performRefresh() {
   timer = setTimeout(() => R.performReactRefresh(), 16);
 }
 `
+}
+
+/**
+ * Browser module served at PREFRESH_UTILS_URL (loaded first by the HTML, so prefresh hooks Preact's options before the
+ * app renders): the registration API refreshTransform emits, over prefresh's `self.__PREFRESH__`. Boundaries
+ * accept themselves through `import.meta.hot` and call `flush()` (or invalidate when their exports changed).
+ */
+export function prefreshUtilsCode(): string {
+  return `import ${JSON.stringify(PREFRESH_CORE_URL)};
+const P = self.__PREFRESH__;
+// a signature before register(): prefresh keeps the first one it gets for a type
+const ids = new WeakMap();
+export function register(type, id, key, getHooks) {
+  if (typeof type !== 'function') return;
+  P.sign(type, key, false, getHooks, 'begin');
+  P.register(type, id);
+  ids.set(type, id);
+}
+export function sign(fn, key, getHooks) {
+  if (typeof fn === 'function') P.sign(fn, key, false, getHooks, 'begin');
+}
+const shapes = new Map();
+const shapeChanged = new Set();
+/** Record a boundary's exports (name -> registration id); added/removed exports or one re-pointed to another component can't hot-update. */
+export function exportsOf(id, mod) {
+  const next = Object.keys(mod).sort().map((k) => [k, ids.get(mod[k]), mod[k]]);
+  const prev = shapes.get(id);
+  shapes.set(id, next);
+  if (prev && (prev.length !== next.length || prev.some(([k, r, v], i) => next[i][0] !== k || next[i][1] !== r || (!r && next[i][2] !== v)))) shapeChanged.add(id);
+  else shapeChanged.delete(id);
+}
+const isComponent = (v) => typeof v === 'function' && /^[A-Z]/.test(v.displayName || v.name || '');
+/** Whether a boundary's re-run can be applied in place (see exportsOf); else its importers must update. */
+export function canRefresh(id, mod) {
+  const keys = Object.keys(mod || {});
+  return !shapeChanged.has(id) && keys.length > 0 && keys.every((k) => isComponent(mod[k]));
+}
+/** Swap every component registered again since the last flush; a changed hook signature resets its state. */
+export function flush() {
+  const pending = [...P.getPendingUpdates()];
+  P.flush();
+  for (const [prev, next] of pending) {
+    const a = P.getSignature(prev) || {};
+    const b = P.getSignature(next) || {};
+    P.replaceComponent(prev, next, a.key !== b.key || P.computeKey(a) !== P.computeKey(b) || !!b.forceReset);
+  }
+}
+`
+}
+
+/** prefresh's runtime (bundled with \`preact\` external) with its imports pointed at the app's optimized Preact. */
+export function prefreshCoreModule(bundle: string): string {
+  return bundle.replace(/(\bfrom\s*|\bimport\s*)(["'])preact\2/g, '$1"/@modules/preact"')
 }
 
 /** Wrap react-refresh's CJS runtime as an ES module. */

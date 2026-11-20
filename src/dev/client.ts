@@ -63,17 +63,116 @@ export function moduleError(msg) {
   showOverlay(msg);
 }
 ${SWAP_LINKS}
+
+// ---- import.meta.hot (Vite-compatible subset: accept, dispose, data, invalidate) ----
+/** module URL -> accept callbacks registered by its current instance ({ deps: URLs, fn(modules) }) */
+const hotAccepts = new Map();
+const hotDisposers = new Map();
+const hotData = new Map();
+/** The hot context of one evaluation of module "url" (its path, no query): each re-run registers its callbacks again. */
+export function createHotContext(url) {
+  if (!hotData.has(url)) hotData.set(url, {});
+  const accepts = [];
+  hotAccepts.set(url, accepts);
+  hotDisposers.delete(url);
+  return {
+    get data() { return hotData.get(url); },
+    accept(deps, cb) {
+      if (deps === undefined || typeof deps === 'function') accepts.push({ deps: [url], fn: ([m]) => deps && deps(m) });
+      else if (typeof deps === 'string') accepts.push({ deps: [deps], fn: ([m]) => cb && cb(m) });
+      else accepts.push({ deps: [...deps], fn: (mods) => cb && cb(mods) });
+    },
+    dispose(cb) { hotDisposers.set(url, cb); },
+    /** This module can't take the update: its importers are updated instead (or the page reloads). Only during an update. */
+    invalidate(message) {
+      if (!updating) return;
+      if (message) console.debug('[cresslet] invalidate', url, message);
+      fetch('/@cresslet/invalidate?path=' + encodeURIComponent(url) + '&batch=' + batch).then((r) => { if (!r.ok) reload(); }, reload);
+    },
+    // not implemented: no-ops, so code written for Vite (\`if (import.meta.hot) import.meta.hot.on(...)\`) still runs
+    on() {},
+    off() {},
+    send() {},
+  };
+}
+const pathOf = (u) => u.split('?')[0];
+const stamped = (u, t) => u + (u.includes('?') ? '&' : '?') + 't=' + t;
+/** module path -> stamp of the copy an update loaded (an invalidation hands importers that copy again: no dispose) */
+const hotLoaded = new Map();
+/** The accept callbacks of boundary "u.url" that take "u.accepted", from the instance that is on the page now. */
+const callbacksFor = (u) => (hotAccepts.get(u.url) || []).filter((c) => c.deps.some((d) => pathOf(d) === u.accepted));
+/** Dispose the accepted modules of a batch, each once, before anything in it is imported (a fresh copy may register its own). */
+async function disposeHot(updates) {
+  const done = new Set();
+  for (const u of updates) {
+    if (u.kind !== 'hot' || done.has(u.accepted) || hotLoaded.get(u.accepted) === u.t) continue;
+    done.add(u.accepted);
+    const dispose = hotDisposers.get(u.accepted);
+    if (dispose) await dispose(hotData.get(u.accepted));
+  }
+}
+/**
+ * Hand boundary "u.url"'s callbacks ("cbs", snapshot before the batch ran) the new copy of "u.accepted", imported with
+ * the URL each accept() named (its flags: \`?raw\`, \`?import\`), once per batch ("loading"). A failed import (a compile
+ * error) gives them undefined, as in Vite, and is rethrown for the overlay. False: no callback took it.
+ */
+async function applyHot(u, cbs, loading) {
+  if (!cbs.length) return false; // the accept call didn't run on this page
+  let failed;
+  for (const c of cbs) {
+    const mods = [];
+    for (const d of c.deps) {
+      if (pathOf(d) !== u.accepted) {
+        mods.push(undefined);
+        continue;
+      }
+      const href = stamped(d, u.t);
+      if (!loading.has(href)) loading.set(href, import(href));
+      try {
+        mods.push(await loading.get(href));
+        hotLoaded.set(u.accepted, u.t);
+      } catch (err) {
+        failed = err;
+        mods.push(undefined);
+      }
+    }
+    try {
+      await c.fn(mods);
+    } catch (err) {
+      if (!failed) throw err;
+      console.debug('[cresslet] accept callback after a failed update:', err); // the update's own error is the one to show
+    }
+  }
+  if (failed) throw failed;
+  return true;
+}
+
 let queue = Promise.resolve();
-async function applyUpdates(updates) {
+/** The update batch being applied (the server only takes invalidate() for the batch that re-ran the module). */
+let batch = 0;
+async function applyUpdates(updates, id) {
   if (stale) return reload();
   updating++;
+  batch = id;
   try {
     let refresh = false;
     let failed;
-    for (const u of updates) {
-      const url = u.url + (u.url.includes('?') ? '&' : '?') + 't=' + u.t;
+    const hotCbs = updates.map((u) => (u.kind === 'hot' ? callbacksFor(u) : null));
+    const loading = new Map();
+    await disposeHot(updates);
+    for (const [i, u] of updates.entries()) {
+      const target = u.kind === 'hot' ? u.accepted : u.url;
+      const url = target + (target.includes('?') ? '&' : '?') + 't=' + u.t;
       if (u.kind === 'css-link') {
         if (!swapLinks(document, u.url, url)) return reload();
+        continue;
+      }
+      if (u.kind === 'hot') {
+        try {
+          if (!(await applyHot(u, hotCbs[i], loading))) return reload();
+        } catch (err) {
+          failed = err;
+        }
         continue;
       }
       // one failing boundary (e.g. a syntax error) must not hold back the others in this batch;
@@ -107,7 +206,7 @@ const bc = new BroadcastChannel(CH);
 bc.onmessage = (e) => {
   const m = e.data || {};
   if (m.type === 'reload') reload();
-  else if (m.type === 'update') queue = queue.then(() => applyUpdates(m.updates));
+  else if (m.type === 'update') queue = queue.then(() => applyUpdates(m.updates, m.batch));
   else if (m.type === 'error') showOverlay(m.message);
   else if (m.type === 'clear') clearOverlay();
 };

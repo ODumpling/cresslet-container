@@ -17,6 +17,8 @@ export interface ProjectConfig {
     tsconfigRaw: Record<string, unknown>;
     /** React DOM project with React JSX: enable React Fast Refresh in the dev server. */
     refresh: boolean;
+    /** Preact project with Preact JSX (and no React Fast Refresh): enable prefresh in the dev server. */
+    preactRefresh: boolean;
 }
 export declare function readProjectConfig(vfs: VFS, root: string): ProjectConfig;
 /** Apply tsconfig paths; returns candidate absolute paths (unresolved) or null. */
@@ -34,4 +36,6 @@ export declare function jsxOptions(cfg: ProjectConfig): {
 };
 export declare const mimeType: (p: string) => string;
 export declare const SCRIPT_EXT: RegExp;
+/** Single-file components the dev server compiles (with the project's own `vue` / `svelte` compiler). */
+export declare const SFC_EXT: RegExp;
 export declare const ASSET_EXT: RegExp;
