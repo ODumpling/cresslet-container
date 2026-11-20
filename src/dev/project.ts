@@ -74,6 +74,8 @@ export interface ProjectConfig {
   tsconfigRaw: Record<string, unknown>
   /** React DOM project with React JSX: enable React Fast Refresh in the dev server. */
   refresh: boolean
+  /** Preact project with Preact JSX (and no React Fast Refresh): enable prefresh in the dev server. */
+  preactRefresh: boolean
 }
 
 export function readProjectConfig(vfs: VFS, root: string): ProjectConfig {
@@ -120,6 +122,7 @@ export function readProjectConfig(vfs: VFS, root: string): ProjectConfig {
   }))
   const pick = ['experimentalDecorators', 'emitDecoratorMetadata', 'useDefineForClassFields', 'verbatimModuleSyntax', 'preserveValueImports', 'importsNotUsedAsValues']
   const tsconfigRaw = { compilerOptions: Object.fromEntries(pick.filter((k) => k in co).map((k) => [k, co[k]])) }
+  const refresh = !!deps['react-dom'] && (classic ? !co.jsxFactory || /^React\./.test(String(co.jsxFactory)) : jsxImportSource === 'react')
   return {
     jsx: classic ? 'transform' : 'automatic',
     jsxImportSource,
@@ -127,7 +130,8 @@ export function readProjectConfig(vfs: VFS, root: string): ProjectConfig {
     jsxFragment: co.jsxFragmentFactory as string | undefined,
     paths,
     tsconfigRaw,
-    refresh: !!deps['react-dom'] && (classic ? !co.jsxFactory || /^React\./.test(String(co.jsxFactory)) : jsxImportSource === 'react'),
+    refresh,
+    preactRefresh: !refresh && !!deps.preact && (classic ? /^(h|preact\.h|createElement|preact\.createElement)$/.test(String(co.jsxFactory ?? '')) : jsxImportSource === 'preact'),
   }
 }
 
@@ -190,4 +194,6 @@ const MIME: Record<string, string> = {
 export const mimeType = (p: string): string => MIME[extname(p).toLowerCase()] ?? 'application/octet-stream'
 
 export const SCRIPT_EXT = /\.(m?[jt]sx?|cjs|cts|mts)$/
+/** Single-file components the dev server compiles (with the project's own `vue` / `svelte` compiler). */
+export const SFC_EXT = /\.(vue|svelte)$/
 export const ASSET_EXT = /\.(svg|png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|eot|mp4|webm|mp3|wav|ogg|pdf|wasm|txt)$/i

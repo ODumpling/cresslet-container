@@ -6,12 +6,14 @@ import { dirname, extname, join, normalize } from '../path'
 import { BROWSER_OPTS, isBare, resolveModule } from '../resolve'
 import { clientCode, errorModule, styleModule } from './client'
 import { DepOptimizer, scanImports } from './deps'
-import { ASSET_EXT, envDefines, jsxOptions, loadEnv, matchPaths, mimeType, readProjectConfig, SCRIPT_EXT, type ProjectConfig } from './project'
+import { ASSET_EXT, envDefines, jsxOptions, loadEnv, matchPaths, mimeType, readProjectConfig, SCRIPT_EXT, SFC_EXT, type ProjectConfig } from './project'
 import { findModuleScripts } from '../build/html'
-import { ModuleGraph, type HmrUpdate } from './hmr'
-import { CSS_CONFIG_RE, CSS_MODULE_RE, CssPipeline, STYLE_RE, type CssError } from '../css/pipeline'
-import { refreshRuntimeModule, refreshTransform, refreshUtilsCode, REFRESH_RUNTIME_URL, REFRESH_UTILS_URL } from './refresh'
+import { ModuleGraph, updateKey, type HmrUpdate } from './hmr'
+import { CSS_CONFIG_RE, CSS_MODULE_RE, CssPipeline, STYLE_RE, type CssError, type SfcResult } from '../css/pipeline'
+import { prefreshCoreModule, prefreshUtilsCode, PREFRESH_CORE_URL, PREFRESH_UTILS_URL, refreshRuntimeModule, refreshTransform, refreshUtilsCode, REFRESH_RUNTIME_URL, REFRESH_UTILS_URL } from './refresh'
+import { analyzeHot, HOT_ID, hotBanner, usesHot } from './hot'
 import refreshRuntimeCjs from 'react-refresh/cjs/react-refresh-runtime.development.js?raw'
+import prefreshCoreBundle from '@prefresh/core?bundle'
 
 export interface DevServerOptions {
   root?: string
@@ -25,6 +27,8 @@ export interface DevServerHandle {
   close(): void
 }
 
+type Hot = { self: boolean; deps: Set<string>; auto?: boolean }
+
 interface CssUses {
   /** scanners (source rules keys) whose candidates the output was built from */
   scanners: Set<string>
@@ -34,6 +38,14 @@ interface CssUses {
 const newUses = (): CssUses => ({ scanners: new Set(), files: new Set(), dirs: [] })
 
 const NO_CACHE = { 'cache-control': 'no-cache, no-store' }
+/** Modules the dev server transforms: scripts and single-file components. */
+const isModule = (p: string) => SCRIPT_EXT.test(p) || SFC_EXT.test(p)
+/** A short stable id for a component file (Vue's HMR / scope id). */
+const fileId = (s: string) => {
+  let h = 0x811c9dc5
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 0x01000193)
+  return (h >>> 0).toString(16).padStart(8, '0')
+}
 const JS = { 'content-type': 'text/javascript; charset=utf-8', ...NO_CACHE }
 
 export async function createDevServer(c: Container, o: DevServerOptions = {}): Promise<DevServerHandle> {
@@ -53,7 +65,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
    * Transformed scripts, with what the graph needs to re-learn them after a full reload resets it. Valid only for the
    * same mtime and source revision: two writes in one millisecond keep the mtime, the revision still moves.
    */
-  const transformCache = new Map<string, { mtime: number; gen: number; code: string; imports: Set<string>; boundary: boolean }>()
+  const transformCache = new Map<string, { mtime: number; gen: number; code: string; imports: Set<string>; boundary: boolean; hot?: Hot }>()
   /** Bumped per module by each HMR flush: an in-flight transform from an older generation must not be cached or report errors. */
   const generation = new Map<string, number>()
   const bump = (f: string) => generation.set(f, (generation.get(f) ?? 0) + 1)
@@ -90,6 +102,22 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   const served = new Set<string>()
   /** Stylesheets served as packages' (`import 'ui/styles.css'`, outside the CSS graph): a linked package's edit reloads. */
   const packageCss = new Set<string>()
+  /**
+   * Modules an `import.meta.hot` update just re-imported or handed a new copy to, on this page (the only ones whose
+   * `invalidate()` counts, once each, while the client applies that update `batch`) -> `by`: the modules whose
+   * invalidations led to that update (re-running one is a loop).
+   */
+  const hotUpdated = new Map<string, { batch: number; by: Set<string>; ran: boolean }>()
+  let batchSeq = 0
+  /**
+   * Vue components' script revision: bumped when an update re-runs one because of something its script imports (not its
+   * own edit, not a `<style>` block's Sass/Less import): it then reloads rather than re-renders with the old setup state.
+   */
+  const vueRev = new Map<string, number>()
+  const vueStyleDeps = new Map<string, Set<string>>()
+  const bumpVue = (chain: Iterable<string>, changed: string) => {
+    for (const m of chain) if (m !== changed && m.endsWith('.vue') && !vueStyleDeps.get(m)?.has(changed)) vueRev.set(m, (vueRev.get(m) ?? 0) + 1)
+  }
   let reloadTimer: ReturnType<typeof setTimeout> | null = null
   let depsTimer: ReturnType<typeof setTimeout> | null = null
   let flushTimer: ReturnType<typeof setTimeout> | null = null
@@ -110,6 +138,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       pageGen++
       published.clear()
       inflight.clear()
+      hotUpdated.clear()
       post({ type: 'reload' })
     }, 60)
   }
@@ -159,7 +188,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
         // or a module whose import of it failed to resolve
         if (vfs.isDir(f)) continue
         if (served.has(f)) return scheduleReload(f)
-        if (!SCRIPT_EXT.test(f) && !STYLE_RE.test(f)) {
+        if (!isModule(f) && !STYLE_RE.test(f)) {
           if (ASSET_EXT.test(f)) return scheduleReload(f)
           continue // README, dotfiles, editor temp files...
         }
@@ -168,17 +197,57 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       }
       const r = graph.propagate(f)
       if (!r) return scheduleReload(f)
-      for (const u of r.updates) updates.set(u.file, u)
+      bumpVue(r.chain, f)
+      for (const u of r.updates) updates.set(updateKey(u), u)
       for (const m of r.chain) chain.add(m)
     }
-    if (!updates.size) return
+    sendUpdates([...updates.values()], chain)
+  }
+  /** Re-stamp the modules to re-execute (`chain`) and send the boundaries' updates to the page. */
+  const sendUpdates = (updates: HmrUpdate[], chain: Set<string>, invalidatedBy = new Set<string>()) => {
+    if (!updates.length) return
     const t = Date.now()
     for (const m of chain) {
       hmrStamp.set(m, t)
       transformCache.delete(m)
       bump(m)
     }
-    post({ type: 'update', updates: [...updates.values()].map((u) => ({ kind: u.kind, url: toUrl(u.file) + (u.kind === 'css' ? '?import' : ''), t })) })
+    const batch = ++batchSeq
+    // (not to one that already invalidated in this cascade: a copy handed on again doesn't re-run)
+    // `ran`: the batch re-runs it (an accepted module), or it was only handed a dep (a dep acceptor)
+    for (const u of updates) {
+      if (u.kind !== 'hot') continue
+      if (!invalidatedBy.has(u.accepted!)) hotUpdated.set(u.accepted!, { batch, by: invalidatedBy, ran: true })
+      if (!invalidatedBy.has(u.file) && hotUpdated.get(u.file)?.batch !== batch) hotUpdated.set(u.file, { batch, by: invalidatedBy, ran: false })
+    }
+    post({
+      type: 'update',
+      batch,
+      updates: updates.map((u) => {
+        const target = u.accepted ?? u.file
+        // (the client imports an accepted dep with the URL its accept() named, flags included); one an invalidation
+        // hands to its importer is already loaded at its current stamp
+        return { kind: u.kind, url: toUrl(u.file) + (u.kind === 'css' ? '?import' : ''), accepted: u.accepted && toUrl(u.accepted), t: hmrStamp.get(target) ?? t }
+      }),
+    })
+  }
+  /**
+   * `import.meta.hot.invalidate()` from a module the client's update `batch` re-ran or handed a new copy to: its
+   * importers are updated instead (a module that accepts a dep, and didn't re-run, is updated as if it had changed).
+   */
+  const invalidate = (file: string, batch: number) => {
+    const p = hotUpdated.get(file)
+    const n = graph.nodes.get(file)
+    if (reloadTimer || !p || p.batch !== batch || !n) return
+    hotUpdated.delete(file)
+    const chainOf = new Set(p.by).add(file)
+    // re-ran with its new code: its importers update; only handed a dep: it updates as if it had changed
+    const r = p.ran ? graph.invalidate(file) : graph.propagate(file)
+    // no importer takes it, or the cascade re-runs a module that already invalidated in it (a loop; the module itself
+    // only in the second case, where re-running it is the point)
+    if (!r || [...r.chain, ...r.updates.map((u) => u.file)].some((m) => chainOf.has(m) && (m !== file || p.ran))) return scheduleReload(file)
+    bumpVue(r.chain, file)
+    sendUpdates(r.updates, r.chain, chainOf)
   }
   // deps changed (npm install, a linked workspace's bundled file): rebuild lazily, then reload once things settle
   const depsChanged = () => {
@@ -309,7 +378,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
 
   const flagFor = (abs: string, query: string): string => {
     if (/[?&](url|raw|inline)\b/.test(query)) return query
-    if (SCRIPT_EXT.test(abs)) return query
+    if (isModule(abs)) return query
     return query ? `${query}&import` : '?import'
   }
 
@@ -330,7 +399,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   }
 
   // ---- transforms ----
-  const importsPlugin = (importer: string, locals?: Set<string>, onUnresolved?: () => void): Plugin => ({
+  const importsPlugin = (importer: string, locals?: Set<string>, onUnresolved?: () => void, entry?: { contents: string; loader: 'js' | 'ts' | 'jsx' | 'tsx' }): Plugin => ({
     name: 'cresslet-dev-imports',
     setup(build) {
       build.onResolve({ filter: /.*/ }, (a) => {
@@ -348,7 +417,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
           return { errors: [{ text: e instanceof Error ? e.message : String(e) }] }
         }
       })
-      build.onLoad({ filter: /.*/, namespace: 'cresslet-entry' }, (a) => ({ contents: vfs.readText(a.path), loader: loaderOf(a.path), resolveDir: dirname(a.path) }))
+      build.onLoad({ filter: /.*/, namespace: 'cresslet-entry' }, (a) => ({ contents: entry?.contents ?? vfs.readText(a.path), loader: entry?.loader ?? loaderOf(a.path), resolveDir: dirname(a.path) }))
     },
   })
 
@@ -372,7 +441,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     const page = pageGen
     const hit = transformCache.get(abs)
     if (hit && hit.mtime === st.mtimeMs && hit.gen === gen) {
-      publish(abs, hit.imports, hit.boundary, gen, page)
+      publish(abs, hit.imports, hit.boundary, gen, page, hit.hot)
       return hit.code
     }
     inflight.set(abs, (inflight.get(abs) ?? 0) + 1)
@@ -383,10 +452,28 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       if (page === pageGen) k > 0 ? inflight.set(abs, k) : inflight.delete(abs) // a reset already cleared it
     }
   }
+  /** Compile a `.vue` / `.svelte` file in the CSS worker (retried once if a CSS config change restarted it). */
+  const compileSfc = async (abs: string): Promise<SfcResult> => {
+    const w = c.cssWorker()
+    if (!w.compile) throw new Error(`${abs}: no compiler for single-file components`)
+    const req = { root, file: abs, source: vfs.readText(abs), hmrId: fileId(toUrl(abs)), session: cssPipe.session, plugins: c.cssPlugins !== false }
+    try {
+      return await w.compile(req)
+    } catch (e) {
+      if (!(e as CssError).restarted) throw e
+      return w.compile(req)
+    }
+  }
   const buildScript = async (abs: string, mtime: number, gen: number, page: number): Promise<string> => {
     const es = await loadEsbuild(c.esbuildWasmUrl)
     const locals = new Set<string>()
     unresolved.delete(abs)
+    const sfc = SFC_EXT.test(abs) ? await compileSfc(abs) : null
+    for (const d of sfc?.deps ?? []) locals.add(d) // a <style lang="scss"> block's imports
+    const source = sfc ? sfc.code : vfs.readText(abs)
+    const loader = sfc ? sfc.lang : loaderOf(abs)
+    // Preact: every script gets a hot context (component modules accept themselves after the refresh pass)
+    const hot = usesHot(source) || (cfg.preactRefresh && !sfc)
     const runtimes = jsxRuntimes()
     let importsRuntime = false
     const jsxRuntimePlugin: Plugin = {
@@ -405,36 +492,60 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       sourcesContent: true,
       ...jsxOptions(cfg),
       tsconfigRaw: cfg.tsconfigRaw as never,
-      define: defines,
-      plugins: [jsxRuntimePlugin, importsPlugin(abs, locals, () => unresolved.add(abs))],
+      define: hot ? { ...defines, 'import.meta.hot': HOT_ID } : defines,
+      banner: hot ? { js: hotBanner(toUrl(abs)) } : undefined,
+      plugins: [jsxRuntimePlugin, importsPlugin(abs, locals, () => unresolved.add(abs), { contents: source, loader })],
       logLevel: 'silent',
       absWorkingDir: root,
     })
     let code = r.outputFiles[0].text
     let boundary = false
+    let hotInfo: Hot | undefined
+    if (hot) {
+      const h = analyzeHot(code, (spec) => {
+        try {
+          const f = resolveLocal(spec, abs)
+          return f ? { file: f, url: toUrl(f) + flagFor(f, splitQuery(spec)[1]) } : null
+        } catch {
+          return null
+        }
+      })
+      code = h.code
+      hotInfo = { self: h.self, deps: new Set(h.deps) }
+    }
     // every script esbuild loads (incl. .ts hook modules, .js JSX): hooks need signatures wherever they're defined
-    if (cfg.refresh && SCRIPT_LOADERS.has(loaderOf(abs))) {
-      const rr = refreshTransform(code, toUrl(abs))
-      code = rr.code
+    if ((cfg.refresh || cfg.preactRefresh) && !sfc && SCRIPT_LOADERS.has(loader)) {
       // only component modules can be boundaries: a .ts/.js module exporting API_URL / an enum must not self-accept
-      boundary = rr.boundary && (loaderOf(abs) === 'jsx' || loaderOf(abs) === 'tsx') && hasJsx(r.outputFiles[0].text, importsRuntime)
+      const components = (loader === 'jsx' || loader === 'tsx') && hasJsx(r.outputFiles[0].text, importsRuntime)
+      const rr = cfg.refresh ? refreshTransform(code, toUrl(abs)) : refreshTransform(code, toUrl(abs), PREFRESH_UTILS_URL, components ? HOT_ID : undefined)
+      code = rr.code
+      boundary = cfg.refresh && rr.boundary && components
+      // Preact boundaries accept themselves through import.meta.hot (an entry doesn't: re-running it re-mounts the app)
+      if (cfg.preactRefresh && rr.boundary && components && hotInfo) hotInfo.auto = true
+    }
+    // Vue re-renders in place only when the component's script is unchanged, and wasn't re-run for an edited import
+    if (sfc && abs.endsWith('.vue')) {
+      vueStyleDeps.set(abs, new Set(sfc.deps))
+      code = code.replace('__cressletScript = "', () => `__cressletScript = "${vueRev.get(abs) ?? 0}:`)
     }
     // the graph describes the code the page actually runs, even if the file changed meanwhile
-    publish(abs, locals, boundary, gen, page)
+    publish(abs, locals, boundary, gen, page, hotInfo)
     // changed while this transform was in flight: serve it, but don't cache stale code
     if (!fresh(abs, gen, page)) return code
-    transformCache.set(abs, { mtime, gen, code, imports: locals, boundary })
+    transformCache.set(abs, { mtime, gen, code, imports: locals, boundary, hot: hotInfo })
     return code
   }
   /**
    * Record a transform's edges/accept, unless it is from a previous page (after a full reload) or a newer transform of
    * the module already published; a stale transform still publishes when nothing newer has (its code is what runs).
    */
-  const publish = (abs: string, imports: Set<string>, boundary: boolean, gen: number, page: number) => {
+  const publish = (abs: string, imports: Set<string>, boundary: boolean, gen: number, page: number, hot?: Hot) => {
     if (page !== pageGen || gen < (published.get(abs) ?? -1)) return
     published.set(abs, gen)
     graph.setImports(abs, imports)
-    graph.ensure(abs).accept = boundary ? 'self' : null
+    const n = graph.ensure(abs)
+    n.accept = boundary ? 'self' : null
+    n.hot = hot
   }
 
   const transformInline = async (code: string, htmlPath: string): Promise<string> => {
@@ -626,6 +737,8 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     let tag = `<script type="module" src="/@cresslet/client"></script>`
     // React Fast Refresh must hook React before react-dom evaluates: load the runtime ahead of the app's scripts
     if (cfg.refresh) tag += `\n    <script type="module" src="${REFRESH_UTILS_URL}"></script>`
+    // prefresh must hook Preact's options before the app renders
+    else if (cfg.preactRefresh) tag += `\n    <script type="module" src="${PREFRESH_UTILS_URL}"></script>`
     if (/<head[^>]*>/i.test(html)) html = html.replace(/<head[^>]*>/i, (h) => `${h}\n    ${tag}`)
     else html = tag + html
     return html
@@ -633,11 +746,13 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
 
   // ---- initial dependency scan ----
   const indexHtml = join(root, 'index.html')
+  /** Dependency requests wait for it: a first bundle of only the deps asked for so far would be rebuilt (and the page reloaded) once it finds the rest. */
+  let scanned: Promise<unknown> = Promise.resolve()
   if (vfs.isFile(indexHtml)) {
     const entries = findModuleScripts(vfs.readText(indexHtml))
       .map((s) => (s.startsWith('/') ? join(root, s) : join(root, s)))
       .filter((p) => vfs.isFile(p))
-    scanImports(vfs, root, entries, { wasmURL: c.esbuildWasmUrl, jsx: jsxOptions(cfg) as unknown as Record<string, string>, resolveLocal: (s, imp) => {
+    scanned = scanImports(vfs, root, entries, { wasmURL: c.esbuildWasmUrl, jsx: jsxOptions(cfg) as unknown as Record<string, string>, compile: compileSfc, resolveLocal: (s, imp) => {
       try {
         return resolveLocal(s, imp || root + '/index.html')
       } catch {
@@ -666,7 +781,18 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       if (pathname === '/@cresslet/empty') return new Response('export default {}', { headers: JS })
       if (pathname === REFRESH_UTILS_URL) return new Response(refreshUtilsCode(), { headers: JS })
       if (pathname === REFRESH_RUNTIME_URL) return new Response(refreshRuntimeModule(refreshRuntimeCjs), { headers: JS })
+      if (pathname === PREFRESH_UTILS_URL) return new Response(prefreshUtilsCode(), { headers: JS })
+      if (pathname === PREFRESH_CORE_URL) {
+        deps.add(['preact'])
+        return new Response(prefreshCoreModule(prefreshCoreBundle), { headers: JS })
+      }
+      if (pathname === '/@cresslet/invalidate') {
+        const p = u.searchParams.get('path') ?? ''
+        if (p.startsWith('/')) invalidate(fromUrl(splitQuery(p)[0]), Number(u.searchParams.get('batch')))
+        return new Response(null, { status: 204, headers: NO_CACHE })
+      }
       if (pathname.startsWith('/@modules/')) {
+        await scanned
         const spec = pathname.slice('/@modules/'.length)
         if (/^chunk-[\w-]+\.js$/.test(spec.split('/').pop()!) && !deps.has(spec)) {
           const text = await deps.chunk(spec.split('/').pop()!)
@@ -688,8 +814,8 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       if (vfs.isDir(abs)) abs = join(abs, 'index.html')
       if (!vfs.isFile(abs)) {
         const accept = req.headers.get('accept') ?? ''
-        if ((accept.includes('text/html') || !extname(pathname)) && req.method === 'GET' && vfs.isFile(indexHtml) && !SCRIPT_EXT.test(pathname)) abs = indexHtml
-        else if (SCRIPT_EXT.test(pathname) || has('import')) return new Response(errorModule(`Failed to load ${pathname}: file not found`), { status: 404, headers: JS })
+        if ((accept.includes('text/html') || !extname(pathname)) && req.method === 'GET' && vfs.isFile(indexHtml) && !isModule(pathname)) abs = indexHtml
+        else if (isModule(pathname) || has('import')) return new Response(errorModule(`Failed to load ${pathname}: file not found`), { status: 404, headers: JS })
         else return new Response(`Not found: ${pathname}`, { status: 404, headers: { 'content-type': 'text/plain' } })
       }
       const ext = extname(abs)
@@ -707,9 +833,9 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       }
       if (has('import')) {
         if (ext === '.json') return new Response(`export default ${vfs.readText(abs)}`, { headers: JS })
-        if (ASSET_EXT.test(abs) || !SCRIPT_EXT.test(abs)) return new Response(`export default ${JSON.stringify(pathname)}`, { headers: JS })
+        if (ASSET_EXT.test(abs) || !isModule(abs)) return new Response(`export default ${JSON.stringify(pathname)}`, { headers: JS })
       }
-      if (SCRIPT_EXT.test(abs)) {
+      if (isModule(abs)) {
         const gen = generation.get(abs) ?? 0
         const page = pageGen
         try {
@@ -730,7 +856,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       return fileResponse(abs)
     } catch (e) {
       const msg = formatErrors(e)
-      return SCRIPT_EXT.test(pathname) || has('import') || pathname.startsWith('/@modules/')
+      return isModule(pathname) || has('import') || pathname.startsWith('/@modules/')
         ? new Response(errorModule(msg), { headers: JS })
         : new Response(msg, { status: 500, headers: { 'content-type': 'text/plain' } })
     }

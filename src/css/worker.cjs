@@ -114,7 +114,7 @@ const isDynamicUrl = (u) => /^[$@]/.test(u) || u.includes('#{') || u.includes('@
  * that Sass loads (every relative `@import` in it is plain CSS, rebased).
  */
 function rebaseUrls(css, fromDir, toDir, o = {}) {
-  if (fromDir === toDir) return css
+  if (fromDir === toDir && !o.toUrl) return css
   let out = ''
   let last = 0
   const n = css.length
@@ -126,6 +126,7 @@ function rebaseUrls(css, fromDir, toDir, o = {}) {
   }
   const rebase = (ref) => {
     const m = /^([^?#]*)(.*)$/s.exec(ref)
+    if (o.toUrl) return o.toUrl(path.resolve(fromDir, m[1])) + m[2] // (a URL for the page instead of a relative path)
     let rel = path.relative(toDir, path.resolve(fromDir, m[1]))
     if (!rel.startsWith('.')) rel = './' + rel
     return rel + m[2]
@@ -647,6 +648,135 @@ async function handle(req) {
   }
 }
 
+// ---- single-file components (the dev server's .vue / .svelte modules), with the project's own compiler ----
+
+const hash = (s) => {
+  let h = 0x811c9dc5
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 0x01000193)
+  return (h >>> 0).toString(36)
+}
+/** A compiler error with its location (Svelte / Vue errors carry one) as `file:line:col: message` + code frame. */
+function located(e, file) {
+  if (!e || typeof e !== 'object') return new Error(String(e))
+  const loc = e.start || (e.loc && e.loc.start)
+  if (loc && !e.cresslet) {
+    const err = new Error(`${file}:${loc.line}:${loc.column + (e.start ? 1 : 0)}: ${e.message}${e.frame ? '\n' + e.frame : ''}`)
+    err.cresslet = true
+    return err
+  }
+  return e
+}
+/**
+ * A component's styles go in `<style>`s it owns, one per block (an `@import` must start its sheet), in order; extra
+ * ones from its previous copy are removed. Relative `url()`s / `@import`s are made root-relative (the page isn't in
+ * the component's dir).
+ */
+function injectStyle(req, id, sheets) {
+  const urlOf = (p) => (p.startsWith(req.root + '/') ? p.slice(req.root.length) : '/@fs' + p)
+  const css = sheets.filter(Boolean).map((s) => rebaseUrls(s, path.dirname(req.file), null, { cssImports: true, toUrl: urlOf }))
+  return `{ const sheets = ${JSON.stringify(css)}, have = [...document.querySelectorAll(${JSON.stringify(`style[data-cresslet-id="${id}"]`)})]
+  sheets.forEach((css, i) => { let el = have[i]; if (!el) { el = document.createElement('style'); el.setAttribute('data-cresslet-id', ${JSON.stringify(id)}); document.head.appendChild(el) } el.textContent = css })
+  for (const el of have.slice(sheets.length)) el.remove() }\n`
+}
+const missing = (pkg, e) => (e && e.code === 'MODULE_NOT_FOUND' && String(e.message).includes(pkg) ? new Error(`compiling this file needs the \`${pkg.split('/')[0]}\` package: npm install ${pkg.split('/')[0]}`) : e)
+
+/**
+ * Svelte: the project's `svelte/compiler`, client output in dev mode; its CSS goes in a `<style>` the module updates
+ * (so a failed update leaves the old one). Svelte 5 emits its own `import.meta.hot` code (`hmr: true`); Svelte 4
+ * compiles without (its components full-reload).
+ */
+function compileSvelte(req) {
+  let svelte
+  try {
+    svelte = projectRequire(req.root)('svelte/compiler')
+  } catch (e) {
+    throw missing('svelte/compiler', e)
+  }
+  const v5 = parseInt(svelte.VERSION, 10) >= 5
+  let r
+  try {
+    r = svelte.compile(req.source, v5 ? { filename: req.file, generate: 'client', dev: true, hmr: true, css: 'external' } : { filename: req.file, generate: 'dom', dev: true, css: 'external' })
+  } catch (e) {
+    throw located(e, req.file)
+  }
+  // the style after the module body: a module that throws as it runs leaves the old one
+  return { code: r.js.code + '\n' + injectStyle(req, req.hmrId, [r.css ? r.css.code : '']), lang: 'js', deps: [], warnings: (r.warnings || []).map((w) => w.message) }
+}
+
+/**
+ * Vue: the project's `vue/compiler-sfc`. Script (incl. `<script setup>`) and template are compiled separately (the
+ * render function reads setup bindings through `$setup`), so a template-only edit re-renders the component in place
+ * (state kept); any other edit reloads it through Vue's HMR runtime. `<style>` / `<style scoped>` (Sass/Less via the
+ * project's `sass` / `less`) are injected by the module.
+ */
+async function compileVue(req) {
+  let sfc
+  try {
+    sfc = projectRequire(req.root)('vue/compiler-sfc')
+  } catch (e) {
+    throw missing('vue/compiler-sfc', e)
+  }
+  const { descriptor, errors } = sfc.parse(req.source, { filename: req.file, sourceMap: false })
+  if (errors.length) throw located(errors[0], req.file)
+  const id = req.hmrId
+  const scoped = descriptor.styles.some((s) => s.scoped)
+  const blocks = [descriptor.script, descriptor.scriptSetup].filter(Boolean)
+  const ts = blocks.some((b) => b.lang === 'ts')
+  let code = 'const _sfc_main = {}'
+  let bindings
+  if (blocks.length) {
+    try {
+      const s = sfc.compileScript(descriptor, { id, isProd: false, inlineTemplate: false, genDefaultAs: '_sfc_main', sourceMap: false })
+      code = s.content
+      bindings = s.bindings
+    } catch (e) {
+      throw located(e, req.file)
+    }
+  }
+  // (a removed <template> must reload: re-rendering with no render function keeps the old one)
+  const scriptHash = hash(code + (scoped ? '\0scoped' : '') + (descriptor.template ? '\0template' : ''))
+  if (descriptor.template) {
+    const t = sfc.compileTemplate({ source: descriptor.template.content, filename: req.file, id, scoped, slotted: descriptor.slotted, isProd: false, compilerOptions: { bindingMetadata: bindings, scopeId: scoped ? `data-v-${id}` : undefined, expressionPlugins: ts ? ['typescript'] : undefined } })
+    if (t.errors.length) throw typeof t.errors[0] === 'string' ? new Error(`${req.file}: ${t.errors[0]}`) : located(t.errors[0], req.file)
+    code += '\n' + t.code.replace(/\nexport (function|const) render\b/, '\n$1 _sfc_render') + '\n_sfc_main.render = _sfc_render'
+  }
+  const out = { deps: new Set(), dirs: new Set(), tailwind: [], warnings: [], attempted: new Set() }
+  const css = []
+  for (const st of descriptor.styles) {
+    if (st.module) throw new Error(`${req.file}: <style module> is not supported by the dev server yet`)
+    const lang = st.lang || 'css'
+    const source = lang === 'css' ? st.content : await preprocess({ root: req.root, file: `${req.file}.${lang}`, css: st.content, plugins: req.plugins }, out)
+    const r = await sfc.compileStyleAsync({ source, filename: req.file, id: `data-v-${id}`, scoped: !!st.scoped, isProd: false })
+    if (r.errors.length) throw located(r.errors[0], req.file)
+    css.push(r.code)
+  }
+  code += `
+_sfc_main.__hmrId = ${JSON.stringify(id)}
+_sfc_main.__file = ${JSON.stringify(req.file)}
+_sfc_main.__cressletScript = ${JSON.stringify(scriptHash)}
+${scoped ? `_sfc_main.__scopeId = ${JSON.stringify(`data-v-${id}`)}\n` : ''}${injectStyle(req, id, css)}if (import.meta.hot && typeof __VUE_HMR_RUNTIME__ !== 'undefined') {
+  __VUE_HMR_RUNTIME__.createRecord(_sfc_main.__hmrId, _sfc_main)
+  import.meta.hot.accept((mod) => {
+    const next = mod && mod.default
+    if (!next) return // the update failed (its error is on the overlay)
+    if (next.__cressletScript === _sfc_main.__cressletScript) __VUE_HMR_RUNTIME__.rerender(next.__hmrId, next.render)
+    else __VUE_HMR_RUNTIME__.reload(next.__hmrId, next)
+  })
+}
+export default _sfc_main
+`
+  return { code, lang: ts ? 'ts' : 'js', deps: [...out.deps], warnings: out.warnings }
+}
+
+/** req: { op: 'sfc', root, file, source, hmrId } -> { code, lang: 'js' | 'ts', deps: files it read besides itself, warnings } */
+async function compileSfc(req) {
+  try {
+    return req.file.endsWith('.svelte') ? compileSvelte(req) : await compileVue(req)
+  } catch (e) {
+    throw Object.assign(e && typeof e === 'object' ? e : new Error(String(e)), { deps: [], dirs: [] })
+  }
+}
+
 /** Forget a session's compilers and candidate sets. */
 function release(session) {
   for (const k of compilers.keys()) if (k.startsWith(session + '\0')) compilers.delete(k)
@@ -670,7 +800,7 @@ function serve() {
         continue
       }
       queue = queue.then(
-        () => handle(msg).then(
+        () => (msg.op === 'sfc' ? compileSfc(msg) : handle(msg)).then(
           (r) => reply({ id: msg.id, ok: true, ...r }),
           (e) => reply({ id: msg.id, ok: false, error: formatError(e), deps: e.deps, dirs: e.dirs }),
         ),
@@ -689,5 +819,5 @@ function formatError(e) {
   return plugin + (e.message || String(e))
 }
 
-module.exports = { handle, release, resolveStylesheet, exportTarget, rebaseUrls, sassTiers, formatError, MARK, TAILWIND_RE, PREPROCESSED_RE }
+module.exports = { handle, compileSfc, release, resolveStylesheet, exportTarget, rebaseUrls, sassTiers, formatError, MARK, TAILWIND_RE, PREPROCESSED_RE }
 if (require.main === module) serve()

@@ -50,9 +50,29 @@ export type CssError = Error & {
     dirs?: string[];
     restarted?: boolean;
 };
+/** A `.vue` / `.svelte` module for the dev server, compiled by the same worker with the project's own compiler. */
+export interface SfcRequest {
+    root: string;
+    file: string;
+    source: string;
+    /** stable per-file id (Vue's HMR id / scope id); not `id`, which numbers the worker's messages */
+    hmrId: string;
+    session?: string;
+    /** false: `boot({ cssPlugins: false })` (Less `@plugin` in a `<style lang="less">` block is refused) */
+    plugins?: boolean;
+}
+export interface SfcResult {
+    /** ES module code (TypeScript when `lang` is 'ts'), with `import.meta.hot` handling */
+    code: string;
+    lang: 'js' | 'ts';
+    /** other files the output depends on (Sass/Less imports of `<style>` blocks) */
+    deps: string[];
+    warnings: string[];
+}
 /** Where requests run: the node worker in the container; in-process in tests. */
 export interface CssBackend {
     process(req: CssRequest): Promise<CssResult>;
+    compile?(req: SfcRequest): Promise<SfcResult>;
     /** Drop the worker (plugins/config changed); the next request starts a fresh one. */
     restart(): void;
     /** Forget a session's worker-side state (its dev server closed / its build finished). */

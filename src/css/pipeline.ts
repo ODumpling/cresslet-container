@@ -56,9 +56,29 @@ export interface CssResult {
  * `restarted`: a restart (config/plugins changed) cut it off; the caller sends it again with its current mode.
  */
 export type CssError = Error & { deps?: string[]; dirs?: string[]; restarted?: boolean }
+/** A `.vue` / `.svelte` module for the dev server, compiled by the same worker with the project's own compiler. */
+export interface SfcRequest {
+  root: string
+  file: string
+  source: string
+  /** stable per-file id (Vue's HMR id / scope id); not `id`, which numbers the worker's messages */
+  hmrId: string
+  session?: string
+  /** false: `boot({ cssPlugins: false })` (Less `@plugin` in a `<style lang="less">` block is refused) */
+  plugins?: boolean
+}
+export interface SfcResult {
+  /** ES module code (TypeScript when `lang` is 'ts'), with `import.meta.hot` handling */
+  code: string
+  lang: 'js' | 'ts'
+  /** other files the output depends on (Sass/Less imports of `<style>` blocks) */
+  deps: string[]
+  warnings: string[]
+}
 /** Where requests run: the node worker in the container; in-process in tests. */
 export interface CssBackend {
   process(req: CssRequest): Promise<CssResult>
+  compile?(req: SfcRequest): Promise<SfcResult>
   /** Drop the worker (plugins/config changed); the next request starts a fresh one. */
   restart(): void
   /** Forget a session's worker-side state (its dev server closed / its build finished). */
@@ -255,7 +275,7 @@ function containerSpawn(c: Container): CssWorkerSpawn {
 export function nodeCssBackend(c: Container, o: { timeoutMs?: number; spawn?: CssWorkerSpawn } = {}): CssBackend & { close(): void } {
   const timeoutMs = o.timeoutMs ?? TIMEOUT_MS
   const spawn = o.spawn ?? containerSpawn(c)
-  type Job = { req: CssRequest; resolve: (r: CssResult) => void; reject: (e: Error) => void; retried: boolean; timer?: ReturnType<typeof setTimeout>; released?: boolean }
+  type Job = { req: CssRequest | (SfcRequest & { op: 'sfc'; candidates?: undefined; candidateSet?: undefined }); resolve: (r: never) => void; reject: (e: Error) => void; retried: boolean; timer?: ReturnType<typeof setTimeout>; released?: boolean }
   type Proc = { w: CssWorkerProcess; pending: Map<number, Job>; sent: Map<string, number> }
   let proc: Proc | null = null
   let nextId = 0
@@ -285,7 +305,7 @@ export function nodeCssBackend(c: Container, o: { timeoutMs?: number; spawn?: Cs
           clearTimeout(job.timer)
           arm(me)
           if (job.released) continue
-          if (m.ok) job.resolve(m)
+          if (m.ok) job.resolve(m as never)
           else job.reject(Object.assign(new Error(m.error), { deps: m.deps ?? [], dirs: m.dirs ?? [] }))
         }
       },
@@ -310,9 +330,9 @@ export function nodeCssBackend(c: Container, o: { timeoutMs?: number; spawn?: Cs
     const set = job.req.candidateSet
     if (set) {
       const from = me.sent.get(set) ?? 0
-      if (from > candidates.length) reset = true // not an extension of what was sent: replace
-      else candidates = candidates.slice(from)
-      me.sent.set(set, job.req.candidates.length)
+      if (from > candidates!.length) reset = true // not an extension of what was sent: replace
+      else candidates = candidates!.slice(from)
+      me.sent.set(set, job.req.candidates!.length)
     }
     me.w.write(JSON.stringify({ id, ...job.req, candidates, candidatesReset: reset || undefined }) + '\n')
     arm(me)
@@ -350,6 +370,7 @@ export function nodeCssBackend(c: Container, o: { timeoutMs?: number; spawn?: Cs
 
   return {
     process: (req) => new Promise<CssResult>((resolve, reject) => send({ req, resolve, reject, retried: false })),
+    compile: (req) => new Promise<SfcResult>((resolve, reject) => send({ req: { ...req, op: 'sfc' }, resolve, reject, retried: false })),
     restart: () => void (proc && recycle(proc, 'restarted')),
     release(session) {
       if (!proc) return

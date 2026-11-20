@@ -20,11 +20,20 @@ const shims = {
     b.onResolve({ filter: /^brotli-wasm-web$/ }, () => ({ path: `${root}node_modules/brotli-wasm/pkg.web/brotli_wasm.js` }))
     // `import text from 'pkg/file.js?raw'` (as in vite/vitest): embed a file's source as a minified string
     b.onResolve({ filter: /\?raw$/ }, (a) => ({ path: a.path.startsWith('.') ? join(a.resolveDir, a.path.slice(0, -4)) : `${root}node_modules/${a.path.slice(0, -4)}`, namespace: 'raw' }))
+    // `import text from 'pkg?bundle'`: a browser package bundled to one ES module string, its peer `preact` external
+    b.onResolve({ filter: /\?bundle$/ }, (a) => ({ path: a.path.slice(0, -7), namespace: 'bundle' }))
+    b.onLoad({ filter: /.*/, namespace: 'bundle' }, async (a) => ({ contents: await bundleText(a.path), loader: 'text' }))
     b.onLoad({ filter: /.*/, namespace: 'raw' }, async (a) => {
       const { code } = await esbuild.transform(readFileSync(a.path, 'utf8'), { minify: true, legalComments: 'inline' })
       return { contents: code, loader: 'text' }
     })
   },
+}
+
+/** Keep in sync with vitest.config.ts. */
+async function bundleText(pkg) {
+  const r = await esbuild.build({ entryPoints: [pkg], absWorkingDir: root, bundle: true, write: false, format: 'esm', minify: true, legalComments: 'inline', external: ['preact', 'preact/*'], logLevel: 'silent' })
+  return r.outputFiles[0].text
 }
 
 const common = {

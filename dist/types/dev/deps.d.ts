@@ -60,4 +60,7 @@ export declare function scanImports(vfs: VFS, root: string, entries: string[], o
     wasmURL?: string;
     jsx?: Record<string, string>;
     resolveLocal: (spec: string, importer: string) => string | null;
+    compile?: (file: string) => Promise<{
+        code: string;
+    }>;
 }): Promise<Set<string>>;
