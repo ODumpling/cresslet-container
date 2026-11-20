@@ -94,8 +94,18 @@ describe('snapshot codec', () => {
     new DataView(blob.buffer).setUint32(4, evil.byteLength, true)
     blob.set(evil, 8)
     expect(() => restoreSnapshot(new VFS(), W, blob)).toThrow(/bad path/)
-    const through = snapshotOf([['l', 'l', 0, '/etc'], ['l/passwd', 'd', 0]])
-    expect(() => restoreSnapshot(new VFS(), W, through)).toThrow(/bad entry/)
+    const bad = [
+      [['l', 'l', 0, '/etc'], ['l/passwd', 'd', 0]], // through a symlink
+      [['a', 'f', 0, 0], ['a/b', 'f', 0, 0]], // under a file
+      [['x/y', 'd', 0]], // before its parent
+      [['a', 'd', 0], ['a', 'd', 0]], // twice
+      [['a', 'd', '0']], // bad mtime
+    ]
+    for (const entries of bad) {
+      const dst = new VFS()
+      expect(() => restoreSnapshot(dst, W, snapshotOf(entries))).toThrow(/bad entry/)
+      expect(dst.exists(W)).toBe(false)
+    }
   })
 })
 
@@ -251,14 +261,23 @@ describe('VfsPersistence', () => {
     expect(store.writes).toBe(1)
   })
 
-  it('a removed workdir snapshots as empty', async () => {
-    const { fs, p, store } = await setup({ maxWrites: 1 })
-    fs.writeFile(`${W}/a`, '1')
-    fs.rm(W, { recursive: true })
-    await p.flush()
-    const back = new VFS()
-    restoreSnapshot(back, W, store.data.get('default')!)
-    expect(back.readdir(W)).toEqual([])
+  it('a removed workdir (or ancestor) snapshots as empty; changes elsewhere are ignored', async () => {
+    for (const removed of [W, '/home']) {
+      const store = new MemoryStore()
+      const { fs, p } = await setup({ debounceMs: 60_000 }, store)
+      fs.writeFile(`${W}/a`, '1')
+      await p.flush()
+      fs.writeFile('/tmp/x', 'x', { mkdirp: true })
+      fs.writeFile('/home/other', 'x')
+      await p.flush()
+      expect(store.writes).toBe(1)
+      fs.rm(removed, { recursive: true })
+      await p.flush()
+      expect(store.writes).toBe(2)
+      const back = new VFS()
+      restoreSnapshot(back, W, store.data.get('default')!)
+      expect(back.readdir(W)).toEqual([])
+    }
   })
 
   it('validates options', () => {

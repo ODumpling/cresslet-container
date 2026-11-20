@@ -96,6 +96,21 @@ test('a snapshot saved to IndexedDB (no OPFS writes then) is restored once OPFS 
   })
   await page.reload()
   expect(await boot(page, { key: 'up' })).toMatchObject({ backend: 'opfs', restored: true, app: 'saved in idb' })
+  await page.evaluate(async () => {
+    const { c } = window as unknown as Win
+    await c.fs.writeFile('src/App.tsx', 'saved in opfs')
+    await c.persistence!.flush()
+  })
+  // clearing works on an OPFS snapshot even where OPFS can't be written (writable streams gone again)
+  await page.evaluate(() => (sessionStorage.noOpfs = '1'))
+  await page.reload()
+  await page.evaluate(async () => {
+    const { Container } = await import('/dist/cresslet-container.js')
+    await Container.clearPersisted('up')
+    sessionStorage.removeItem('noOpfs')
+  })
+  await page.reload()
+  expect(await boot(page, { key: 'up' })).toMatchObject({ backend: 'opfs', restored: false, tree: [] })
 })
 
 test('flush() on demand, teardown writes pending changes, Container.clearPersisted() without booting', async ({ browser }) => {

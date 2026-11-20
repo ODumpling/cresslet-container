@@ -33,8 +33,8 @@ export interface SnapshotStore {
     close(): void;
 }
 /**
- * OPFS store, or null where OPFS (with writable streams on this thread) is unavailable. `create: false`: null too
- * when nothing was ever stored there.
+ * OPFS store, or null where OPFS (with writable streams on this thread) is unavailable. `create: false` (to read or
+ * delete what's there): no writable streams needed, and null when nothing was ever stored there.
  */
 export declare function opfsStore(create?: boolean): Promise<SnapshotStore | null>;
 /** IndexedDB store, or null where IndexedDB is unavailable. `create: false`: null too when the database doesn't exist. */

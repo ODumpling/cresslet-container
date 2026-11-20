@@ -86,12 +86,16 @@ export function restoreSnapshot(vfs: VFS, dir: string, bytes: Uint8Array): void 
   // validate everything before touching the VFS
   let off = 8 + len
   const files: Uint8Array[] = []
-  const links: string[] = []
+  // as the encoder writes them: each path once, after its parent directory (never under a file or symlink: that
+  // would fail halfway, or write through the link)
+  const dirSet = new Set([''])
+  const seen = new Set<string>()
   for (const [rel, type, mtime, extra] of header.entries) {
     if (typeof rel !== 'string' || !rel || rel.split('/').some((s) => !s || s === '.' || s === '..')) throw new Error(`bad path in VFS snapshot: ${rel}`)
-    // the encoder never descends into symlinks: an entry under one would be written through it
-    if (typeof mtime !== 'number' || links.some((l) => rel.startsWith(l + '/'))) throw new Error(`bad entry in VFS snapshot: ${rel}`)
-    if (type === 'l') links.push(rel)
+    const parent = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : ''
+    if (typeof mtime !== 'number' || !dirSet.has(parent) || seen.has(rel)) throw new Error(`bad entry in VFS snapshot: ${rel}`)
+    seen.add(rel)
+    if (type === 'd') dirSet.add(rel)
     if (type === 'f') {
       const n = extra as number
       if (!Number.isInteger(n) || n < 0 || off + n > bytes.byteLength) throw new Error('truncated VFS snapshot')
@@ -137,15 +141,21 @@ const opfsName = (key: string) => `${encodeURIComponent(key)}.snap`
 const isNotFound = (e: unknown) => (e as { name?: string })?.name === 'NotFoundError'
 
 /**
- * OPFS store, or null where OPFS (with writable streams on this thread) is unavailable. `create: false`: null too
- * when nothing was ever stored there.
+ * OPFS store, or null where OPFS (with writable streams on this thread) is unavailable. `create: false` (to read or
+ * delete what's there): no writable streams needed, and null when nothing was ever stored there.
  */
 export async function opfsStore(create = true): Promise<SnapshotStore | null> {
   try {
     if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) return null
-    if (typeof FileSystemFileHandle === 'undefined' || typeof FileSystemFileHandle.prototype.createWritable !== 'function') return null
+    if (create && (typeof FileSystemFileHandle === 'undefined' || typeof FileSystemFileHandle.prototype.createWritable !== 'function')) return null
     const root = await navigator.storage.getDirectory()
     const dir = await root.getDirectoryHandle(OPFS_DIR, { create })
+    if (create) {
+      // createWritable() can exist and still be refused: probe it (a name of its own, so concurrent boots don't collide)
+      const probe = `probe-${Math.random().toString(36).slice(2)}`
+      await (await (await dir.getFileHandle(probe, { create: true })).createWritable()).abort()
+      await dir.removeEntry(probe).catch(() => {})
+    }
     return {
       backend: 'opfs',
       async read(key) {
@@ -176,7 +186,7 @@ export async function opfsStore(create = true): Promise<SnapshotStore | null> {
       close() {},
     }
   } catch {
-    return null // e.g. SecurityError in some private modes; NotFoundError without `create`
+    return null // e.g. SecurityError in some private modes, a refused probe; NotFoundError without `create`
   }
 }
 
@@ -320,8 +330,11 @@ export class VfsPersistence implements Persistence {
       console.warn(`[cresslet] VFS snapshot '${this.key}' not restored:`, e)
     }
     if (this.closed) return
-    const w = this.vfs.watch(this.dir, { recursive: true }, (_e, rel) => {
-      if (!isNodeModules(rel)) this.changed()
+    // from the root: removing or renaming an ancestor (`rm -rf /home`) changes the workdir too
+    const base = this.dir === '/' ? '' : this.dir
+    const w = this.vfs.watch('/', { recursive: true }, (_e, rel) => {
+      const abs = '/' + rel
+      if ((base + '/').startsWith(abs + '/') || (abs.startsWith(base + '/') && !isNodeModules(abs.slice(base.length + 1)))) this.changed()
     })
     this.stops.push(() => w.close())
     if (typeof addEventListener === 'function' && typeof document !== 'undefined') {
