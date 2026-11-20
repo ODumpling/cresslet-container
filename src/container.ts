@@ -645,6 +645,7 @@ export class Container {
         const dispose = opts.onlyPort !== undefined && port
         if (dispose) port.postMessage({ type: RELAY_DISPOSE })
         if (!dispose && !linger) return void (port?.close(), frame.remove())
+        // (this bounded wait may outlive teardown(): the frame goes up to DISPOSE_TIMEOUT later)
         link.gone = new Promise<void>((res) => {
           const done = () => (clearTimeout(t), port?.close(), frame.remove(), res())
           const t = setTimeout(done, dispose ? DISPOSE_TIMEOUT : 250)

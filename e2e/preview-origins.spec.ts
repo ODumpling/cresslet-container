@@ -251,7 +251,8 @@ test("teardown while a preview's relay is still registering its service worker s
   const requested = new Promise<void>((r) => (asked = r))
   let release!: () => void
   const released = new Promise<void>((r) => (release = r))
-  await ctx.route(/-3000\.localhost:4402\/cresslet-sw\.js/, async (route) => {
+  const SW_3000 = /-3000\.localhost:4402\/cresslet-sw\.js/
+  await ctx.route(SW_3000, async (route) => {
     asked()
     await released
     await route.continue()
@@ -280,7 +281,7 @@ test("teardown while a preview's relay is still registering its service worker s
   release()
   const origin = `http://${id}-3000.localhost:4402`
   await expect.poll(() => p.frames().filter((f) => f.url().includes('/cresslet-relay.html')).length, { timeout: 10_000 }).toBe(0)
-  await ctx.unroute(/cresslet-sw\.js/)
+  await ctx.unroute(SW_3000)
   await p.evaluate(
     (src) =>
       new Promise((resolve) => {
