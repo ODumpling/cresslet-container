@@ -24,9 +24,9 @@ export declare function relayUrl(previewOrigin: string, hostOrigin: string, opts
 /** `boot({ previewOrigins })`: the origin for one preview port (`port` 0: where the container's workers run). */
 export declare function expandOriginTemplate(template: string, instanceId: string, port: number): string;
 /**
- * Check a `previewOrigins` template: `{id}` and `{port}` once each in the host name, apart (something other than a
- * letter or digit between them, e.g. `{id}-{port}`, so no two containers or ports share an origin: ids are letters and
- * digits), and an http(s) origin with no path once they're filled in. Returns the error, or null.
+ * Check a `previewOrigins` template: `{id}` and `{port}` once each in an ASCII host name (letters, digits, `-`, `.`),
+ * apart (a `-` or `.` between them, e.g. `{id}-{port}`, so no two containers or ports share an origin: ids are letters
+ * and digits), and an http(s) origin with no path once they're filled in. Returns the error, or null.
  */
 export declare function originTemplateError(template: unknown): string | null;
 /**

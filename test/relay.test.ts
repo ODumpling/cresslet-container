@@ -410,6 +410,12 @@ describe('previewOrigins templates', () => {
       'https://{id}-{port}-{port}.preview.example.com',
       'https://{id}-{port}.preview.example.com:99999',
       'https://{id}-{port}.pre view.example.com',
+      'https://{id}%2D{port}.preview.example.com', // %31 / %2D decode in host names
+      'https://{id}%31{port}.preview.example.com',
+      'https://{id}\u2460{port}.preview.example.com', // IDNA maps ① to 1
+      'https://{id}\uff0d{port}.preview.example.com',
+      'https://{id}\u00ad{port}.preview.example.com', // soft hyphen: dropped
+      'https://{id}_{port}.preview.example.com',
     ])
       expect(originTemplateError(t), t).not.toBeNull()
     expect(originTemplateError(5)).not.toBeNull()
