@@ -322,6 +322,14 @@ describe('Container.boot({ previewOrigin })', () => {
     spawned.forEach((p) => p.close())
   })
 
+  it('never runs workers on the host origin when previews (and so the relay) are disabled', async () => {
+    vi.stubGlobal('fetch', async () => new Response('/* worker */'))
+    const c = await Container.boot({ previewOrigin: PREVIEW, serviceWorkerUrl: false, npmCache: false })
+    await expect(c.nodeChannel()).rejects.toThrow(/previews are disabled/)
+    await expect(c.projectWorker('https://studio.example.com/w.js')).rejects.toThrow(/previews are disabled/)
+    c.teardown()
+  })
+
   it('answers malformed (or misaddressed) requests from the relay with a 400 and closes the reply port', async () => {
     let relayPort!: MessagePort
     fakePage((port) => {

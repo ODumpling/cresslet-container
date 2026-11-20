@@ -2,6 +2,13 @@
 // sent through a blob: URL and answers requests. Reports what it can see of the host's storage.
 onmessage = ({ data }) => {
   if (data.type === 'throw') throw new Error('boom from the worker')
+  if (data.type === 'port') {
+    // answer on the port it was sent, and send one back
+    const { port1, port2 } = new MessageChannel()
+    data.port.postMessage({ pong: true, back: port2 }, [port2])
+    port1.onmessage = (e) => postMessage({ via: 'returned port', got: e.data })
+    return
+  }
   void answer(data)
 }
 

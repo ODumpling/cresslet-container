@@ -89,7 +89,7 @@ export function relayWorker(port: MessagePort, onClose: () => void): ProjectWork
   port.onmessage = (ev) => {
     const m = ev.data as { t?: unknown; data?: unknown; message?: unknown } | null
     if (closed || !m || typeof m !== 'object') return
-    if (m.t === 'msg') w.onmessage?.(new MessageEvent('message', { data: m.data }))
+    if (m.t === 'msg') w.onmessage?.(new MessageEvent('message', { data: m.data, ports: [...ev.ports] }))
     else if (m.t === 'error') w.onerror?.({ message: String(m.message).slice(0, 2000) })
   }
   return w

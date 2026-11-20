@@ -437,12 +437,14 @@ test.describe.serial('node on the preview origin', () => {
   })
 })
 
-test('the CSS worker (Tailwind v4) runs on the preview origin and the preview gets its styles', async ({ browser, browserName }) => {
+test('the CSS worker (Tailwind v4 + a PostCSS plugin) runs on the preview origin and the preview gets its styles', async ({ browser, browserName }) => {
   const origin = drivable(browserName)
   const page = await (await browser.newContext()).newPage()
   await bootBlank(page, origin)
   const files: Record<string, string> = {
-    'package.json': JSON.stringify({ name: 'tw', private: true, type: 'module', dependencies: { react: '^19.1.0', 'react-dom': '^19.1.0' }, devDependencies: { tailwindcss: '^4.1.0' } }),
+    'package.json': JSON.stringify({ name: 'tw', private: true, type: 'module', dependencies: { react: '^19.1.0', 'react-dom': '^19.1.0' }, devDependencies: { tailwindcss: '^4.1.0', postcss: '^8.5.0' } }),
+    // a project plugin that writes down where it ran
+    'postcss.config.js': "export default { plugins: [{ postcssPlugin: 'where', Once(root, { Rule, Declaration }) { root.append(new Rule({ selector: 'h1::after' }).append(new Declaration({ prop: 'content', value: JSON.stringify(String(globalThis.origin)) }))) } }] }\n",
     'index.html': '<!doctype html>\n<html><head><meta charset="utf-8" /></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>\n',
     'src/main.tsx': "import { createRoot } from 'react-dom/client'\nimport './index.css'\n\ncreateRoot(document.getElementById('root')!).render(<h1 className=\"text-brand\">Tailwind</h1>)\n",
     'src/index.css': '@import "tailwindcss";\n\n@theme {\n  --color-brand: rgb(10, 120, 30);\n}\n',
@@ -457,7 +459,9 @@ test('the CSS worker (Tailwind v4) runs on the preview origin and the preview ge
     f.src = server.url
     document.body.append(f)
   })
-  await expect(page.frameLocator('#frame').getByRole('heading', { name: 'Tailwind' })).toHaveCSS('color', 'rgb(10, 120, 30)')
+  const h1 = page.frameLocator('#frame').getByRole('heading', { name: 'Tailwind' })
+  await expect(h1).toHaveCSS('color', 'rgb(10, 120, 30)')
+  expect(await h1.evaluate((el) => getComputedStyle(el, '::after').content)).toBe(JSON.stringify(origin))
 })
 
 for (const mode of ['previewOrigin', 'same origin'] as const)
@@ -472,12 +476,21 @@ for (const mode of ['previewOrigin', 'same origin'] as const)
         const body = new Uint8Array(1000).buffer
         w.postMessage({ code: 'export default (n) => n * 2', n: 21, body }, [body])
       })
+      // MessagePorts pass through both ways
+      const ports = await new Promise((resolve) => {
+        const ch = new MessageChannel()
+        ch.port1.onmessage = (e) => {
+          e.data.back.postMessage('hi back')
+          w.onmessage = (e2) => resolve({ pong: e.data.pong, ...e2.data })
+        }
+        w.postMessage({ type: 'port', port: ch.port2 }, [ch.port2])
+      })
       const error = await new Promise<string>((resolve) => {
         w.onerror = (e) => resolve(e.message)
         w.postMessage({ type: 'throw' })
       })
       w.terminate()
-      return { reply, error }
+      return { reply, error, ports }
     })
     expect(got.reply).toEqual(
       mode === 'previewOrigin'
@@ -485,4 +498,5 @@ for (const mode of ['previewOrigin', 'same origin'] as const)
         : { origin: HOST, answer: 42, bytes: 1000, stores: ['files'], studioCache: true },
     )
     expect(got.error).toContain('boom from the worker')
+    expect(got.ports).toEqual({ pong: true, via: 'returned port', got: 'hi back' })
   })

@@ -136,14 +136,22 @@ function spawnProjectWorker(port: MessagePort, source: string, name?: string) {
     URL.revokeObjectURL(url)
     return fail(e instanceof Error ? e.message : String(e))
   }
-  worker.onmessage = (ev) => port.postMessage({ t: 'msg', data: ev.data })
+  // MessagePorts in a message must be transferred again on each hop
+  const forward = (to: { postMessage(m: unknown, t: Transferable[]): void }, m: unknown, ports: readonly MessagePort[]) => {
+    try {
+      to.postMessage(m, [...ports])
+    } catch (e) {
+      fail(e instanceof Error ? e.message : String(e))
+    }
+  }
+  worker.onmessage = (ev) => forward(port, { t: 'msg', data: ev.data }, ev.ports)
   worker.onerror = (e) => {
     e.preventDefault()
     fail(e.message || 'worker error')
   }
   port.onmessage = (ev) => {
     const m = ev.data as { t?: unknown; data?: unknown } | null
-    if (m?.t === 'msg') worker.postMessage(m.data)
+    if (m?.t === 'msg') forward(worker, m.data, ev.ports)
     else if (m?.t === 'terminate') {
       worker.terminate()
       URL.revokeObjectURL(url)

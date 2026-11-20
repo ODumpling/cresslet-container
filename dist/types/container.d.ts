@@ -105,6 +105,8 @@ export declare class Container {
     private relayPort;
     /** Whether the relay connected at boot (previews, and `node`, run on the preview origin). */
     private relayBooted;
+    /** The current relay connection once it's ready (set up its service worker and message handler), else rejected. */
+    private relayConn;
     /** The relay port the node worker script was last sent on. */
     private relayScriptPort;
     /** Kill switches of `node` processes and project workers running in the relay (they die with its document). */
@@ -154,20 +156,22 @@ export declare class Container {
     /**
      * Start a `node` worker: on the preview origin (run by the relay) when previews are served from a separate
      * `previewOrigin`, so project code there can't open this page's IndexedDB / Cache Storage; on this page otherwise.
+     * @internal
      */
     nodeChannel(): Promise<NodeChannel>;
     /**
      * Start a module Web Worker for project code (e.g. an app's server handler) where `node` runs: on the preview origin
      * when previews are served from a separate `previewOrigin` (the page fetches `url` and the relay runs it from a
      * `blob:` URL there, so its imports must be absolute URLs), else `new Worker(url, { type: 'module' })` on this page.
-     * Messages are structured-cloned (transfer lists apply to the hop from this page only); `onerror` gets `{ message }`.
+     * Messages are structured-cloned (MessagePorts are passed on; other transferables are copied after the first hop);
+     * `onerror` gets `{ message }`. With a `previewOrigin` it never falls back to this page's origin: it rejects when
+     * there's no relay (`serviceWorkerUrl: false`).
      */
     projectWorker(url: string | URL, opts?: {
         name?: string;
     }): Promise<ProjectWorker>;
-    /** Whether project workers run on the preview origin (a relay connected at boot). */
-    private onPreviewOrigin;
-    private connectedRelay;
+    /** The relay port to start workers on. Never falls back to this page's origin when there is a `previewOrigin`. */
+    private workerRelay;
     /**
      * A message the SW posts to the page that owns an instance (directly, or forwarded by the relay). `exclusive`: the
      * channel is this container's own (the relay port), so every request on it is ours to answer, if only with a 400;
