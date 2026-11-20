@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Container } from '../src/container'
 import { PortTable } from '../src/ports'
 import { acceptHello, acceptInit, expandOriginTemplate, isChannelName, isPageToSw, isProcSpawn, isSwToPage, isWorkerScript, newestWorker, originTemplateError, relayErrorText, relayUrl, toOrigin } from '../src/relay-protocol'
-import { decodeResult, encodeResult, HEADER, STATE_DONE, STATE_GROW, SyncReplier } from '../src/node/protocol'
+import { decodeResult, encodeResult, HEADER, listenPort, STATE_DONE, STATE_GROW, SyncReplier } from '../src/node/protocol'
 import { relayChannel } from '../src/node/channel'
 
 const HOST = 'https://studio.example.com'
@@ -786,5 +786,14 @@ describe('Container.boot({ previewOrigins })', () => {
     await tick()
     expect(events.at(-1)).toBe(3000)
     c.teardown()
+  })
+})
+
+describe('node http: listen() ports', () => {
+  it('coerces like Node, gives pipe paths an automatic port, and rejects bad ports', () => {
+    for (const [arg, port] of [[3000, 3000], ['3e3', 3000], ['0x1F', 31], [' 8080 ', 8080], [undefined, 0], [null, 0], ['', 0], [0, 0], ['/tmp/app.sock', 0], [{ port: 4000 }, 4000], [{ port: '4001' }, 4001], [{}, 0]] as const)
+      expect(listenPort(arg), String(arg)).toBe(port)
+    for (const arg of [-1, 1.5, 65536, 70000, '70000', '1.5', { port: -1 }, NaN])
+      expect(() => listenPort(arg), String(arg)).toThrow(expect.objectContaining({ code: 'ERR_SOCKET_BAD_PORT' }))
   })
 })

@@ -75,6 +75,19 @@ export type WorkerToMain =
   | { type: 'child-kill'; id: number; signal: string }
 
 // SAB layout: Int32 [0]=state, [1]=payload length; bytes from offset 8 = payload.
+/**
+ * The port `server.listen(first, …)` asks for (0: pick one). Strings are coerced as Node does ('3e3' is 3000); a string
+ * that isn't a number is a pipe path, which gets an automatic port here (no sockets). A bad port throws
+ * ERR_SOCKET_BAD_PORT, as in Node.
+ */
+export function listenPort(first: unknown): number {
+  let port = first && typeof first === 'object' ? Number((first as { port?: number }).port ?? 0) : Number(first ?? 0)
+  if (typeof first === 'string' && Number.isNaN(port)) port = 0
+  if (!Number.isInteger(port) || port < 0 || port > 65535)
+    throw Object.assign(new RangeError(`options.port should be >= 0 and < 65536. Received ${String(first)}.`), { code: 'ERR_SOCKET_BAD_PORT' })
+  return port
+}
+
 export const HEADER = 8
 export const STATE_IDLE = 0
 export const STATE_DONE = 1

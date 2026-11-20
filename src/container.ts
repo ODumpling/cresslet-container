@@ -696,7 +696,7 @@ export class Container {
             settle(e)
             // an open preview's relay went quiet: say so (an opening waiting on it reports it itself)
             const p = opts.onlyPort
-            if (p !== undefined && booted && link.conn === conn && !this.opening.has(p) && !this.torndown) this.emit('error', { message: `port ${p}: ${e.message}` })
+            if (p !== undefined && booted && link.conn === conn && this.ports.has(p) && !this.opening.has(p) && !this.torndown) this.emit('error', { message: `port ${p}: ${e.message}` })
           }, RELAY_TIMEOUT)
           settle = (e) => {
             clearTimeout(t)
