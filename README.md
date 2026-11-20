@@ -36,7 +36,7 @@ Install: `pnpm add github:ODumpling/cresslet-container` (dist is committed) or l
 ## API
 
 ```ts
-const c = await Container.boot({ serviceWorkerUrl?, esbuildWasmUrl?, brotliWasmUrl?, registry?, workdir? /* '/home/project' */, npmCache? /* true, or { maxBytes } */, previewOrigin? /* e.g. 'https://preview.example.com' */ })
+const c = await Container.boot({ serviceWorkerUrl?, esbuildWasmUrl?, brotliWasmUrl?, registry?, workdir? /* '/home/project' */, npmCache? /* true, or { maxBytes } */, previewOrigin? /* e.g. 'https://preview.example.com' */, persist? /* off; true, or { key?, debounceMs?, maxWrites? } */ })
 c.workdir; c.instanceId
 c.fs.readFile(p, 'utf8'?) / writeFile(p, data) /* mkdir -p */ / readdir(p, { withFileTypes? }) / mkdir / rm / rename / stat / exists
 c.fs.watch(p, { recursive? }, (event: 'change' | 'rename', filename) => {}) // { close() }
@@ -59,6 +59,24 @@ Notes:
 - `spawn('jsh')` with no args is an interactive shell for xterm.js (raw keystrokes in, `\r\n` out, Ctrl+C kills the foreground job). Other commands emit `\n`.
 - `servePort` handlers receive `Request` with URL `http://localhost:<port>/<path>`.
 - `bundle` with `platform: 'node' | 'neutral'` keeps `node:*`/`npm:`/`jsr:` imports external; `external` globs and `packages: 'external'` are honoured.
+
+### Persistence
+
+`boot({ persist: { key: 'project-42' } })` keeps the workdir across reloads. It's off by default.
+
+```ts
+const c = await Container.boot({ persist: { key: projectId } })
+if (!c.persistence?.restored) await c.mount(template) // first visit: nothing to restore
+// c.persistence: { key, backend: 'opfs' | 'indexeddb' | null, restored, flush(), clear() }
+await Container.clearPersisted(projectId) // delete a snapshot without booting (e.g. project deleted)
+```
+
+- **What's saved:** everything under `workdir` (files, empty dirs, symlinks, file and directory mtimes) except `node_modules` at any depth. After a restore, run `npm install` again: packages still in the [npm cache](#commands) aren't downloaded again. Nothing outside `workdir` (`/tmp`, `/home`) is saved.
+- **When:** a snapshot of the whole workdir is written `debounceMs` (default 1000) after the last change, or as soon as `maxWrites` (default 100) changes are pending, so a steady stream of writes still gets saved. Pending changes are also written on teardown and when the page is hidden; that write is best effort, since the browser may close the page before it finishes. `await c.persistence?.flush()` writes now (or waits for the write in progress) and rejects if storing fails. Background writes that fail emit `error` events (on teardown, a console warning). A failed write's changes stay pending, so the next change, `flush()` or teardown tries again. Changes made while a write is in progress go into one follow-up write. Only changes the VFS reports count: an mtime-only update (`touch` on an existing file) is saved with the next change.
+- **Where:** one file per key in OPFS (`cresslet-vfs/<key>.snap`), written through a writable stream so a new snapshot replaces the old one atomically. Where OPFS can't be written from the page (no `createWritable`, or blocked as in some private modes), snapshots go to IndexedDB (`cresslet-vfs` database, one record per key). `backend` is `null` when neither works; persistence is then off and `restored` is `false`.
+- **Restore:** `boot` loads the key's snapshot into `workdir` before it resolves. `restored` tells you if it did. It also checks the other backend for a copy saved while the one in use wasn't writable (OPFS before a browser update, or while it was blocked) and restores whichever is newer; the first save then deletes the other copy. To reboot the same key in the same page, `await c.persistence?.flush()` before `teardown()`, since teardown's own write isn't awaited. A snapshot that can't be read or is corrupt is skipped with a console warning, and the next save replaces it.
+- **Clearing:** `c.persistence.clear()` drops pending changes and deletes the key's snapshot from both backends. It rejects if a delete fails; a backend the browser won't open at all right now (storage blocked) is skipped, since the page can't reach it either. Later changes are saved again. `Container.clearPersisted(key?)` does the same without a container; containers on the page still using the key (or still saving it after teardown) drop their pending changes, and the delete runs after their queued saves. Don't clear a key while a container with that key is still booting: it may restore the snapshot being deleted.
+- **Keys:** `persist: true` uses key `'default'`. Containers that share a key share one snapshot, and the last save wins. That includes two tabs of the same project, so give each project its own key.
 
 ## Previews
 
@@ -144,7 +162,7 @@ Parses `index.html`, bundles each `<script type="module" src>` and local stylesh
 - `npm`: no lockfile-driven installs, no workspaces, no git/file deps, no lifecycle scripts. The package cache is cleared with `indexedDB.deleteDatabase('cresslet-npm')`; the browser may also evict it.
 - Without `previewOrigin`, previews and `node` share the host origin (and its storage); a preview at `/` and a host page at `/` can't be told apart on a *top-level* reload. Manual reload of a preview frame after `pushState` is best-effort in WebKit.
 - With a cross-site `previewOrigin` (or in WebKit), previews work in frames of the host page only, not as top-level tabs (see [Separate preview origin](#separate-preview-origin)).
-- In-memory only: the VFS is lost on reload (persist with `export()`/`mount()`).
+- The VFS is in memory: it's lost on reload unless you opt into [persistence](#persistence), which saves the workdir only (not `node_modules`, `/tmp` or `/home`). Snapshots are whole-workdir, so very large projects take longer to save. The browser may evict OPFS / IndexedDB data under storage pressure unless the host calls `navigator.storage.persist()`.
 
 ## Architecture
 
@@ -166,14 +184,14 @@ host page ───────────────────────�
 ```sh
 pnpm install
 pnpm build       # dist/: cresslet-container.js, node-worker.js, cresslet-sw.js, cresslet-relay.{html,js}, index.d.ts (+ types/)
-pnpm test        # vitest: VFS, parser, resolver/hoisting, tar, html, module resolution, relay message validation, CSS scanning + worker (real tailwindcss/postcss/autoprefixer/sass/less), zlib/child_process host side
+pnpm test        # vitest: VFS, parser, resolver/hoisting, tar, html, module resolution, relay message validation, CSS scanning + worker (real tailwindcss/postcss/autoprefixer/sass/less), zlib/child_process host side, VFS snapshots
 pnpm test:e2e    # Playwright (chromium); test:e2e:all adds firefox + webkit
 pnpm demo        # http://localhost:4400 (+ preview origin http://127.0.0.1:4401)
 ```
 
 ## Roadmap
 
-VFS persistence (IndexedDB/OPFS snapshots; the npm cache already persists), `import.meta.hot` API + non-React HMR, lockfile-driven installs + workspaces, real Node via WASM for big CLIs, per-preview origins.
+`import.meta.hot` API + non-React HMR, lockfile-driven installs + workspaces, real Node via WASM for big CLIs, per-preview origins.
 
 ## License
 
