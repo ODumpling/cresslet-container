@@ -229,3 +229,36 @@ test('the dev server (HMR, live updates) works on a per-preview origin', async (
   // fast refresh kept the state: the update came over this preview's own relay
   await expect(f.getByRole('button', { name: 'count is 1' })).toBeVisible()
 })
+
+test("teardown while a preview's relay is still setting up still unregisters its service worker", async ({ browser }) => {
+  const p = await (await browser.newContext()).newPage()
+  p.on('pageerror', (e) => console.log('[pageerror]', e.message))
+  await p.goto(`${HOST}/demo/blank.html`)
+  const id = await p.evaluate(async (previewOrigins) => {
+    const { Container } = await import('/dist/cresslet-container.js')
+    const c = await Container.boot({ previewOrigins })
+    let ready = false
+    c.on('server-ready', () => void (ready = true))
+    c.servePort(3000, () => new Response('A'))
+    // once the relay frame has loaded (it registers its service worker next), before it's ready
+    const relay = [...document.querySelectorAll('iframe')].find((f) => f.src.includes('-3000.'))!
+    await new Promise((r) => relay.addEventListener('load', r, { once: true }))
+    if (ready) throw new Error('relay was ready before teardown: the test raced')
+    c.teardown()
+    return c.instanceId
+  }, TEMPLATE)
+  const origin = `http://${id}-3000.localhost:4402`
+  await expect.poll(() => p.frames().filter((f) => f.url().includes('/cresslet-relay.html')).length).toBe(0)
+  await p.evaluate(
+    (src) =>
+      new Promise((resolve) => {
+        const f = document.createElement('iframe')
+        f.name = 'probe'
+        f.src = src
+        f.onload = resolve
+        document.body.appendChild(f)
+      }),
+    `${origin}/blank.html`,
+  )
+  expect(await p.frame({ name: 'probe' })!.evaluate(async () => (await navigator.serviceWorker.getRegistrations()).length)).toBe(0)
+})

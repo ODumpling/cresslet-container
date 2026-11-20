@@ -61,7 +61,8 @@ export function expandOriginTemplate(template: string, instanceId: string, port:
 /**
  * Check a `previewOrigins` template: `{id}` and `{port}` once each in an ASCII host name (letters, digits, `-`, `.`),
  * apart (a `-` or `.` between them, e.g. `{id}-{port}`, so no two containers or ports share an origin: ids are letters
- * and digits), and an http(s) origin with no path once they're filled in. Returns the error, or null.
+ * and digits), not in the last label (which mustn't be numeric: IPv4), and an http(s) origin with no path once they're
+ * filled in. Returns the error, or null.
  */
 export function originTemplateError(template: unknown): string | null {
   if (typeof template !== 'string') return 'must be a string'
@@ -74,6 +75,9 @@ export function originTemplateError(template: unknown): string | null {
   if (!/^[a-z0-9.-]*$/i.test(host.replace('{id}', '').replace('{port}', ''))) return 'may only use ASCII letters, digits, "-" and "." in its host name (besides {id} and {port})'
   const i = host.indexOf('{id}')
   const j = host.indexOf('{port}')
+  // a last label with a placeholder could come out all digits (ids can be), and then parse as an IPv4 address
+  const last = host.replace(/\.$/, '').split('.').pop()!
+  if (last.includes('{') || /^(\d+|0x[0-9a-f]*)$/i.test(last)) return 'must end its host name in a fixed, non-numeric label (e.g. .com)'
   if (!/[^a-z0-9]/i.test(i < j ? host.slice(i + 4, j) : host.slice(j + 6, i))) return 'must separate {id} and {port} with something other than a letter or digit (e.g. {id}-{port})'
   for (const [id, port] of [['a0', 1], ['zz9zz9zz', 65535], ['zz9zz9zz', 0]] as const) {
     const s = expandOriginTemplate(template, id, port)

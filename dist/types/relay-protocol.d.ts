@@ -26,7 +26,8 @@ export declare function expandOriginTemplate(template: string, instanceId: strin
 /**
  * Check a `previewOrigins` template: `{id}` and `{port}` once each in an ASCII host name (letters, digits, `-`, `.`),
  * apart (a `-` or `.` between them, e.g. `{id}-{port}`, so no two containers or ports share an origin: ids are letters
- * and digits), and an http(s) origin with no path once they're filled in. Returns the error, or null.
+ * and digits), not in the last label (which mustn't be numeric: IPv4), and an http(s) origin with no path once they're
+ * filled in. Returns the error, or null.
  */
 export declare function originTemplateError(template: unknown): string | null;
 /**

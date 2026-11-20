@@ -52,6 +52,8 @@ export declare class PortTable {
     /** Origin previews (`port`'s, with per-preview origins: then `port` is required) are served from. */
     origin(port?: number): string;
     url(port: number): string;
+    /** Throws a RangeError for a port previews can't use (per-preview origins: 1-65535; {port} 0 is the workers' origin). */
+    checkPort(port: number): void;
     open(port: number, handler: PortHandler, owner?: string): string;
     close(port: number): void;
     has(port: number): boolean;

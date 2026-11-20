@@ -39,6 +39,7 @@ const JS = { 'content-type': 'text/javascript; charset=utf-8', ...NO_CACHE }
 export async function createDevServer(c: Container, o: DevServerOptions = {}): Promise<DevServerHandle> {
   const root = normalize(o.root ? (o.root.startsWith('/') ? o.root : join(c.workdir, o.root)) : c.workdir)
   const port = o.port ?? c.ports.free(5173)
+  c.ports.checkPort?.(port) // before anything needs closing (test doubles may not have it)
   const channelName = `cresslet:${c.instanceId}:${port}`
   const bc = c.previewChannel(channelName)
   const vfs = c.vfs

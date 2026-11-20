@@ -387,7 +387,7 @@ describe('Container.boot({ previewOrigin })', () => {
 })
 
 describe('previewOrigins templates', () => {
-  it('accepts origins with {id} and {port} in the host (or port)', () => {
+  it('accepts origins with {id} and {port} apart in the host name', () => {
     for (const t of ['https://{id}-{port}.preview.example.com', 'http://{id}-{port}.localhost:4402', 'https://{port}.{id}.preview.example/', 'https://p-{id}--x{port}.example'])
       expect(originTemplateError(t), t).toBeNull()
     expect(expandOriginTemplate('https://{id}-{port}.preview.example.com', 'abc123', 5173)).toBe('https://abc123-5173.preview.example.com')
@@ -416,6 +416,10 @@ describe('previewOrigins templates', () => {
       'https://{id}\uff0d{port}.preview.example.com',
       'https://{id}\u00ad{port}.preview.example.com', // soft hyphen: dropped
       'https://{id}_{port}.preview.example.com',
+      'https://{port}.{id}', // an all-digit id would make it an IPv4 address
+      'https://{id}.{port}',
+      'https://{id}-{port}.preview.123',
+      'https://{id}-{port}.preview.0x1f.',
     ])
       expect(originTemplateError(t), t).not.toBeNull()
     expect(originTemplateError(5)).not.toBeNull()
@@ -592,16 +596,39 @@ describe('Container.boot({ previewOrigins })', () => {
     await tick()
     relays[1].postMessage({ type: 'cresslet-relay-error', message: 'registration failed' })
     await tick()
+    expect(events.slice(1)).toEqual([{ message: 'preview relay: registration failed' }])
+    // the next open replaces the broken relay at once
     c.servePort(3000, () => new Response('A'))
     await tick()
-    expect(events.slice(1)).toEqual([{ message: 'preview relay: registration failed' }, { message: 'port 3000: preview relay: registration failed' }])
     expect(page.frames[1].removed).toBe(1)
-    c.servePort(3000, () => new Response('A')) // same handler re-registered: no new open
-    c.ports.close(3000)
-    c.servePort(3000, () => new Response('A'))
+    expect(page.frames).toHaveLength(3)
+    expect(events.slice(2)).toEqual([3000])
+    c.teardown()
+    relays.forEach((p) => p.close())
+  })
+
+  it('an opening waiting on a reconnect follows the relay when it reloads again, rather than failing at the old deadline', async () => {
+    const relays: MessagePort[] = []
+    const page = fakePage((origin, port) => {
+      const n = origin.includes('-3000.') ? relays.push(port) : 0
+      if (n !== 2) port.postMessage({ type: 'cresslet-relay-ready' }) // connection 2 never gets ready
+    })
+    const c = await Container.boot({ previewOrigins: TEMPLATE, npmCache: false })
+    const events: unknown[] = []
+    c.on('error', (e) => events.push(e))
+    c.on('server-ready', (p) => events.push(p))
+    c.servePort(3000, () => new Response('A')).close()
     await tick()
-    expect(page.frames).toHaveLength(3) // a new relay for 3000
-    expect(events.at(-1)).toBe(3000)
+    const hello = { origin: new URL(page.frames[1].src).origin, source: page.frames[1].contentWindow, data: { type: 'cresslet-relay-hello' } }
+    page.listeners.forEach((fn) => fn(hello)) // reload: connection 2
+    await tick()
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    c.servePort(3000, () => new Response('A')) // waits on connection 2
+    page.listeners.forEach((fn) => fn(hello)) // reload again: connection 3 gets ready
+    await vi.advanceTimersByTimeAsync(25_000) // past connection 2's deadline
+    vi.useRealTimers()
+    expect(events).toEqual([3000])
+    expect(page.frames).toHaveLength(2)
     c.teardown()
     relays.forEach((p) => p.close())
   })
