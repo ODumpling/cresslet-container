@@ -21,6 +21,7 @@ vi.mock('../src/esbuild', async (orig) => {
   return { ...m, loadEsbuild: async () => es }
 })
 const { createDevServer } = await import('../src/dev/server')
+type CssBackend = import('../src/css/pipeline').CssBackend
 
 const ROOT = '/__cresslet_test__/p'
 let n = 0
@@ -31,10 +32,11 @@ afterEach(() => {
 })
 
 type Msg = { type: string; updates?: { kind: string; url: string }[] }
-async function devServer(files: Record<string, string>) {
+const noCss = { restart() {}, process: async () => { throw new Error('no CSS worker in this test') } }
+async function devServer(files: Record<string, string>, o: { deps?: Record<string, string>; css?: CssBackend } = {}) {
   const vfs = new VFS()
   const write = (p: string, s: string) => vfs.writeFile(join(ROOT, p), s, { mkdirp: true })
-  write('package.json', JSON.stringify({ dependencies: { react: '*', 'react-dom': '*' } }))
+  write('package.json', JSON.stringify({ dependencies: { react: '*', 'react-dom': '*', ...o.deps } }))
   for (const [p, s] of Object.entries(files)) write(p, s)
   let handler!: (r: Request) => Promise<Response>
   const id = `t${++n}`
@@ -45,6 +47,7 @@ async function devServer(files: Record<string, string>) {
     esbuildWasmUrl: '',
     resolveFs: { isFile: (p: string) => vfs.isFile(p), isDir: (p: string) => vfs.isDir(p), readText: (p: string) => vfs.tryReadText(p) },
     previewChannel: (name: string) => new BroadcastChannel(name),
+    cssWorker: () => o.css ?? noCss,
     ports: { free: () => 5173, open: (_p: number, h: typeof handler) => ((handler = h), 'http://localhost/'), close() {} },
   }
   const server = await createDevServer(c as never, {})
@@ -392,3 +395,280 @@ describe('dev server HMR', () => {
     expect(code).not.toContain('"v1"')
   })
 })
+
+describe('dev server CSS processing', () => {
+  /** Stands in for Tailwind: emits the known utility candidates it was given; `BROKEN` in the CSS fails like a plugin. */
+  const fakeTailwind = () => {
+    const calls: string[][] = []
+    const backend: CssBackend = {
+      restart() {},
+      async process(r) {
+        if (r.css.includes('BROKEN')) throw new Error('[postcss-fake] boom in ' + r.file)
+        calls.push(r.candidates)
+        const utils = r.candidates.filter((c) => /^(flex|underline|grid)$/.test(c)).sort()
+        return { css: utils.map((u) => `.${u}{}`).join('\n'), deps: [], dirs: [], warnings: [], tailwind: [{ root: null, sources: [] }] }
+      },
+    }
+    return { backend, calls }
+  }
+  const files = { 'src/main.ts': "import './index.css'\nimport App from './App'\n", 'src/App.tsx': comp('App', 'return "flex"'), 'src/index.css': '@import "tailwindcss";\n' }
+
+  it('Tailwind: a source edit that adds classes hot-updates the stylesheet too; one that does not, only the component', async () => {
+    const tw = fakeTailwind()
+    const s = await devServer(files, { deps: { tailwindcss: '^4' }, css: tw.backend })
+    await s.get('/src/main.ts')
+    await s.get('/src/App.tsx')
+    expect(await s.get('/src/index.css?import')).toMatch(/\.flex \{/)
+    s.write('src/App.tsx', comp('App', 'return "flex underline"'))
+    expect(upd(await s.next())).toEqual(expect.arrayContaining(['/src/index.css?import', '/src/App.tsx']))
+    const css = await s.get('/src/index.css?import&t=1')
+    expect(css).toMatch(/\.underline \{/)
+    s.write('src/App.tsx', comp('App', 'return "underline flex"'))
+    expect(upd(await s.next())).toEqual(['/src/App.tsx'])
+  })
+
+  it('non-CSS deps (configs) and content dirs (PostCSS dir-dependency, e.g. Tailwind v3) re-serve the stylesheet', async () => {
+    const ROOT_ = '/__cresslet_test__/p'
+    const backend: CssBackend = {
+      restart() {},
+      process: async (r) => ({ css: 'a{}', deps: [ROOT_ + '/tailwind.config.js', ROOT_ + '/src/theme.css', ROOT_ + '/src/App.tsx'], dirs: [ROOT_ + '/src/pages'], warnings: [], tailwind: [] }),
+    }
+    const s = await devServer({ ...files, 'postcss.config.js': 'export default {}', 'tailwind.config.js': 'export default {}', 'src/theme.css': 'b{}', 'src/pages/Home.tsx': comp('Home') }, { css: backend })
+    await s.get('/src/main.ts')
+    await s.get('/src/App.tsx')
+    await s.get('/src/index.css?import')
+    s.write('src/pages/Home.tsx', comp('Home', 'return "x"'))
+    expect(upd(await s.next())).toEqual(['/src/index.css?import'])
+    s.write('tailwind.config.js', 'export default { x: 1 }')
+    expect(upd(await s.next())).toEqual(['/src/index.css?import'])
+    s.write('src/theme.css', 'b{color:red}')
+    expect(upd(await s.next())).toEqual(['/src/index.css?import'])
+    // a script dep doesn't become a CSS node: App still fast-refreshes as JS, and re-serves the stylesheet
+    s.write('src/App.tsx', comp('App', 'return "y"'))
+    const m = await s.next()
+    expect(m.updates).toEqual(expect.arrayContaining([expect.objectContaining({ kind: 'js', url: '/src/App.tsx' }), expect.objectContaining({ kind: 'css', url: '/src/index.css?import' })]))
+  })
+
+  it('plain CSS in a Tailwind project skips the worker; projects without Tailwind/PostCSS never use it', async () => {
+    const tw = fakeTailwind()
+    const s = await devServer({ 'src/a.css': 'b { color: red }\n' }, { deps: { tailwindcss: '^4' }, css: tw.backend })
+    expect(await s.get('/src/a.css?import')).toContain('color: red')
+    const t = await devServer({ 'src/b.css': '@import "tailwindcss";\n' })
+    expect(await t.get('/src/b.css?import')).toContain('tailwindcss') // untouched (no worker)
+    expect(tw.calls).toHaveLength(0)
+  })
+
+  it('processing errors reach the overlay: imported CSS throws in its module, <link> CSS posts the error; fixing it hot-updates', async () => {
+    const tw = fakeTailwind()
+    const s = await devServer({ ...files, 'src/index.css': '@import "tailwindcss";\n/* BROKEN */\n' }, { deps: { tailwindcss: '^4' }, css: tw.backend })
+    expect(await s.get('/src/index.css?import')).toContain('boom in')
+    const next = s.next()
+    expect(await s.get('/src/index.css')).toContain('boom in')
+    expect(await next).toMatchObject({ type: 'error' })
+    expect(await s.get('/@cresslet/last-error')).toContain('[postcss-fake] boom')
+    s.write('src/index.css', '@import "tailwindcss";\n')
+    expect(upd(await s.next())).toEqual(['/src/index.css?import'])
+    expect(await s.get('/src/index.css?import&t=1')).toMatch(/\.flex \{/)
+  })
+
+  it('a class added to index.html (full reload) is in the stylesheet the reloaded page gets, and so is one added before it asks', async () => {
+    const tw = fakeTailwind()
+    const s = await devServer({ ...files, 'index.html': '<div id="root"></div><script type="module" src="/src/main.ts"></script>' }, { deps: { tailwindcss: '^4' }, css: tw.backend })
+    for (const p of ['/', '/src/main.ts', '/src/App.tsx']) await s.get(p)
+    expect(await s.get('/src/index.css?import')).not.toMatch(/\.underline/)
+    s.write('index.html', '<p class="underline">x</p><div id="root"></div><script type="module" src="/src/main.ts"></script>')
+    expect(upd(await s.next())).toBe('reload')
+    // the reloaded page hasn't requested the stylesheet yet (nothing tracks it): a source edit still counts
+    s.write('src/App.tsx', comp('App', 'return "flex grid"'))
+    await s.quiet()
+    const css = await s.get('/src/index.css?import')
+    expect(css).toMatch(/\.underline \{/)
+    expect(css).toMatch(/\.grid \{/)
+  })
+
+  /** fakeTailwind whose candidate builds (`all`: every request) wait while `hold` is set. */
+  const holdable = (all = false) => {
+    const tw = fakeTailwind()
+    const g = { hold: null as Promise<void> | null, builds: 0 }
+    const backend: CssBackend = {
+      restart() {},
+      async process(r) {
+        if (all || !r.discover) {
+          g.builds++
+          if (g.hold) await g.hold
+        }
+        return tw.backend.process(r)
+      },
+    }
+    const holdNext = () => {
+      let release!: () => void
+      g.hold = new Promise((r) => (release = r))
+      const builds = g.builds
+      return {
+        started: async () => {
+          while (g.builds === builds) await new Promise((r) => setTimeout(r, 5))
+        },
+        release: () => ((g.hold = null), release()),
+      }
+    }
+    return { backend, holdNext, g }
+  }
+
+  it('a class added while the first stylesheet build is in flight is in what it serves', async () => {
+    const h = holdable()
+    const s = await devServer(files, { deps: { tailwindcss: '^4' }, css: h.backend })
+    await s.get('/src/main.ts')
+    await s.get('/src/App.tsx')
+    const held = h.holdNext()
+    const css = s.get('/src/index.css?import')
+    await held.started()
+    s.write('src/App.tsx', comp('App', 'return "flex underline"'))
+    await new Promise((r) => setTimeout(r, 100))
+    held.release()
+    expect(await css).toMatch(/\.underline \{/)
+  })
+
+  it('a stylesheet edited during its first in-flight build is rebuilt, not lost (and no reload)', async () => {
+    let builds = 0
+    let hold: Promise<void> | null = null
+    const backend: CssBackend = {
+      restart() {},
+      async process(r) {
+        if (!r.discover && hold && builds++ === 0) await hold
+        return { css: r.css.includes('v2') ? '.v2{}' : '.v1{}', deps: [], dirs: [], warnings: [], tailwind: [{ root: null, sources: [] }] }
+      },
+    }
+    const s = await devServer({ ...files, 'src/index.css': '@import "tailwindcss";\n/* v1 */\n' }, { deps: { tailwindcss: '^4' }, css: backend })
+    await s.get('/src/main.ts')
+    let release!: () => void
+    hold = new Promise((r) => (release = r))
+    const css = s.get('/src/index.css?import')
+    while (!builds) await new Promise((r) => setTimeout(r, 5))
+    s.write('src/index.css', '@import "tailwindcss";\n/* v2 */\n')
+    const msgs = s.quiet()
+    await new Promise((r) => setTimeout(r, 100))
+    release()
+    expect(await css).toContain('.v2')
+    expect((await msgs).map(upd)).not.toContain('reload')
+  })
+
+  it('<link> CSS errors: cleared by a full reload and when the file is deleted; a build from the previous page does not report', async () => {
+    const h = holdable(true)
+    const s = await devServer({ ...files, 'index.html': '<link rel="stylesheet" href="/src/index.css">', 'src/index.css': '@import "tailwindcss";\n/* BROKEN */\n' }, { deps: { tailwindcss: '^4' }, css: h.backend })
+    const e1 = s.next()
+    await s.get('/src/index.css')
+    expect(await e1).toMatchObject({ type: 'error' })
+    expect(await s.get('/@cresslet/last-error')).toContain('boom')
+    s.write('index.html', '<link rel="stylesheet" href="/src/index.css"> ')
+    expect(upd(await s.next())).toBe('reload')
+    expect(await s.get('/@cresslet/last-error')).toBe('')
+    // a failing build still in flight when the page reloads: its error isn't the new page's
+    const held = h.holdNext()
+    const css = s.get('/src/index.css')
+    await held.started()
+    s.write('index.html', '<link rel="stylesheet" href="/src/index.css">  ')
+    expect(upd(await s.next())).toBe('reload')
+    held.release()
+    await css
+    expect(await s.get('/@cresslet/last-error')).toBe('')
+    const e2 = s.next()
+    await s.get('/src/index.css')
+    expect(await e2).toMatchObject({ type: 'error' })
+    expect(await s.get('/@cresslet/last-error')).toContain('boom')
+    s.rm('src/index.css')
+    await s.next()
+    expect(await s.get('/@cresslet/last-error')).toBe('')
+  })
+
+  it('a failed build records what it tried to read: creating a missing @import / @config target hot-updates the stylesheet', async () => {
+    const ROOT_ = '/__cresslet_test__/p'
+    const exists = { css: false, config: false }
+    const backend: CssBackend = {
+      restart() {},
+      async process() {
+        if (!exists.css || !exists.config) throw Object.assign(new Error("Can't resolve './missing.css'"), { deps: [ROOT_ + '/src/missing.css', ROOT_ + '/tailwind.config.js'] })
+        return { css: '.ok{}', deps: [ROOT_ + '/src/missing.css', ROOT_ + '/tailwind.config.js'], dirs: [], warnings: [], tailwind: [] }
+      },
+    }
+    const s = await devServer({ ...files, 'src/index.css': '@import "tailwindcss";\n@import "./missing.css";\n@config "../tailwind.config.js";\n' }, { deps: { tailwindcss: '^4' }, css: backend })
+    await s.get('/src/main.ts')
+    expect(await s.get('/src/index.css?import')).toContain("Can't resolve")
+    exists.css = true
+    s.write('src/missing.css', '.m{}')
+    expect(upd(await s.next())).toEqual(['/src/index.css?import'])
+    expect(await s.get('/src/index.css?import&t=1')).toContain("Can't resolve")
+    exists.config = true
+    s.write('tailwind.config.js', 'export default {}')
+    expect(upd(await s.next())).toEqual(['/src/index.css?import'])
+    expect(await s.get('/src/index.css?import&t=2')).toContain('.ok')
+  })
+
+  it('a failing <link> build in flight when its directory is deleted does not report afterwards', async () => {
+    const h = holdable(true)
+    const s = await devServer({ ...files, 'index.html': '<link rel="stylesheet" href="/src/styles/index.css">', 'src/styles/index.css': '@import "tailwindcss";\n/* BROKEN */\n' }, { deps: { tailwindcss: '^4' }, css: h.backend })
+    const held = h.holdNext()
+    const css = s.get('/src/styles/index.css')
+    await held.started()
+    s.rm('src/styles')
+    held.release()
+    await css
+    await s.quiet()
+    expect(await s.get('/@cresslet/last-error')).toBe('')
+  })
+
+  it('a failing <link> build in flight when the stylesheet itself is deleted does not report afterwards', async () => {
+    const h = holdable(true)
+    const s = await devServer({ ...files, 'index.html': '<link rel="stylesheet" href="/src/index.css">', 'src/index.css': '@import "tailwindcss";\n/* BROKEN */\n' }, { deps: { tailwindcss: '^4' }, css: h.backend })
+    const held = h.holdNext()
+    const css = s.get('/src/index.css')
+    await held.started()
+    s.rm('src/index.css')
+    held.release()
+    await css
+    expect((await s.quiet()).filter((m) => m.type === 'error')).toEqual([])
+    expect(await s.get('/@cresslet/last-error')).toBe('')
+  })
+
+  it('a failed CSS Module keeps what it tried to read: creating the missing @import updates its importer', async () => {
+    const ROOT_ = '/__cresslet_test__/p'
+    let exists = false
+    const backend: CssBackend = {
+      restart() {},
+      async process() {
+        if (!exists) throw Object.assign(new Error("Can't resolve './missing.css'"), { deps: [ROOT_ + '/src/missing.css'] })
+        return { css: '.ok{}', deps: [ROOT_ + '/src/missing.css'], dirs: [], warnings: [], tailwind: [] }
+      },
+    }
+    const s = await devServer({ 'src/main.ts': "import App from './App'\n", 'src/App.tsx': comp('App', 'return s.ok', "import s from './a.module.css'"), 'src/a.module.css': '@import "./missing.css";\n.ok { color: red }\n', 'postcss.config.js': 'module.exports = {}' }, { css: backend })
+    await s.get('/src/main.ts')
+    await s.get('/src/App.tsx')
+    expect(await s.get('/src/a.module.css?import')).toContain("Can't resolve")
+    exists = true
+    s.write('src/missing.css', '.m{}')
+    expect(upd(await s.next())).not.toEqual([])
+  })
+
+  it('<link> CSS errors are cleared when a directory holding the stylesheet is deleted', async () => {
+    const tw = fakeTailwind()
+    const s = await devServer({ ...files, 'index.html': '<link rel="stylesheet" href="/src/styles/index.css">', 'src/styles/index.css': '/* BROKEN */\n', 'postcss.config.js': 'module.exports = {}' }, { css: tw.backend })
+    const e = s.next()
+    await s.get('/src/styles/index.css')
+    expect(await e).toMatchObject({ type: 'error' })
+    expect(await s.get('/@cresslet/last-error')).toContain('boom')
+    s.rm('src/styles')
+    await s.quiet()
+    expect(await s.get('/@cresslet/last-error')).toBe('')
+  })
+
+  it('closing the dev server releases its CSS worker state', async () => {
+    const tw = fakeTailwind()
+    const released: string[] = []
+    const sessions = new Set<string>()
+    const backend: CssBackend = { ...tw.backend, process: (r) => (sessions.add(r.session!), tw.backend.process(r)), release: (x) => void released.push(x) }
+    const s = await devServer(files, { deps: { tailwindcss: '^4' }, css: backend })
+    await s.get('/src/index.css?import')
+    for (const x of servers.splice(0)) x.close()
+    expect(released).toEqual([...sessions])
+  })
+})
+

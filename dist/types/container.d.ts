@@ -7,6 +7,7 @@ import { type ResolveFs } from './resolve';
 import { type BuildOptions as EsbuildOptions } from './esbuild';
 import { type DevServerHandle, type DevServerOptions } from './dev/server';
 import { type BuildOptions } from './build/build';
+import { type CssBackend } from './css/pipeline';
 export interface BootOptions {
     /** Service worker URL served by the host at its origin root. Default '/cresslet-sw.js'. `false` disables previews. */
     serviceWorkerUrl?: string | false;
@@ -25,6 +26,11 @@ export interface BootOptions {
      * Unset (or equal to the page's origin): previews share the host origin.
      */
     previewOrigin?: string;
+    /**
+     * Run project code when processing CSS: PostCSS configs (and their plugins), Tailwind `@plugin` / `@config`.
+     * Default true. `false`: PostCSS configs are ignored and `@plugin`/`@config` fail; Tailwind v4 itself still compiles.
+     */
+    cssPlugins?: boolean;
 }
 export interface ContainerEvents {
     'server-ready': (port: number, url: string) => void;
@@ -92,6 +98,8 @@ export declare class Container {
     readonly fs: FsApi;
     /** Origin previews are served from when it differs from the page's (`boot({ previewOrigin })`), else null. */
     readonly previewOrigin: string | null;
+    /** Whether CSS processing runs project code (`boot({ cssPlugins })`). */
+    readonly cssPlugins: boolean;
     private relayPort;
     private listeners;
     private commands;
@@ -130,6 +138,9 @@ export declare class Container {
     }>;
     /** esbuild over the VFS. Relative entry points resolve against workdir. */
     bundle(options: BundleOptions): Promise<BundleResult>;
+    private css;
+    /** The CSS worker (PostCSS / Tailwind) shared by dev servers and builds; a `node` process started on first use. */
+    cssWorker(): CssBackend;
     /** Create a runtime worker shipped next to this module (dist/node-worker.js). */
     createWorker(_name: 'node-worker.js'): Worker;
     /**

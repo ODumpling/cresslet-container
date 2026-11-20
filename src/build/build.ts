@@ -6,6 +6,7 @@ import { basename, dirname, extname, join, normalize } from '../path'
 import { BROWSER_OPTS, resolveModule } from '../resolve'
 import { envDefines, jsxOptions, loadEnv, matchPaths, readProjectConfig, type ProjectConfig } from '../dev/project'
 import { contentHash, findTags, isLocalRef, rewriteHtmlForBuild } from './html'
+import { CssPipeline } from '../css/pipeline'
 
 export interface BuildOptions {
   root?: string
@@ -59,6 +60,8 @@ export async function build(c: Container, o: BuildOptions = {}): Promise<{ files
   for (const r of [...scriptRefs, ...styleRefs]) entryFor.set(localPath(r), r)
   if (!scriptRefs.length && !styleRefs.length) throw new Error('build: index.html has no <script type="module" src> entries')
 
+  // a fresh pipeline (session) per build: Tailwind starts from this build's candidates, none from dev or earlier builds
+  const css = new CssPipeline(c, root, 'production')
   let result
   try {
     result = await bundleVfs(vfs, {
@@ -81,10 +84,12 @@ export async function build(c: Container, o: BuildOptions = {}): Promise<{ files
       define: { ...envDefines(env), 'process.env.NODE_ENV': '"production"', global: 'globalThis' },
       loader: { '.module.css': 'local-css' },
       plugins: [pathsPlugin(c, cfg)],
-      vfsPlugin: { resolve: PROD_RESOLVE },
+      vfsPlugin: { resolve: PROD_RESOLVE, transformCss: css.active ? async (p, text) => (await css.process(p, text)).css : undefined },
     })
   } catch (e) {
     throw new Error(`build failed:\n${formatErrors(e)}`)
+  } finally {
+    css.release() // its compilers/candidates were this build's only
   }
 
   vfs.rm(outDir, { recursive: true, force: true })

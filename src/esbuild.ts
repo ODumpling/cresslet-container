@@ -77,6 +77,8 @@ export interface VfsPluginOptions {
   external?: (spec: string, importer: string, kind: string) => string | undefined | false
   /** Node builtins: 'empty' (browser shim) or 'external'. */
   builtins?: 'empty' | 'external'
+  /** Post-process every loaded stylesheet (PostCSS / Tailwind). */
+  transformCss?: (path: string, css: string) => Promise<string>
 }
 
 /** Resolve + load everything from the VFS. */
@@ -109,9 +111,17 @@ export function vfsPlugin(vfs: VFS, opts: VfsPluginOptions = {}): Plugin {
         }
       })
       build.onLoad({ filter: /.*/, namespace: 'cresslet-empty' }, () => ({ contents: 'module.exports = {}', loader: 'js' }))
-      build.onLoad({ filter: /.*/, namespace: 'cresslet-vfs' }, (args) => {
-        const loader = (build.initialOptions.loader?.[extname(args.path)] as Loader | undefined) ?? loaderFor(args.path)
+      build.onLoad({ filter: /.*/, namespace: 'cresslet-vfs' }, async (args) => {
+        const custom = build.initialOptions.loader ?? {}
+        const loader = ((/\.module\.css$/.test(args.path) && custom['.module.css']) || custom[extname(args.path)] || loaderFor(args.path)) as Loader
         const data = vfs.readFile(args.path)
+        if ((loader === 'css' || loader === 'local-css') && opts.transformCss) {
+          try {
+            return { contents: await opts.transformCss(args.path, toText(data)), loader, resolveDir: dirname(args.path) }
+          } catch (e) {
+            return { errors: [{ text: e instanceof Error ? e.message : String(e) }] }
+          }
+        }
         return {
           contents: loader === 'file' || loader === 'binary' || loader === 'dataurl' || loader === 'base64' ? data : toText(data),
           loader,

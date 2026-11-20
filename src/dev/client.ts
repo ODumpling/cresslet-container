@@ -118,6 +118,8 @@ window.addEventListener('error', (e) => {
   // prefer the dev server's pending transform error when there is one
   fetch('/@cresslet/last-error').then((r) => r.text()).then((t) => showOverlay(t || msg), () => showOverlay(msg));
 });
+// an error the server hit before this client was listening (e.g. a <link> stylesheet that failed to process)
+fetch('/@cresslet/last-error').then((r) => r.text()).then((t) => { if (t) showOverlay(t); }, () => {});
 window.addEventListener('unhandledrejection', (e) => showOverlay((e.reason && e.reason.stack) || String(e.reason)));
 `
 }
