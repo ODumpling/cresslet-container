@@ -6,8 +6,6 @@ export interface PackageCache {
 export type CacheStore = 'tarballs' | 'packuments';
 /** Default cap on the cache's (approximate) total size. */
 export declare const DEFAULT_MAX_BYTES: number;
-/** Read hits refresh their entry's last use in one batched write this long after the first of them (or the next put). */
-export declare const TOUCH_DELAY = 500;
 /** Bound for one IndexedDB transaction (and for flushing pending writes): past it a get is a miss, a put/delete a no-op. */
 export declare const OP_TIMEOUT = 2000;
 /** In-memory PackageCache (tests, or a host that wants per-session caching only). */
@@ -26,30 +24,19 @@ export interface IdbCacheOptions {
 export declare class IdbCache implements PackageCache {
     readonly maxBytes: number;
     private db;
-    /** Read hits not yet written back: meta id → time of the hit. */
-    private touched;
-    private touchTimer;
-    private lastStamp;
     constructor(opts?: IdbCacheOptions);
     private open;
     /** Runs `fn` in one transaction; resolves to its result getter's value once committed, or undefined on failure / timeout. */
     private tx;
+    /** A hit counts as a use, recorded in the same transaction, so a write right after can't evict what was just read. */
     get<T>(store: CacheStore, key: string): Promise<T | undefined>;
     put(store: CacheStore, key: string, value: unknown): Promise<void>;
     delete(store: CacheStore, key: string): Promise<void>;
-    /** Last-use stamp: wall-clock ms, strictly increasing here so uses within one tick keep their order. */
-    private stamp;
-    /** Records a read hit as a use; hits are written back in batches (or with the next write) so reads stay read-only. */
-    private touch;
-    /** Queues the pending read hits' last-use writes in `t`; entries evicted or deleted meanwhile are skipped. */
-    private applyTouches;
     /**
-     * Evicts least-recently-used entries (other than the one just written, `keep`) until `bytes` fits the cap, and
-     * saves the new total. Also trims a cache left over a cap that was lowered since it was filled.
+     * Saves `st` after evicting least-recently-used entries (other than `keep`, the entry just used) until its total
+     * fits the cap.
      */
-    private evict;
-    /** Writes pending read hits' last-use times now, and trims the cache if it is over the cap. */
-    flushTouches(): Promise<void>;
+    private settle;
 }
 /** A cap must be a positive number of bytes (`Infinity` for none). */
 export declare function checkMaxBytes(n: unknown): number;

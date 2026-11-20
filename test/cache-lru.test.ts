@@ -1,20 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { IDBFactory } from 'fake-indexeddb'
-import { DEFAULT_MAX_BYTES, IdbCache, sharedIdbCache, sizeOf, TOUCH_DELAY } from '../src/npm/cache'
+import { DEFAULT_MAX_BYTES, IdbCache, sharedIdbCache, sizeOf } from '../src/npm/cache'
 import { Container } from '../src/container'
 
 // LRU size cap, against a spec-complete IndexedDB (fake-indexeddb).
 
 let factory: IDBFactory
-let clock = 1_000
 beforeEach(() => {
   factory = new IDBFactory()
   vi.stubGlobal('indexedDB', factory)
-  vi.spyOn(Date, 'now').mockImplementation(() => clock++) // distinct, increasing last-use times
 })
 afterEach(() => {
   vi.unstubAllGlobals()
-  vi.restoreAllMocks()
 })
 
 const bytes = (n: number) => new Uint8Array(n)
@@ -31,10 +28,10 @@ async function meta(): Promise<{ ids: string[]; total: number; sum: number }> {
     r.onsuccess = () => res(r.result)
   })
   db.close()
-  const entries = all.filter((e) => e.id !== '#total')
+  const entries = all.filter((e) => e.id !== '#state')
   return {
     ids: entries.map((e) => e.id).sort(),
-    total: all.find((e) => e.id === '#total')?.bytes ?? 0,
+    total: all.find((e) => e.id === '#state')?.bytes ?? 0,
     sum: entries.reduce((a, e) => a + e.size!, 0),
   }
 }
@@ -56,7 +53,6 @@ describe('IdbCache size cap', () => {
     await c.put('tarballs', 'a', bytes(40))
     await c.put('tarballs', 'b', bytes(40))
     expect(await c.get('tarballs', 'a')).toEqual(bytes(40))
-    await c.flushTouches()
     await c.put('tarballs', 'c', bytes(40))
     expect(await c.get('tarballs', 'a')).toEqual(bytes(40))
     expect(await c.get('tarballs', 'b')).toBeUndefined()
@@ -71,13 +67,23 @@ describe('IdbCache size cap', () => {
     expect((await meta()).ids).toEqual(['tarballs:a', 'tarballs:c'])
   })
 
-  it('keeps use order within one clock tick', async () => {
-    vi.spyOn(Date, 'now').mockReturnValue(5_000)
+  it('a hit still in flight when a write starts counts before that write evicts', async () => {
     const c = new IdbCache({ maxBytes: 100 })
-    await c.put('tarballs', 'z', bytes(40))
     await c.put('tarballs', 'a', bytes(40))
     await c.put('tarballs', 'b', bytes(40))
-    expect((await meta()).ids).toEqual(['tarballs:a', 'tarballs:b'])
+    const [hit] = await Promise.all([c.get('tarballs', 'a'), c.put('tarballs', 'c', bytes(40))])
+    expect(hit).toEqual(bytes(40))
+    expect((await meta()).ids).toEqual(['tarballs:a', 'tarballs:c'])
+  })
+
+  it('keeps use order across instances (one shared use counter)', async () => {
+    const a = new IdbCache({ maxBytes: 100 })
+    const b = new IdbCache({ maxBytes: 100 })
+    await a.put('tarballs', 'z', bytes(40))
+    await a.put('tarballs', 'y', bytes(40))
+    await b.get('tarballs', 'z')
+    await a.put('tarballs', 'x', bytes(40))
+    expect((await meta()).ids).toEqual(['tarballs:x', 'tarballs:z'])
   })
 
   it('a lowered cap trims the cache on read hits alone', async () => {
@@ -86,18 +92,7 @@ describe('IdbCache size cap', () => {
     await big.put('tarballs', 'b', bytes(40))
     const small = new IdbCache({ maxBytes: 50 })
     expect(await small.get('tarballs', 'b')).toEqual(bytes(40))
-    await small.flushTouches()
     expect(await meta()).toEqual({ ids: ['tarballs:b'], total: 40, sum: 40 })
-  })
-
-  it('writes read hits back on its own after TOUCH_DELAY', async () => {
-    const c = new IdbCache({ maxBytes: 100 })
-    await c.put('tarballs', 'a', bytes(40))
-    await c.put('tarballs', 'b', bytes(40))
-    await c.get('tarballs', 'a')
-    await new Promise((r) => setTimeout(r, TOUCH_DELAY + 100))
-    await c.put('tarballs', 'c', bytes(40))
-    expect((await meta()).ids).toEqual(['tarballs:a', 'tarballs:c'])
   })
 
   it('evicts across stores (packuments count, sized by their JSON)', async () => {
@@ -106,7 +101,6 @@ describe('IdbCache size cap', () => {
     await c.put('packuments', 'r|x', pk)
     await c.put('tarballs', 'a', bytes(100 - sizeOf(pk)))
     expect(await c.get('packuments', 'r|x')).toEqual(pk)
-    await c.flushTouches()
     await c.put('tarballs', 'b', bytes(1))
     expect(await c.get('tarballs', 'a')).toBeUndefined()
     expect(await c.get('packuments', 'r|x')).toEqual(pk)
@@ -151,7 +145,7 @@ describe('IdbCache size cap', () => {
     })
     await new Promise((res) => {
       const t = db.transaction('meta', 'readwrite')
-      t.objectStore('meta').put({ id: '#total', bytes: 10_000 })
+      t.objectStore('meta').put({ id: '#state', bytes: 10_000 })
       t.oncomplete = res
     })
     db.close()

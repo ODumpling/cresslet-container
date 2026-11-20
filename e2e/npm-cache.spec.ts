@@ -85,11 +85,11 @@ test('boot({ npmCache: { maxBytes } }) keeps the persistent cache under the cap,
     const meta = await read<{ id: string; size?: number; bytes?: number }>('meta')
     const tarballs = await read<Uint8Array>('tarballs')
     db.close()
-    const entries = meta.filter((e) => e.id !== '#total')
+    const entries = meta.filter((e) => e.id !== '#state')
     return {
       codes,
       afterFirst,
-      total: meta.find((e) => e.id === '#total')?.bytes,
+      total: meta.find((e) => e.id === '#state')?.bytes,
       sum: entries.reduce((a, e) => a + (e.size ?? 0), 0),
       tarballBytes: tarballs.reduce((a, t) => a + t.byteLength, 0),
       ids: entries.map((e) => e.id),
