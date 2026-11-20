@@ -186,7 +186,8 @@ export class Server extends EventEmitter {
     let port: number
     const first = args[0]
     if (first && typeof first === 'object') port = Number((first as { port?: number }).port ?? 0)
-    else port = Number(first ?? 0)
+    // a pipe path (non-numeric string): no sockets here, so an automatic port as before
+    else port = typeof first === 'string' && !/^\s*\d+\s*$/.test(first) ? 0 : Number(first ?? 0)
     // as Node: a bad port throws (and the host's port table never sees it)
     if (!Number.isInteger(port) || port < 0 || port > 65535)
       throw Object.assign(new RangeError(`options.port should be >= 0 and < 65536. Received ${String(first)}.`), { code: 'ERR_SOCKET_BAD_PORT' })

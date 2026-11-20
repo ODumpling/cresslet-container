@@ -144,6 +144,8 @@ export declare class Container {
     private relayBooted;
     /** `previewOrigins`: each preview port's relay (on its own origin), by port. */
     private previewRelays;
+    /** `previewOrigins`: the latest relay framed for each port (live or gone), by port. */
+    private lastPreviewRelay;
     /** `previewOrigins`: open ports whose `port` / `server-ready` were emitted (after their relay connected). */
     private announced;
     /** `previewOrigins`: the latest opening of each port, until its relay connected (or failed). */

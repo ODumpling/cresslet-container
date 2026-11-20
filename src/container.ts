@@ -144,6 +144,8 @@ export class Container {
   private relayBooted = false
   /** `previewOrigins`: each preview port's relay (on its own origin), by port. */
   private previewRelays = new Map<number, RelayLink>()
+  /** `previewOrigins`: the latest relay framed for each port (live or gone), by port. */
+  private lastPreviewRelay = new Map<number, RelayLink>()
   /** `previewOrigins`: open ports whose `port` / `server-ready` were emitted (after their relay connected). */
   private announced = new Set<number>()
   /** `previewOrigins`: the latest opening of each port, until its relay connected (or failed). */
@@ -571,7 +573,11 @@ export class Container {
    * @internal
    */
   previewReady(port: number): Promise<void> {
-    return this.opening.get(port) ?? Promise.resolve()
+    const opening = this.opening.get(port)
+    if (opening) return opening
+    // already announced (e.g. a dev server taking over an open port): its relay may be reconnecting
+    const link = this.announced.has(port) ? this.previewRelays.get(port) : undefined
+    return link ? connected(link).catch(() => {}) : Promise.resolve()
   }
 
   /** `previewOrigins`: the relay on `port`'s preview origin, framed on first use and kept until teardown. */
@@ -584,8 +590,11 @@ export class Container {
       r = undefined
     }
     if (!r) {
-      const link = (r = this.connectRelay(origin, { workers: false, sw: true, onlyPort: port }))
+      // after the last relay on this origin is gone (it unregisters its service worker on the way out)
+      const after = this.lastPreviewRelay.get(port)?.gone
+      const link = (r = this.connectRelay(origin, { workers: false, sw: true, onlyPort: port, after }))
       this.previewRelays.set(port, link)
+      this.lastPreviewRelay.set(port, link)
       // a failed relay is gone (frame removed): the next open of this port tries again
       link.ready.catch(() => this.previewRelays.get(port) === link && this.previewRelays.delete(port))
     }
@@ -598,8 +607,8 @@ export class Container {
    * it forwards (`onlyPort`: for that preview port only). `ready` rejects (leaving no frame or listener behind) if the
    * first handshake fails or times out.
    */
-  private connectRelay(origin: string, opts: { workers: boolean; sw: boolean; onlyPort?: number }): RelayLink {
-    const link: RelayLink = { port: null, conn: null, ready: null!, booted: false, broken: false, drop: () => {} }
+  private connectRelay(origin: string, opts: { workers: boolean; sw: boolean; onlyPort?: number; after?: Promise<void> }): RelayLink {
+    const link: RelayLink = { port: null, conn: null, ready: null!, booted: false, broken: false, drop: () => {}, gone: Promise.resolve() }
     if (typeof document === 'undefined' || typeof location === 'undefined') {
       link.ready = Promise.reject(new Error('previewOrigin needs a browser page'))
       return link
@@ -626,11 +635,29 @@ export class Container {
       let settleConn: ((e?: Error) => void) | null = null
       /** Hands a still-pending connection over to the next one (a reload during a reconnect): waiters follow it. */
       let followConn: ((next: Promise<MessagePort>) => void) | null = null
+      /**
+       * Remove the frame. A per-preview relay first unregisters its origin's service worker (also mid-setup: it does so
+       * as soon as the registration exists), acknowledged or bounded; `linger`: let queued messages go out first.
+       * `link.gone` settles when it's gone: a replacement relay on the same origin waits for it, so this unregister
+       * can't drop the replacement's registration.
+       */
+      const removeFrame = (port: MessagePort | null, linger: boolean) => {
+        const dispose = opts.onlyPort !== undefined && port
+        if (dispose) port.postMessage({ type: RELAY_DISPOSE })
+        if (!dispose && !linger) return void (port?.close(), frame.remove())
+        link.gone = new Promise<void>((res) => {
+          const done = () => (clearTimeout(t), port?.close(), frame.remove(), res())
+          const t = setTimeout(done, dispose ? DISPOSE_TIMEOUT : 250)
+          if (dispose) port.onmessage = (e) => void (e.data?.type === RELAY_DISPOSED && done())
+        })
+      }
       const fail = (message: string) => {
         if (failed) return
         failed = true
+        const port = link.port
+        link.port = null
         stop()
-        frame.remove()
+        removeFrame(port, false)
         reject(new Error(message))
         unlist()
       }
@@ -638,7 +665,7 @@ export class Container {
         const i = this.cleanups.indexOf(close)
         if (i >= 0) this.cleanups.splice(i, 1)
       }
-      // replaced by a new relay on the same origin: no dispose (it would unregister the new relay's service worker)
+      // to be replaced by a new relay on the same origin (which waits for `link.gone`)
       link.drop = () => {
         if (failed) return
         settleConn?.(new Error('preview relay replaced'))
@@ -664,15 +691,20 @@ export class Container {
         let follow!: (next: Promise<MessagePort>) => void
         const conn = (link.conn = new Promise<MessagePort>((res, rej) => {
           const t = setTimeout(() => settle(new Error(`preview relay did not reconnect within ${RELAY_TIMEOUT / 1000}s`)), RELAY_TIMEOUT)
-          settle = (e) => (clearTimeout(t), e ? rej(e) : res(port))
+          settle = (e) => {
+            clearTimeout(t)
+            if (!e) return res(port)
+            // broken at once (before anyone hears of it), unless a newer connection replaced this one
+            if (link.conn === conn) link.broken = true
+            rej(e)
+          }
           follow = (next) => (clearTimeout(t), res(next))
         }))
         followConn?.(conn) // no-op if the previous one already settled
         followConn = follow
         settleConn = settle
         link.broken = false
-        // a connection that failed (and wasn't replaced since): the relay is broken until it says hello again
-        conn.catch(() => void (link.conn === conn && (link.broken = true)))
+        conn.catch(() => {})
         port.onmessage = (e) => {
           const m = e.data
           if (m?.type === RELAY_READY && !ready) {
@@ -700,7 +732,9 @@ export class Container {
         frame.contentWindow!.postMessage({ type: RELAY_INIT }, origin, [ch.port2])
       }
       addEventListener('message', onWindowMessage)
-      ;(document.body ?? document.documentElement).appendChild(frame)
+      const append = () => void (!failed && (document.body ?? document.documentElement).appendChild(frame))
+      if (opts.after) void opts.after.then(append)
+      else append()
       const close = () => {
         if (failed) return
         settleConn?.(new Error('container torn down'))
@@ -712,14 +746,8 @@ export class Container {
           failed = true
           reject(new Error('container torn down'))
         }
-        // a per-preview origin is this container's alone: drop its service worker registration too (also when torn down
-        // mid-setup: the relay may be registering it, and unregisters it as soon as the registration exists)
-        const dispose = opts.onlyPort !== undefined && port
-        if (dispose) port.postMessage({ type: RELAY_DISPOSE })
-        // let the relay forward the unregister / unregister its SW before its frame goes
-        const done = () => (clearTimeout(t), port?.close(), frame.remove())
-        const t = setTimeout(done, dispose ? DISPOSE_TIMEOUT : 250)
-        if (dispose) port.onmessage = (e) => void (e.data?.type === RELAY_DISPOSED && done())
+        // a per-preview origin is this container's alone: its service worker registration goes too
+        removeFrame(port, true)
       }
       this.cleanups.push(close)
     })
@@ -771,8 +799,10 @@ interface RelayLink {
   booted: boolean
   /** Its current connection failed (after the first handshake) and the relay hasn't said hello since. */
   broken: boolean
-  /** Remove the frame now (no teardown messages), e.g. to replace a relay that broke after connecting. */
+  /** Remove the frame (and its origin's SW registration), e.g. to replace a relay that broke after connecting. */
   drop(): void
+  /** Settles once the frame is gone (after its SW registration, if it had to drop one). */
+  gone: Promise<void>
 }
 
 /** Resolves once `link`'s current connection is up (the first one, or a reconnect in progress), else rejects. */

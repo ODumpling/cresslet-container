@@ -443,8 +443,8 @@ describe('Container.boot({ previewOrigins })', () => {
     setAttribute(): void
     style: Record<string, string>
   }
-  /** A fake page whose relay frames (one per origin) say hello; `relay(origin, port)` plays the relay. */
-  function fakePage(relay: (origin: string, port: MessagePort, frame: Frame) => void) {
+  /** A fake page whose relay frames (one per origin) say hello; `relay(origin, port)` plays the relay. `ack`: answer RELAY_DISPOSE. */
+  function fakePage(relay: (origin: string, port: MessagePort, frame: Frame) => void, { ack = true } = {}) {
     const listeners = new Set<(ev: unknown) => void>()
     const frames: Frame[] = []
     vi.stubGlobal('location', { origin: HOST })
@@ -460,7 +460,16 @@ describe('Container.boot({ previewOrigins })', () => {
           remove() {
             this.removed++
           },
-          contentWindow: { postMessage: (_m, origin, transfer) => relay(origin, transfer[0], frame) },
+          contentWindow: {
+            postMessage: (_m, origin, transfer) => {
+              const p = transfer[0]
+              if (ack) {
+                p.addEventListener('message', (e) => e.data?.type === 'cresslet-relay-dispose' && p.postMessage({ type: 'cresslet-relay-disposed' }))
+                p.start()
+              }
+              relay(origin, p, frame)
+            },
+          },
         }
         frames.push(frame)
         return frame
@@ -620,15 +629,97 @@ describe('Container.boot({ previewOrigins })', () => {
     c.servePort(3000, () => new Response('A')).close()
     await tick()
     const hello = { origin: new URL(page.frames[1].src).origin, source: page.frames[1].contentWindow, data: { type: 'cresslet-relay-hello' } }
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] }) // before connection 2 sets its deadline
     page.listeners.forEach((fn) => fn(hello)) // reload: connection 2
-    await tick()
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    await vi.advanceTimersByTimeAsync(10)
     c.servePort(3000, () => new Response('A')) // waits on connection 2
     page.listeners.forEach((fn) => fn(hello)) // reload again: connection 3 gets ready
     await vi.advanceTimersByTimeAsync(25_000) // past connection 2's deadline
     vi.useRealTimers()
     expect(events).toEqual([3000])
     expect(page.frames).toHaveLength(2)
+    c.teardown()
+    relays.forEach((p) => p.close())
+  })
+
+  it('an error listener that reopens the port at once gets a new relay (the broken one is known broken by then)', async () => {
+    const relays: MessagePort[] = []
+    const page = fakePage((origin, port) => {
+      if (origin.includes('-3000.') && relays.push(port) === 2) return
+      port.postMessage({ type: 'cresslet-relay-ready' })
+    })
+    const c = await Container.boot({ previewOrigins: TEMPLATE, npmCache: false })
+    const ready: number[] = []
+    c.on('server-ready', (p) => ready.push(p))
+    let s = c.servePort(3000, () => new Response('A'))
+    await tick()
+    c.on('error', () => {
+      s.close()
+      s = c.servePort(3000, () => new Response('A'))
+    })
+    const hello = { origin: new URL(page.frames[1].src).origin, source: page.frames[1].contentWindow, data: { type: 'cresslet-relay-hello' } }
+    page.listeners.forEach((fn) => fn(hello))
+    await tick()
+    relays[1].postMessage({ type: 'cresslet-relay-error', message: 'registration failed' })
+    await tick(50)
+    expect(page.frames).toHaveLength(3)
+    expect(ready).toEqual([3000, 3000])
+    c.teardown()
+    relays.forEach((p) => p.close())
+  })
+
+  it("a replacement relay is framed only once the broken one has dropped its origin's service worker", async () => {
+    const relays: MessagePort[] = []
+    const page = fakePage(
+      (origin, port) => {
+        if (!origin.includes('-3000.')) return port.postMessage({ type: 'cresslet-relay-ready' })
+        const n = relays.push(port)
+        port.onmessage = () => {} // starts the port (the first relay never acks its dispose by itself)
+        if (n !== 2) port.postMessage({ type: 'cresslet-relay-ready' })
+      },
+      { ack: false },
+    )
+    const c = await Container.boot({ previewOrigins: TEMPLATE, npmCache: false })
+    c.servePort(3000, () => new Response('A')).close()
+    await tick()
+    const hello = { origin: new URL(page.frames[1].src).origin, source: page.frames[1].contentWindow, data: { type: 'cresslet-relay-hello' } }
+    page.listeners.forEach((fn) => fn(hello))
+    await tick()
+    relays[1].postMessage({ type: 'cresslet-relay-error', message: 'registration failed' })
+    await tick()
+    const disposed = new Promise<void>((r) => (relays[1].onmessage = (e) => e.data?.type === 'cresslet-relay-dispose' && r()))
+    c.servePort(3000, () => new Response('A'))
+    await disposed
+    await tick()
+    expect(page.frames).toHaveLength(3) // created, but not in the page yet
+    expect(relays).toHaveLength(2)
+    relays[1].postMessage({ type: 'cresslet-relay-disposed' })
+    await tick()
+    expect(page.frames[1].removed).toBe(1)
+    expect(relays).toHaveLength(3) // framed (said hello) only now
+    c.teardown()
+    relays.forEach((p) => p.close())
+  })
+
+  it('previewReady on an announced port waits for a reconnect in progress', async () => {
+    const relays: MessagePort[] = []
+    const page = fakePage((origin, port) => {
+      if (origin.includes('-3000.') && relays.push(port) === 2) return
+      port.postMessage({ type: 'cresslet-relay-ready' })
+    })
+    const c = await Container.boot({ previewOrigins: TEMPLATE, npmCache: false })
+    c.servePort(3000, () => new Response('A'))
+    await c.previewReady(3000)
+    const hello = { origin: new URL(page.frames[1].src).origin, source: page.frames[1].contentWindow, data: { type: 'cresslet-relay-hello' } }
+    page.listeners.forEach((fn) => fn(hello))
+    await tick()
+    let done = false
+    void c.previewReady(3000).then(() => (done = true))
+    await tick()
+    expect(done).toBe(false)
+    relays[1].postMessage({ type: 'cresslet-relay-ready' })
+    await tick()
+    expect(done).toBe(true)
     c.teardown()
     relays.forEach((p) => p.close())
   })
@@ -641,7 +732,7 @@ describe('Container.boot({ previewOrigins })', () => {
         relayPort = port
         port.onmessage = (e) => got.push(e.data) // still registering: never ready
       } else port.postMessage({ type: 'cresslet-relay-ready' })
-    })
+    }, { ack: false })
     const c = await Container.boot({ previewOrigins: TEMPLATE, npmCache: false })
     c.servePort(3000, () => new Response('A'))
     await tick()
