@@ -228,3 +228,58 @@ test('a preview opened top-level in a new tab keeps working while the host is op
   await write(page, 'src/App.tsx', app.replace('Hello from Cresslet', 'Edited in host'))
   await expect(tab.getByRole('heading', { name: 'Edited in host' })).toBeVisible()
 })
+
+test.describe.serial('preview origin trust boundary', () => {
+  let page: Page
+  let frame: Frame
+
+  test.beforeAll(async ({ browser, browserName }) => {
+    page = await (await browser.newContext()).newPage()
+    frame = await bootDemo(page, drivable(browserName))
+  })
+
+  test('relay assets always come from the network, never from a preview', async () => {
+    // the preview frame is a mapped client: without the reservation its root-relative fetches go to the dev server
+    const got = await frame.evaluate(() =>
+      Promise.all(
+        ['/cresslet-relay.html', '/cresslet-relay.js', '/cresslet-sw.js'].map(async (p) => {
+          const r = await fetch(p)
+          return { p, csp: r.headers.get('content-security-policy'), type: r.headers.get('content-type') ?? '' }
+        }),
+      ),
+    )
+    expect(got[0].csp).toContain('frame-ancestors')
+    expect(got[0].type).toContain('text/html')
+    expect(got[1].type).toContain('javascript')
+    expect(got[2].type).toContain('javascript')
+  })
+
+  test("a preview can't claim or drop its container's service worker mapping", async () => {
+    const { id, url } = await page.evaluate(() => ({ id: (window as unknown as Win).container.instanceId, url: (window as unknown as Win).previewUrl! }))
+    const body = await frame.evaluate(
+      async ({ id, url }) => {
+        const sw = navigator.serviceWorker
+        // answer as if this preview window owned the container
+        sw.addEventListener('message', (e) => {
+          const d = e.data
+          if (d?.type === 'cresslet-who') e.ports[0]?.postMessage({ owns: true })
+          else if (d?.type === 'cresslet-request') {
+            const p = e.ports[0]
+            p.postMessage({ type: 'head', status: 200, statusText: 'OK', headers: [['content-type', 'text/plain']] })
+            p.postMessage({ type: 'chunk', data: new TextEncoder().encode('hijacked') })
+            p.postMessage({ type: 'end' })
+          }
+        })
+        sw.startMessages()
+        sw.controller!.postMessage({ type: 'cresslet-unregister', instanceId: id })
+        sw.controller!.postMessage({ type: 'cresslet-register', instanceId: id })
+        await new Promise((r) => setTimeout(r, 300))
+        return (await fetch(url)).text()
+      },
+      { id, url },
+    )
+    expect(body).not.toBe('hijacked')
+    expect(body).toContain('<')
+    await expect(page.frameLocator('#frame').getByRole('heading', { name: 'Hello from Cresslet' })).toBeVisible()
+  })
+})

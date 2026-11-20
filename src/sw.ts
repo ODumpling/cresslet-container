@@ -3,10 +3,9 @@
 // mapped back to their preview via the requesting client id (remembered per document, persisted in Cache
 // Storage so SW restarts keep working), falling back to the Referer.
 /// <reference lib="webworker" />
-export {}
+import { isolate, isRelayClient, PREFIX, receiveResponse, RESERVED, XORIGIN_HEADERS } from './sw-lib'
 declare const self: ServiceWorkerGlobalScope
 
-const PREFIX = '/__cresslet__/'
 /** Registered by cresslet-relay.html on a separate preview origin: previews are embedded cross-origin by the host. */
 const XORIGIN = new URL(location.href).searchParams.get('xorigin') === '1'
 const STORE = 'cresslet-sw-clients-v1'
@@ -80,17 +79,22 @@ self.addEventListener('activate', (e) => {
   )
 })
 
+/** Windows that may own a container: on a preview origin only relay frames (previews share the origin). */
+const ownerCandidate = (c: Client) => !XORIGIN || isRelayClient(c)
+
 self.addEventListener('message', (e) => {
   const d = e.data
-  if (d?.type === 'cresslet-register' && e.source && 'id' in e.source) owners.set(d.instanceId, (e.source as Client).id)
-  else if (d?.type === 'cresslet-unregister') owners.delete(d.instanceId)
-  else if (d?.type === 'cresslet-ping') e.ports[0]?.postMessage({ type: 'cresslet-pong' })
+  const src = e.source && 'id' in e.source ? (e.source as Client) : null
+  if (d?.type === 'cresslet-ping') e.ports[0]?.postMessage({ type: 'cresslet-pong' })
+  if (!src || typeof d?.instanceId !== 'string' || !ownerCandidate(src)) return
+  if (d.type === 'cresslet-register') owners.set(d.instanceId, src.id)
+  else if (d.type === 'cresslet-unregister' && (!XORIGIN || owners.get(d.instanceId) === src.id)) owners.delete(d.instanceId)
 })
 
 self.addEventListener('fetch', (e) => {
   const req = e.request
   const url = new URL(req.url)
-  if (url.origin !== location.origin) return
+  if (url.origin !== location.origin || RESERVED.has(url.pathname)) return
   const direct = parse(url.pathname)
   if (direct) {
     if (req.mode === 'navigate' && e.resultingClientId) remember(e.resultingClientId, direct)
@@ -183,17 +187,21 @@ async function findOwner(instanceId: string): Promise<Client | null> {
     if (c) return c
     owners.delete(instanceId)
   }
-  const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true })
+  // also how ownership is recovered after an SW restart
+  const all = (await self.clients.matchAll({ type: 'window', includeUncontrolled: true })).filter(ownerCandidate)
   const answers = await Promise.all(
     all.map(
       (c) =>
         new Promise<Client | null>((resolve) => {
           const ch = new MessageChannel()
-          const timer = setTimeout(() => resolve(null), 1500)
-          ch.port1.onmessage = (ev) => {
+          const settle = (owner: Client | null) => {
             clearTimeout(timer)
-            resolve(ev.data?.owns ? c : null)
+            ch.port1.onmessage = null
+            ch.port1.close()
+            resolve(owner)
           }
+          const timer = setTimeout(() => settle(null), 1500)
+          ch.port1.onmessage = (ev) => settle(ev.data?.owns === true ? c : null)
           c.postMessage({ type: 'cresslet-who', instanceId }, [ch.port2])
         }),
     ),
@@ -203,54 +211,17 @@ async function findOwner(instanceId: string): Promise<Client | null> {
   return owner
 }
 
-function isolate(headers: [string, string][], t: Target): Headers {
-  const h = new Headers(headers)
-  if (!h.has('cross-origin-embedder-policy')) h.set('Cross-Origin-Embedder-Policy', 'require-corp')
-  if (!h.has('cross-origin-resource-policy')) h.set('Cross-Origin-Resource-Policy', XORIGIN ? 'cross-origin' : 'same-origin')
-  const loc = h.get('location')
-  if (loc && loc.startsWith('/') && !loc.startsWith('//') && !loc.startsWith(PREFIX)) h.set('location', prefixOf(t) + loc)
-  return h
-}
-
 async function forward(req: Request, t: Target, path: string): Promise<Response> {
   const client = await findOwner(t.instanceId)
   if (!client)
     return new Response(`Cresslet preview ${t.instanceId}:${t.port} is not running (owning page closed?)`, {
       status: 503,
-      headers: { 'content-type': 'text/plain', ...(XORIGIN && { 'cross-origin-resource-policy': 'cross-origin', 'cross-origin-embedder-policy': 'require-corp' }) },
+      headers: { 'content-type': 'text/plain', ...(XORIGIN && XORIGIN_HEADERS) },
     })
   const body = req.method === 'GET' || req.method === 'HEAD' ? null : await req.arrayBuffer()
   const ch = new MessageChannel()
   const headers: [string, string][] = []
   req.headers.forEach((v, k) => headers.push([k, v]))
   client.postMessage({ type: 'cresslet-request', instanceId: t.instanceId, port: t.port, path, method: req.method, headers, body }, body ? [ch.port2, body] : [ch.port2])
-  return new Promise<Response>((resolve) => {
-    let ctrl: ReadableStreamDefaultController<Uint8Array> | null = null
-    let headed = false
-    const stream = new ReadableStream<Uint8Array>({
-      start: (c) => void (ctrl = c),
-      cancel: () => ch.port1.postMessage({ type: 'cancel' }),
-    })
-    ch.port1.onmessage = (ev) => {
-      const m = ev.data
-      if (m.type === 'head') {
-        headed = true
-        const status = m.status >= 200 && m.status <= 599 ? m.status : 200
-        const nullBody = status === 204 || status === 304 || req.method === 'HEAD'
-        resolve(new Response(nullBody ? null : stream, { status, statusText: m.statusText, headers: isolate(m.headers, t) }))
-      } else if (m.type === 'chunk') ctrl?.enqueue(new Uint8Array(m.data.buffer ?? m.data))
-      else if (m.type === 'end') {
-        try {
-          ctrl?.close()
-        } catch {
-          /* cancelled */
-        }
-        ch.port1.close()
-      } else if (m.type === 'error') {
-        if (!headed) resolve(new Response(m.message, { status: 500 }))
-        else ctrl?.error(new Error(m.message))
-        ch.port1.close()
-      }
-    }
-  })
+  return receiveResponse(ch.port1, { method: req.method, headers: (raw) => isolate(raw, { xorigin: XORIGIN, prefix: prefixOf(t) }), errorHeaders: XORIGIN ? XORIGIN_HEADERS : {} })
 }

@@ -9,9 +9,11 @@ import {
   isChannelName,
   isPageToSw,
   isSwToPage,
+  newestWorker,
   RELAY_ERROR,
   RELAY_HELLO,
   RELAY_READY,
+  THIRD_PARTY_HINT,
   toOrigin,
 } from './relay-protocol'
 
@@ -36,11 +38,11 @@ function onInit(ev: MessageEvent) {
 }
 
 async function connect(p: MessagePort) {
-  if (!('serviceWorker' in navigator)) {
-    p.postMessage({ type: RELAY_ERROR, message: 'Service workers unavailable on the preview origin' })
+  const sw = serviceWorkers()
+  if (!sw) {
+    p.postMessage({ type: RELAY_ERROR, message: `Service workers unavailable on ${location.origin} (${THIRD_PARTY_HINT})` })
     return
   }
-  const sw = navigator.serviceWorker
   sw.addEventListener('message', (ev) => {
     const d = ev.data
     if (!isSwToPage(d, ev.ports)) return
@@ -53,9 +55,10 @@ async function connect(p: MessagePort) {
   let active: ServiceWorker
   try {
     reg = await sw.register(SW_URL, { scope: '/' })
-    active = reg.active ?? (await waitActive(reg))
+    // an older SW may still be active while this page's register() installs a new one: wait for the new one
+    active = await newestWorker(reg, () => sw.ready)
   } catch (e) {
-    p.postMessage({ type: RELAY_ERROR, message: `Service worker registration failed on ${location.origin}: ${e instanceof Error ? e.message : e}` })
+    p.postMessage({ type: RELAY_ERROR, message: `Service worker registration failed on ${location.origin}: ${e instanceof Error ? e.message : e} (${THIRD_PARTY_HINT})` })
     return
   }
   p.onmessage = (ev) => {
@@ -73,17 +76,12 @@ async function connect(p: MessagePort) {
   p.postMessage({ type: RELAY_READY })
 }
 
-function waitActive(reg: ServiceWorkerRegistration): Promise<ServiceWorker> {
-  return new Promise((resolve, reject) => {
-    const w = reg.installing ?? reg.waiting
-    if (!w) return navigator.serviceWorker.ready.then((r) => resolve(r.active!), reject)
-    const check = () => {
-      if (w.state === 'activated') resolve(w)
-      else if (w.state === 'redundant') reject(new Error('service worker became redundant'))
-    }
-    w.addEventListener('statechange', check)
-    check()
-  })
+function serviceWorkers(): ServiceWorkerContainer | undefined {
+  try {
+    return navigator.serviceWorker // throws SecurityError where storage is blocked
+  } catch {
+    return undefined
+  }
 }
 
 start()

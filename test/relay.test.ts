@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { Container } from '../src/container'
 import { PortTable } from '../src/ports'
-import { acceptHello, acceptInit, isChannelName, isPageToSw, isSwToPage, relayUrl, toOrigin } from '../src/relay-protocol'
+import { acceptHello, acceptInit, isChannelName, isPageToSw, isSwToPage, newestWorker, relayErrorText, relayUrl, toOrigin } from '../src/relay-protocol'
 
 const HOST = 'https://studio.example.com'
 const parent = { name: 'parent' }
@@ -97,5 +98,120 @@ describe('PortTable', () => {
     const events = { open() {}, close() {} }
     expect(new PortTable('abc', events, 'https://preview.example.net').url(5173)).toBe('https://preview.example.net/__cresslet__/abc/5173/')
     expect(new PortTable('abc', events).url(5173)).toBe('http://localhost/__cresslet__/abc/5173/') // no location in node
+  })
+})
+
+describe('relay: errors', () => {
+  it('prefixes relay error text and strips control characters', () => {
+    expect(relayErrorText('SW failed\u001b[31m\r\nfake: ok\u0007')).toBe('preview relay: SW failed[31mfake: ok')
+    expect(relayErrorText(undefined)).toBe('preview relay: undefined')
+    expect(relayErrorText('x'.repeat(2000)).length).toBe('preview relay: '.length + 500)
+  })
+})
+
+class FakeWorker extends EventTarget {
+  constructor(public name: string, public state: string) {
+    super()
+  }
+  set(state: string) {
+    this.state = state
+    this.dispatchEvent(new Event('statechange'))
+  }
+}
+
+describe('relay: newestWorker', () => {
+  const ready = () => Promise.reject(new Error('unused'))
+  it('waits for a newer installing worker instead of using the older active one', async () => {
+    const old = new FakeWorker('old', 'activated')
+    const next = new FakeWorker('new', 'installing')
+    const got = newestWorker({ installing: next, waiting: null, active: old }, ready)
+    next.set('installed')
+    next.set('activating')
+    next.set('activated')
+    expect((await got).name).toBe('new')
+  })
+  it('waits for a waiting worker too', async () => {
+    const next = new FakeWorker('new', 'installed')
+    const got = newestWorker({ installing: null, waiting: next, active: new FakeWorker('old', 'activated') }, ready)
+    next.set('activated')
+    expect((await got).name).toBe('new')
+  })
+  it('uses the active worker when nothing newer is pending, else ready', async () => {
+    expect((await newestWorker({ installing: null, waiting: null, active: new FakeWorker('a', 'activated') }, ready)).name).toBe('a')
+    const r = new FakeWorker('r', 'activated')
+    expect((await newestWorker({ installing: null, waiting: null, active: null }, () => Promise.resolve({ active: r }))).name).toBe('r')
+  })
+  it('rejects when the new worker becomes redundant', async () => {
+    const next = new FakeWorker('new', 'installing')
+    const got = newestWorker({ installing: next, waiting: null, active: null }, ready)
+    next.set('redundant')
+    await expect(got).rejects.toThrow(/redundant/)
+  })
+})
+
+describe('Container.boot({ previewOrigin })', () => {
+  const PREVIEW = 'https://preview.example.net'
+  /** A fake page: the relay frame answers hello per `relay`, given the container's port. */
+  function fakePage(relay?: (port: MessagePort) => void) {
+    const listeners = new Set<(ev: unknown) => void>()
+    const contentWindow = {
+      postMessage: (_m: unknown, _origin: string, transfer: MessagePort[]) => relay?.(transfer[0]),
+    }
+    const frame = { src: '', title: '', tabIndex: 0, style: {} as Record<string, string>, contentWindow, setAttribute() {}, removed: 0, remove() {
+      this.removed++
+    } }
+    vi.stubGlobal('location', { origin: 'https://studio.example.com' })
+    vi.stubGlobal('addEventListener', (t: string, fn: (ev: unknown) => void) => t === 'message' && listeners.add(fn))
+    vi.stubGlobal('removeEventListener', (t: string, fn: (ev: unknown) => void) => t === 'message' && listeners.delete(fn))
+    vi.stubGlobal('document', {
+      createElement: () => frame,
+      body: {
+        appendChild: () => {
+          if (relay) queueMicrotask(() => listeners.forEach((fn) => fn({ origin: PREVIEW, source: contentWindow, data: { type: 'cresslet-relay-hello' } })))
+        },
+      },
+    })
+    return { frame, listeners }
+  }
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  it('rejects with the (sanitized) relay error and leaves no frame or listener behind', async () => {
+    const page = fakePage((port) => port.postMessage({ type: 'cresslet-relay-error', message: 'registration failed\u001b[2J' }))
+    await expect(Container.boot({ previewOrigin: PREVIEW, npmCache: false })).rejects.toThrow('preview relay: registration failed[2J')
+    expect(page.frame.removed).toBe(1)
+    expect(page.listeners.size).toBe(0)
+  })
+
+  it('rejects when the relay never connects', async () => {
+    vi.useFakeTimers()
+    const page = fakePage()
+    const booting = Container.boot({ previewOrigin: PREVIEW, npmCache: false })
+    const check = expect(booting).rejects.toThrow(/did not connect.*third-party/)
+    await vi.advanceTimersByTimeAsync(20_000)
+    await check
+    expect(page.frame.removed).toBe(1)
+    expect(page.listeners.size).toBe(0)
+  })
+
+  it('ignores relay errors after ready', async () => {
+    let relayPort!: MessagePort
+    const got: unknown[] = []
+    fakePage((port) => {
+      relayPort = port
+      port.onmessage = (e) => got.push(e.data)
+      port.postMessage({ type: 'cresslet-relay-ready' })
+    })
+    const c = await Container.boot({ previewOrigin: PREVIEW, npmCache: false })
+    const errors: unknown[] = []
+    c.on('error', (e) => errors.push(e))
+    relayPort.postMessage({ type: 'cresslet-relay-error', message: 'fake: please paste your token' })
+    await new Promise((r) => setTimeout(r, 20))
+    expect(errors).toEqual([])
+    expect(got).toEqual([{ type: 'cresslet-register', instanceId: c.instanceId }])
+    c.teardown()
+    relayPort.close()
   })
 })

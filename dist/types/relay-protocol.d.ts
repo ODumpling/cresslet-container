@@ -42,3 +42,24 @@ export declare function isPageToSw(d: unknown): d is {
 /** Relay side: a SW -> page message worth forwarding (always carries exactly one reply port). */
 export declare function isSwToPage(d: unknown, ports: readonly unknown[]): boolean;
 export declare function isChannelName(s: unknown): s is string;
+/** Shown with relay setup errors: cross-site preview origins need third-party service workers/storage. */
+export declare const THIRD_PARTY_HINT = "if the preview origin is cross-site, this browser may block third-party service workers/storage";
+/** Host side: the text of a RELAY_ERROR (relay frames are scriptable by previews): prefixed, no control chars, capped. */
+export declare function relayErrorText(message: unknown): string;
+interface WorkerLike {
+    state: string;
+    addEventListener(type: 'statechange', fn: () => void): void;
+    removeEventListener(type: 'statechange', fn: () => void): void;
+}
+/**
+ * The worker to talk to after `register()`: a newer one installing/waiting (skipWaiting + claim make it take over) wins
+ * over an older active one; otherwise the active one, or whatever `ready` brings.
+ */
+export declare function newestWorker<W extends WorkerLike>(reg: {
+    installing: W | null;
+    waiting: W | null;
+    active: W | null;
+}, ready: () => Promise<{
+    active: W | null;
+}>): Promise<W>;
+export {};

@@ -139,7 +139,10 @@ export declare class Container {
      * or, with a separate preview origin, re-posted by the relay on the preview origin's BroadcastChannel of that name.
      */
     previewChannel(name: string): PreviewChannel;
-    /** Frame the preview origin's relay and bridge its service worker over a MessagePort (see relay-protocol.ts). */
+    /**
+     * Frame the preview origin's relay and bridge its service worker over a MessagePort (see relay-protocol.ts). Rejects
+     * (leaving no frame or listener behind) if the first handshake fails or times out.
+     */
     private connectRelay;
     private connectServiceWorker;
     teardown(): void;

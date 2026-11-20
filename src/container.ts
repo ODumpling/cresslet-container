@@ -1,7 +1,7 @@
 // Container: public entry point. Owns the VFS, port table, command registry and the SW bridge.
 import { VFS, type Dirent, type Stats } from './vfs'
 import { exportTree, globToRegExp, mountTree, type FileSystemTree } from './tree'
-import { PortTable, type PortHandler, type SwRequest } from './ports'
+import { isSwRequest, PortTable, type PortHandler } from './ports'
 import { createProcess, EMPTY_STDIN, type Command, type CommandContext, type ContainerProcess, type SpawnOptions } from './process'
 import { builtins } from './shell/builtins'
 import { COMMANDS } from './commands'
@@ -12,7 +12,7 @@ import { bundleVfs, DEFAULT_WASM_URL, type BuildOptions as EsbuildOptions, type 
 import { createDevServer, type DevServerHandle, type DevServerOptions } from './dev/server'
 import { build, type BuildOptions } from './build/build'
 import { dirname, join, normalize, resolve } from './path'
-import { acceptHello, BROADCAST, BROADCAST_CLOSE, RELAY_ERROR, RELAY_INIT, RELAY_READY, relayUrl, toOrigin } from './relay-protocol'
+import { acceptHello, BROADCAST, BROADCAST_CLOSE, newestWorker, RELAY_ERROR, RELAY_INIT, RELAY_READY, relayErrorText, relayUrl, THIRD_PARTY_HINT, toOrigin } from './relay-protocol'
 
 export interface BootOptions {
   /** Service worker URL served by the host at its origin root. Default '/cresslet-sw.js'. `false` disables previews. */
@@ -129,8 +129,12 @@ export class Container {
   static async boot(opts: BootOptions = {}): Promise<Container> {
     const c = new Container(opts)
     if (opts.serviceWorkerUrl === false) return c
-    if (c.previewOrigin) await c.connectRelay(c.previewOrigin)
-    else await c.connectServiceWorker(opts.serviceWorkerUrl ?? '/cresslet-sw.js')
+    if (!c.previewOrigin) await c.connectServiceWorker(opts.serviceWorkerUrl ?? '/cresslet-sw.js')
+    else
+      await c.connectRelay(c.previewOrigin).catch((e) => {
+        c.teardown()
+        throw e
+      })
     return c
   }
 
@@ -320,10 +324,12 @@ export class Container {
   /** A message the SW posts to the page that owns an instance (directly, or forwarded by the relay). */
   private onSwMessage(m: unknown, ports: readonly MessagePort[]): void {
     if (!m || typeof m !== 'object') return
-    const d = m as Partial<Record<keyof SwRequest, unknown>>
-    if (d.type === 'cresslet-who') ports[0]?.postMessage({ owns: d.instanceId === this.instanceId })
-    else if (d.type === 'cresslet-request' && d.instanceId === this.instanceId && ports[0] && typeof d.port === 'number' && typeof d.path === 'string' && typeof d.method === 'string' && Array.isArray(d.headers))
-      void this.ports.answer(m as SwRequest, ports[0])
+    const d = m as { type?: unknown; instanceId?: unknown }
+    if (d.type === 'cresslet-who' && ports[0]) {
+      ports[0].postMessage({ owns: d.instanceId === this.instanceId })
+      ports[0].close()
+    }
+    else if (isSwRequest(m) && m.instanceId === this.instanceId && ports[0]) void this.ports.answer(m, ports[0])
   }
 
   /**
@@ -338,38 +344,57 @@ export class Container {
     }
   }
 
-  /** Frame the preview origin's relay and bridge its service worker over a MessagePort (see relay-protocol.ts). */
+  /**
+   * Frame the preview origin's relay and bridge its service worker over a MessagePort (see relay-protocol.ts). Rejects
+   * (leaving no frame or listener behind) if the first handshake fails or times out.
+   */
   private connectRelay(origin: string): Promise<void> {
-    if (typeof document === 'undefined' || typeof location === 'undefined') {
-      this.emit('error', { message: 'previewOrigin needs a browser page: previews disabled' })
-      return Promise.resolve()
-    }
+    if (typeof document === 'undefined' || typeof location === 'undefined') return Promise.reject(new Error('previewOrigin needs a browser page'))
     const frame = document.createElement('iframe')
     frame.src = relayUrl(origin, location.origin)
     frame.title = 'cresslet preview relay'
     frame.tabIndex = -1
     frame.setAttribute('aria-hidden', 'true')
     frame.style.display = 'none'
-    return new Promise<void>((settle) => {
-      const timer = setTimeout(() => {
-        this.emit('error', { message: `Preview relay ${frame.src} did not connect: serve it with the headers in the README (COEP, CORP, CSP frame-ancestors)` })
-        settle()
-      }, RELAY_TIMEOUT)
-      const done = () => (clearTimeout(timer), settle())
+    return new Promise<void>((resolve, reject) => {
+      let booted = false
+      const timer = setTimeout(
+        () => fail(`Preview relay ${frame.src} did not connect within ${RELAY_TIMEOUT / 1000}s: serve it with the headers in the README (COEP, CORP, CSP frame-ancestors); ${THIRD_PARTY_HINT}`),
+        RELAY_TIMEOUT,
+      )
+      const fail = (message: string) => {
+        stop()
+        frame.remove()
+        reject(new Error(message))
+      }
+      const stop = () => {
+        clearTimeout(timer)
+        removeEventListener('message', onWindowMessage)
+        this.relayPort?.close()
+        this.relayPort = null
+      }
       const onWindowMessage = (ev: MessageEvent) => {
         if (!acceptHello(ev, { previewOrigin: origin, relay: frame.contentWindow })) return
         // (re)connect: a reloaded relay says hello again
         const ch = new MessageChannel()
         this.relayPort?.close()
         const port = (this.relayPort = ch.port1)
+        let ready = false
         port.onmessage = (e) => {
           const m = e.data
-          if (m?.type === RELAY_READY) {
+          if (m?.type === RELAY_READY && !ready) {
+            ready = true
             port.postMessage({ type: 'cresslet-register', instanceId: this.instanceId })
-            done()
+            if (!booted) {
+              booted = true
+              clearTimeout(timer)
+              resolve()
+            }
           } else if (m?.type === RELAY_ERROR) {
-            this.emit('error', { message: String(m.message) })
-            done()
+            // previews can script the relay: only believe errors from its setup, and never show them unmarked
+            if (ready) return
+            if (!booted) fail(relayErrorText(m.message))
+            else this.emit('error', { message: relayErrorText(m.message) })
           } else this.onSwMessage(m, e.ports)
         }
         frame.contentWindow!.postMessage({ type: RELAY_INIT }, origin, [ch.port2])
@@ -377,14 +402,13 @@ export class Container {
       addEventListener('message', onWindowMessage)
       ;(document.body ?? document.documentElement).appendChild(frame)
       this.cleanups.push(() => {
-        clearTimeout(timer)
-        removeEventListener('message', onWindowMessage)
+        if (!booted) return
         const port = this.relayPort
-        this.relayPort = null
         port?.postMessage({ type: 'cresslet-unregister', instanceId: this.instanceId })
+        this.relayPort = null
+        stop()
         // let the relay forward the unregister before its frame goes
         setTimeout(() => (port?.close(), frame.remove()), 250)
-        settle()
       })
     })
   }
@@ -401,7 +425,7 @@ export class Container {
     this.cleanups.push(() => sw.removeEventListener('message', onMessage))
     try {
       const reg = await sw.register(url, { scope: '/' })
-      const active = reg.active ?? (await waitActive(reg))
+      const active = await newestWorker(reg, () => sw.ready)
       active.postMessage({ type: 'cresslet-register', instanceId: this.instanceId })
       this.cleanups.push(() => active.postMessage({ type: 'cresslet-unregister', instanceId: this.instanceId }))
     } catch (e) {
@@ -418,19 +442,6 @@ export class Container {
     for (const fn of this.cleanups.splice(0)) fn()
     this.listeners.clear()
   }
-}
-
-function waitActive(reg: ServiceWorkerRegistration): Promise<ServiceWorker> {
-  return new Promise((resolve, reject) => {
-    const w = reg.installing ?? reg.waiting
-    if (!w) return navigator.serviceWorker.ready.then((r) => resolve(r.active!), reject)
-    const check = () => {
-      if (w.state === 'activated') resolve(w)
-      else if (w.state === 'redundant') reject(new Error('service worker became redundant'))
-    }
-    w.addEventListener('statechange', check)
-    check()
-  })
 }
 
 export type { FileSystemTree, ContainerProcess, SpawnOptions, Command, CommandContext, DevServerOptions, DevServerHandle, BuildOptions, Dirent, Stats }

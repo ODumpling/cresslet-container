@@ -77,3 +77,40 @@ export function isSwToPage(d: unknown, ports: readonly unknown[]): boolean {
 export function isChannelName(s: unknown): s is string {
   return typeof s === 'string' && CHANNEL.test(s)
 }
+
+/** Shown with relay setup errors: cross-site preview origins need third-party service workers/storage. */
+export const THIRD_PARTY_HINT = 'if the preview origin is cross-site, this browser may block third-party service workers/storage'
+
+/** Host side: the text of a RELAY_ERROR (relay frames are scriptable by previews): prefixed, no control chars, capped. */
+export function relayErrorText(message: unknown): string {
+  // eslint-disable-next-line no-control-regex
+  return `preview relay: ${String(message).replace(/[\u0000-\u001f\u007f-\u009f]/g, '').slice(0, 500)}`
+}
+
+interface WorkerLike {
+  state: string
+  addEventListener(type: 'statechange', fn: () => void): void
+  removeEventListener(type: 'statechange', fn: () => void): void
+}
+
+/**
+ * The worker to talk to after `register()`: a newer one installing/waiting (skipWaiting + claim make it take over) wins
+ * over an older active one; otherwise the active one, or whatever `ready` brings.
+ */
+export function newestWorker<W extends WorkerLike>(
+  reg: { installing: W | null; waiting: W | null; active: W | null },
+  ready: () => Promise<{ active: W | null }>,
+): Promise<W> {
+  const w = reg.installing ?? reg.waiting
+  if (!w) return reg.active ? Promise.resolve(reg.active) : ready().then((r) => r.active!)
+  return new Promise((resolve, reject) => {
+    const check = () => {
+      if (w.state === 'activated') resolve(w)
+      else if (w.state === 'redundant') reject(new Error('service worker became redundant'))
+      else return
+      w.removeEventListener('statechange', check)
+    }
+    w.addEventListener('statechange', check)
+    check()
+  })
+}

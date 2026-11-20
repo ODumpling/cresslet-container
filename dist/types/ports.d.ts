@@ -15,6 +15,8 @@ export interface SwRequest {
     headers: [string, string][];
     body: ArrayBuffer | null;
 }
+/** A well-formed `cresslet-request` (checked before anything is dispatched to a port handler). */
+export declare function isSwRequest(d: unknown): d is SwRequest;
 export declare class PortTable {
     instanceId: string;
     private events;
@@ -32,6 +34,6 @@ export declare class PortTable {
     /** Lowest free port >= start. */
     free(start: number): number;
     dispatch(port: number, req: Request): Promise<Response>;
-    /** Answer a request bridged from the service worker. Streams the body back over `reply`. */
+    /** Answer a request bridged from the service worker. Streams the body back over `reply`, then closes it. */
     answer(m: SwRequest, reply: MessagePort): Promise<void>;
 }
