@@ -690,7 +690,13 @@ export class Container {
         let settle!: (e?: Error) => void
         let follow!: (next: Promise<MessagePort>) => void
         const conn = (link.conn = new Promise<MessagePort>((res, rej) => {
-          const t = setTimeout(() => settle(new Error(`preview relay did not reconnect within ${RELAY_TIMEOUT / 1000}s`)), RELAY_TIMEOUT)
+          const t = setTimeout(() => {
+            const e = new Error(`preview relay did not reconnect within ${RELAY_TIMEOUT / 1000}s`)
+            settle(e)
+            // an open preview's relay went quiet: say so (an opening waiting on it reports it itself)
+            const p = opts.onlyPort
+            if (p !== undefined && booted && link.conn === conn && !this.opening.has(p) && !this.torndown) this.emit('error', { message: `port ${p}: ${e.message}` })
+          }, RELAY_TIMEOUT)
           settle = (e) => {
             clearTimeout(t)
             if (!e) return res(port)

@@ -724,6 +724,27 @@ describe('Container.boot({ previewOrigins })', () => {
     relays.forEach((p) => p.close())
   })
 
+  it('reports an open preview whose relay reloads and never comes back', async () => {
+    const relays: MessagePort[] = []
+    const page = fakePage((origin, port) => {
+      if (origin.includes('-3000.') && relays.push(port) === 2) return
+      port.postMessage({ type: 'cresslet-relay-ready' })
+    })
+    const c = await Container.boot({ previewOrigins: TEMPLATE, npmCache: false })
+    const errors: unknown[] = []
+    c.on('error', (e) => errors.push(e))
+    c.servePort(3000, () => new Response('A'))
+    await tick()
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const hello = { origin: new URL(page.frames[1].src).origin, source: page.frames[1].contentWindow, data: { type: 'cresslet-relay-hello' } }
+    page.listeners.forEach((fn) => fn(hello))
+    await vi.advanceTimersByTimeAsync(20_000)
+    vi.useRealTimers()
+    expect(errors).toEqual([{ message: 'port 3000: preview relay did not reconnect within 20s' }])
+    c.teardown()
+    relays.forEach((p) => p.close())
+  })
+
   it('torn down mid-setup: asks the relay to drop its service worker and waits for it before removing the frame', async () => {
     const got: unknown[] = []
     let relayPort!: MessagePort

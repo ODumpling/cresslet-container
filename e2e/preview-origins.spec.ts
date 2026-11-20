@@ -246,12 +246,14 @@ test('the dev server (HMR, live updates) works on a per-preview origin', async (
 
 test("teardown while a preview's relay is still registering its service worker still unregisters it", async ({ browser }) => {
   const ctx = await browser.newContext()
-  // hold preview 3000's service worker script: the relay is mid-registration when the container is torn down
-  let held!: () => void
-  const asked = new Promise<void>((r) => (held = r))
+  // hold preview 3000's service worker script until the container is torn down: the relay is mid-registration then
+  let asked!: () => void
+  const requested = new Promise<void>((r) => (asked = r))
+  let release!: () => void
+  const released = new Promise<void>((r) => (release = r))
   await ctx.route(/-3000\.localhost:4402\/cresslet-sw\.js/, async (route) => {
-    held()
-    await new Promise((r) => setTimeout(r, 1500))
+    asked()
+    await released
     await route.continue()
   })
   const p = await ctx.newPage()
@@ -260,18 +262,22 @@ test("teardown while a preview's relay is still registering its service worker s
   const id = await p.evaluate(async (previewOrigins) => {
     const { Container } = await import('/dist/cresslet-container.js')
     const c = await Container.boot({ previewOrigins })
-    ;(window as unknown as Win).container = c
+    const w = window as unknown as Win & { ready?: boolean }
+    w.container = c
+    w.ready = false
+    c.on('server-ready', () => void (w.ready = true))
     c.servePort(3000, () => new Response('A'))
     return c.instanceId
   }, TEMPLATE)
-  await asked
-  expect(await p.evaluate(() => {
-    let ready = false
-    const c = (window as unknown as Win).container
-    c.on('server-ready', () => void (ready = true))
-    c.teardown()
-    return ready
-  })).toBe(false)
+  await requested
+  expect(
+    await p.evaluate(() => {
+      const w = window as unknown as Win & { ready?: boolean }
+      w.container.teardown()
+      return w.ready
+    }),
+  ).toBe(false)
+  release()
   const origin = `http://${id}-3000.localhost:4402`
   await expect.poll(() => p.frames().filter((f) => f.url().includes('/cresslet-relay.html')).length, { timeout: 10_000 }).toBe(0)
   await ctx.unroute(/cresslet-sw\.js/)
