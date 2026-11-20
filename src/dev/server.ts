@@ -193,7 +193,12 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     const abs = join(root, file)
     changes.push({ seq: ++changeSeq, file: abs })
     if (changes.length > 2000) changes.splice(0, changes.length - 1000)
-    if (!vfs.isFile(abs)) for (const k of cssErrors.keys()) if (k === abs || k.startsWith(abs + '/')) cssErrors.delete(k) // a file, or a directory removed with it
+    if (!vfs.isFile(abs)) {
+      // a file, or a directory removed with what's in it: its errors go, and builds in flight under it no longer report
+      const under = (k: string) => k === abs || k.startsWith(abs + '/')
+      for (const k of cssErrors.keys()) if (under(k)) cssErrors.delete(k)
+      for (const k of inflight.keys()) if (under(k)) bump(k)
+    }
     // Tailwind: every changed source updates the candidates (before any full-reload return, whether or not a Tailwind
     // stylesheet is on the page yet: the reloaded / next request must see them); contentCss picks what to re-serve
     const grown = cssPipe.mode.tailwind ? cssPipe.update(abs) : []

@@ -68,8 +68,11 @@ function exportTarget(exp, sub) {
 }
 
 /** Resolve a CSS `@import` the way vite/@tailwindcss/node do: relative paths, or packages via `style`/exports. */
+/** Where a stylesheet `@import` of path `p` may be (what resolution tries, and what a failure records). */
+const stylesheetPaths = (p) => [p, p + '.css', path.join(p, 'index.css')]
+
 function resolveStylesheet(id, base) {
-  const tryFile = (p) => [p, p + '.css', path.join(p, 'index.css')].find(isFile)
+  const tryFile = (p) => stylesheetPaths(p).find(isFile)
   if (id.startsWith('.') || id.startsWith('/')) {
     const f = tryFile(path.resolve(base, id))
     if (f) return f
@@ -154,8 +157,8 @@ function rebaseUrls(css, fromDir, toDir) {
       }
       if (isRelativeUrl(ref)) {
         const next = rebase(ref)
-        const quote = q || (/[\s"'()\\]/.test(next) ? '"' : '')
-        out += css.slice(last, i) + `url(${quote}${quote ? next.replace(/[\\"']/g, (c) => (c === quote || c === '\\' ? '\\' + c : c)) : next}${quote})`
+        const quote = q || (/[\s"'()\\\x00-\x1f\x7f]/.test(next) ? '"' : '')
+        out += css.slice(last, i) + `url(${quote}${quote ? escapeString(next, quote) : next}${quote})`
         last = end + 1
       }
       i = end + 1
@@ -174,6 +177,9 @@ function unescapeCss(s) {
     return nl ? '' : ch
   })
 }
+
+/** A CSS string's content: the quote and backslashes escaped, control characters (newlines) as hex escapes. */
+const escapeString = (s, quote) => s.replace(/[\\"'\x00-\x1f\x7f]/g, (c) => (c === quote || c === '\\' ? '\\' + c : c === '"' || c === "'" ? c : `\\${c.charCodeAt(0).toString(16)} `))
 
 /** Length of the escape at `css[i]` (a backslash): hex digits and their one whitespace, or one character. */
 function escapeLength(css, i) {
@@ -201,10 +207,10 @@ function dropProjectModules(root) {
 }
 
 /** Paths a failed relative `@import` / `@plugin` / `@config` might be created at. */
-function attempted(id, base, exts, index) {
+function attempted(id, base, exts) {
   if (!id.startsWith('.') && !id.startsWith('/')) return []
   const p = path.resolve(base, id)
-  return [p, ...(path.extname(p) ? [] : exts.map((e) => p + e)), ...(index ? [path.join(p, index)] : [])]
+  return exts ? (path.extname(p) ? [p] : [p, ...exts.map((e) => p + e)]) : stylesheetPaths(p)
 }
 
 function stale(deps) {
@@ -254,7 +260,7 @@ async function tailwind(req, css, from, out) {
           try {
             p = resolveStylesheet(id, base)
           } catch (err) {
-            for (const a of attempted(id, base, ['.css'], 'index.css')) record(a)
+            for (const a of attempted(id, base)) record(a)
             throw err
           }
           record(p)
@@ -374,9 +380,14 @@ function plugins(config, root) {
 let lastEnv = null
 async function handle(req) {
   // plugins and configs see the request's mode (a production build: NODE_ENV=production); packages that read it when
-  // loaded are loaded again when it changes (compilers/configs already built keep their instances)
+  // loaded are loaded again when it changes (a build during dev reloads them; switching is rare)
   const env = req.env || 'development'
-  if (lastEnv !== null && lastEnv !== env) for (const k of Object.keys(require.cache)) if (k !== __filename) delete require.cache[k]
+  if (lastEnv !== null && lastEnv !== env) {
+    // modules, and every plugin/compiler instance made from them, go together (no old plugins on a fresh postcss)
+    for (const k of Object.keys(require.cache)) if (k !== __filename) delete require.cache[k]
+    configs.clear()
+    compilers.clear()
+  }
   lastEnv = env
   process.env.NODE_ENV = env
   const out = { deps: new Set(), dirs: new Set(), tailwind: [], warnings: [] }

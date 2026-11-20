@@ -79,6 +79,8 @@ export declare class CssPipeline {
     revision: number;
     private plugins;
     private released;
+    /** Bumped by reset(): a request prepared under an older mode is prepared again. */
+    private generation;
     constructor(c: Pick<Container, 'vfs' | 'cssWorker'> & {
         cssPlugins?: boolean;
     }, root: string, env: CssRequest['env']);

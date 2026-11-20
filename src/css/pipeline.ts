@@ -97,6 +97,8 @@ export class CssPipeline {
   revision = 0
   private plugins: boolean
   private released = false
+  /** Bumped by reset(): a request prepared under an older mode is prepared again. */
+  private generation = 0
 
   constructor(
     private c: Pick<Container, 'vfs' | 'cssWorker'> & { cssPlugins?: boolean },
@@ -115,6 +117,7 @@ export class CssPipeline {
   /** Re-detect after package.json / PostCSS config / node_modules changes. */
   reset(): void {
     this.mode = detectCssMode(this.c.vfs, this.root, this.plugins)
+    this.generation++
     this.scanners.clear()
     this.rules.clear()
     this.c.cssWorker().restart()
@@ -147,11 +150,18 @@ export class CssPipeline {
       // the stylesheet's source rules come first (a discovery request when they aren't known for this text), so its
       // first build already has the candidates of exactly its sources
       if (restarts && !this.needs(css)) return { css, deps: [], dirs: [], scanner: null } // the new mode doesn't process it
+      const gen = this.generation
       const scanner = this.mode.tailwind && known?.key != null ? this.scannerFor(known.key, known.rules) : null
       const discover = this.mode.tailwind && !known
       const candidates = scanner ? await scanner.all() : []
       // closed meanwhile (dev server closed, build done): nothing may recreate its worker-side state
       if (this.released) throw new Error('CSS pipeline closed')
+      if (gen !== this.generation && ++restarts <= 3) {
+        // reset during the scan: prepare it again under the new mode (rules and scanners were cleared)
+        known = undefined
+        attempt--
+        continue
+      }
       try {
         r = await this.c.cssWorker().process({
           root: this.root,
@@ -169,7 +179,7 @@ export class CssPipeline {
       } catch (e) {
         // cut off by a reset: again with the mode (config path) and rules as they are now
         if (!(e as CssError).restarted || this.released || ++restarts > 3) throw e
-        known = this.rules.get(file)
+        known = this.rules.get(file) // cleared by our reset (another pipeline's restart keeps them)
         if (known && known.css !== css) known = undefined
         attempt--
         continue
@@ -332,6 +342,12 @@ export function nodeCssBackend(c: Container, o: { timeoutMs?: number; spawn?: Cs
     restart: () => void (proc && recycle(proc, 'restarted')),
     release(session) {
       if (!proc) return
+      // its requests still queued are never replayed on another worker (a timeout recycling this one)
+      for (const [id, j] of proc.pending) {
+        if (j.req.session !== session || j.timer) continue
+        proc.pending.delete(id)
+        j.reject(new Error('CSS pipeline closed'))
+      }
       for (const k of proc.sent.keys()) if (k.startsWith(session + ':')) proc.sent.delete(k)
       proc.w.write(JSON.stringify({ op: 'release', session }) + '\n')
     },

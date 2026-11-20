@@ -284,6 +284,30 @@ describe('CSS mode', () => {
     expect(reqs.at(-1)!.postcssConfig).toBe('/p/postcss.config.cjs')
   })
 
+  it('pipeline: a reset during the candidate scan prepares the request again under the new mode', async () => {
+    const v = tailwindProject()
+    for (let i = 0; i < 20; i++) v.writeFile(`/p/src/f${i}.js`, '"flex"')
+    let t = 0
+    const spy = vi.spyOn(performance, 'now').mockImplementation(() => (t += 5)) // the scan yields after each entry
+    const reqs: CssRequest[] = []
+    let p!: CssPipeline
+    const backend: CssBackend = {
+      restart() {},
+      async process(r) {
+        reqs.push(r)
+        if (r.discover) setTimeout(() => (v.writeFile('/p/package.json', '{}'), p.reset()), 0) // Tailwind removed mid-scan
+        return { css: 'built', deps: [], dirs: [], warnings: [], tailwind: [{ root: null, sources: [] }] }
+      },
+    }
+    p = new CssPipeline({ vfs: v, cssWorker: () => backend }, '/p', 'development')
+    try {
+      expect((await p.process('/p/a.css', '@import "tailwindcss";')).css).toBe('@import "tailwindcss";')
+      expect(reqs.map((q) => q.discover)).toEqual([true])
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
   it('pipeline: released while a discovery request runs, it sends no build (nothing recreates its worker state)', async () => {
     const v = tailwindProject()
     let release!: () => void
@@ -400,6 +424,9 @@ describe('CSS worker (real tailwindcss / postcss / autoprefixer)', () => {
     expect(worker.rebaseUrls('.a{background:url("./asset\\20 name.svg")}', '/p/d', '/p')).toBe('.a{background:url("./d/asset name.svg")}')
     expect(worker.rebaseUrls('.a{background:url(./asset\\ name.svg)}', '/p/d', '/p')).toBe('.a{background:url("./d/asset name.svg")}')
     expect(worker.rebaseUrls('.a{background:url(./\\31 x.svg)}', '/p/d', '/p')).toBe('.a{background:url(./d/1x.svg)}')
+    // control characters are written back as escapes (a raw newline would end the string)
+    expect(worker.rebaseUrls('.a{background:url("./a\\a b.svg")}', '/p/d', '/p')).toBe('.a{background:url("./d/a\\a b.svg")}')
+    expect(worker.rebaseUrls('.a{background:url(./a\\d b.svg)}', '/p/d', '/p')).toBe('.a{background:url("./d/a\\d b.svg")}')
   })
 
   it('a failed compile reports what it tried to read: a missing @import / @config target', async () => {
@@ -500,6 +527,8 @@ describe('CSS worker (real tailwindcss / postcss / autoprefixer)', () => {
     const dir = project({})
     const err = await worker.handle({ root: dir, file: join(dir, 'a.css'), css: '@import "tailwindcss";\n@import "./theme";\n', candidates: [] }).then(() => null, (e) => e)
     expect(err.deps).toEqual(expect.arrayContaining([join(dir, 'theme'), join(dir, 'theme.css'), join(dir, 'theme/index.css')]))
+    const err2 = await worker.handle({ root: dir, file: join(dir, 'a.css'), css: '@import "tailwindcss";\n@import "./theme.dark";\n', candidates: [] }).then(() => null, (e) => e)
+    expect(err2.deps).toEqual(expect.arrayContaining([join(dir, 'theme.dark'), join(dir, 'theme.dark.css'), join(dir, 'theme.dark/index.css')]))
   })
 
   it('a package that reads NODE_ENV when loaded sees the build\'s mode', async () => {
@@ -510,6 +539,10 @@ describe('CSS worker (real tailwindcss / postcss / autoprefixer)', () => {
     const req = { root: dir, file: join(dir, 'a.css'), css: 'a{}', candidates: [], postcssConfig: join(dir, 'postcss.config.cjs') }
     expect((await worker.handle({ ...req, env: 'development' })).css).toContain('env:development')
     expect((await worker.handle({ ...req, env: 'production' })).css).toContain('env:production')
+    // and back: plugins from before the switch never meet the reloaded postcss (instanceof checks hold)
+    const dir2 = project({ 'postcss.config.cjs': "const postcss = require('postcss')\nmodule.exports = { plugins: [{ postcssPlugin: 'inst', Once(root) { if (!(root instanceof postcss.Root)) throw new Error('mixed postcss instances') } }] }\n" })
+    const req2 = { root: dir2, file: join(dir2, 'a.css'), css: 'a{}', candidates: [], postcssConfig: join(dir2, 'postcss.config.cjs') }
+    for (const env of ['development', 'production', 'development'] as const) expect((await worker.handle({ ...req2, env })).css).toContain('a{}')
   })
 
   it('plugins: false (boot({ cssPlugins: false })): @plugin / @config are refused, Tailwind core compiles', async () => {
@@ -566,6 +599,24 @@ describe('CSS worker process (nodeCssBackend over a real node child)', () => {
       await b.process(req(dir, { candidateSet: 'x:1', candidates: ['flex', 'underline', 'grid'] }))
       expect(s.lines.at(-2)).toEqual({ op: 'release', session: 'x' })
       expect(s.lines.at(-1)!.candidates).toEqual(['flex', 'underline', 'grid'])
+    } finally {
+      b.close()
+    }
+  })
+
+  it('a released session\'s queued requests are not replayed when another request times out', async () => {
+    const dir = project({ 'postcss.config.cjs': "module.exports = { plugins: [{ postcssPlugin: 'hang', Once: (root) => root.toString().includes('HANG') ? new Promise(() => {}) : undefined }] }\n" })
+    const s = nodeSpawn()
+    const b = nodeCssBackend({} as never, { spawn: s.spawn, timeoutMs: 800 })
+    try {
+      const pc = { postcssConfig: join(dir, 'postcss.config.cjs') }
+      const hang = b.process(req(dir, { ...pc, css: '/* HANG */', session: 'a' }))
+      const queued = b.process(req(dir, { ...pc, css: 'a{}', session: 'b' }))
+      b.release!('b')
+      await expect(queued).rejects.toThrow(/closed/)
+      await expect(hang).rejects.toThrow(/timed out/)
+      await new Promise((r) => setTimeout(r, 100))
+      expect(s.lines.filter((l) => l.session === 'b' && l.op !== 'release')).toHaveLength(1)
     } finally {
       b.close()
     }

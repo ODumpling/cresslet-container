@@ -603,6 +603,19 @@ describe('dev server CSS processing', () => {
     expect(await s.get('/src/index.css?import&t=2')).toContain('.ok')
   })
 
+  it('a failing <link> build in flight when its directory is deleted does not report afterwards', async () => {
+    const h = holdable(true)
+    const s = await devServer({ ...files, 'index.html': '<link rel="stylesheet" href="/src/styles/index.css">', 'src/styles/index.css': '@import "tailwindcss";\n/* BROKEN */\n' }, { deps: { tailwindcss: '^4' }, css: h.backend })
+    const held = h.holdNext()
+    const css = s.get('/src/styles/index.css')
+    await held.started()
+    s.rm('src/styles')
+    held.release()
+    await css
+    await s.quiet()
+    expect(await s.get('/@cresslet/last-error')).toBe('')
+  })
+
   it('a failed CSS Module keeps what it tried to read: creating the missing @import updates its importer', async () => {
     const ROOT_ = '/__cresslet_test__/p'
     let exists = false
