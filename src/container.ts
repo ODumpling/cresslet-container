@@ -356,6 +356,7 @@ export class Container {
    */
   async nodeChannel(): Promise<NodeChannel> {
     if (!this.previewOrigin) return localChannel(this.createWorker('node-worker.js'))
+    this.checkRelayEnabled()
     nodeSource ??= fetchSource(workerScriptUrl().href).catch((e) => {
       nodeSource = null
       throw e
@@ -367,7 +368,7 @@ export class Container {
       this.relayScriptPort = relay
     }
     const { port1, port2 } = new MessageChannel()
-    const kill = (reason: string) => (ch.onerror?.(reason), ch.terminate())
+    const kill = (reason: string) => (ch.terminate(), notify(() => ch.onerror?.(reason)))
     const ch = relayChannel(port1, () => this.relayProcs.delete(kill))
     this.relayProcs.add(kill)
     relay.postMessage({ type: PROC_SPAWN }, [port2])
@@ -385,10 +386,11 @@ export class Container {
   async projectWorker(url: string | URL, opts: { name?: string } = {}): Promise<ProjectWorker> {
     const href = new URL(url, typeof location === 'undefined' ? undefined : location.href).href
     if (!this.previewOrigin) return new Worker(href, { type: 'module', name: opts.name }) as ProjectWorker
+    this.checkRelayEnabled()
     const source = await fetchSource(href)
     const relay = await this.workerRelay()
     const { port1, port2 } = new MessageChannel()
-    const kill = (reason: string) => (w.onerror?.({ message: reason }), w.terminate())
+    const kill = (reason: string) => (w.terminate(), notify(() => w.onerror?.({ message: reason })))
     const w = relayWorker(port1, () => this.relayProcs.delete(kill))
     this.relayProcs.add(kill)
     relay.postMessage({ type: WORKER_SPAWN, source, name: opts.name }, [port2])
@@ -397,9 +399,12 @@ export class Container {
 
   /** The relay port to start workers on. Never falls back to this page's origin when there is a `previewOrigin`. */
   private async workerRelay(): Promise<MessagePort> {
-    if (!this.relayBooted) throw new Error('project code runs on the preview origin, but previews are disabled (serviceWorkerUrl: false): no relay to run it')
     if (!this.relayConn) throw new Error('preview relay is not connected')
     return this.relayConn
+  }
+
+  private checkRelayEnabled(): void {
+    if (!this.relayBooted) throw new Error('project code runs on the preview origin, but previews are disabled (serviceWorkerUrl: false): no relay to run it')
   }
 
   // ---------------- service worker bridge ----------------
@@ -484,6 +489,8 @@ export class Container {
           if (m?.type === RELAY_READY && !ready) {
             ready = true
             settle()
+            // ready after the deadline (launches that waited got the timeout): later launches use it
+            if (this.relayPort === port) this.relayConn = Promise.resolve(port)
             port.postMessage({ type: 'cresslet-register', instanceId: this.instanceId })
             if (!booted) {
               booted = this.relayBooted = true
@@ -547,6 +554,15 @@ export class Container {
     for (const port of this.ports.list()) this.ports.close(port)
     for (const fn of this.cleanups.splice(0)) fn()
     this.listeners.clear()
+  }
+}
+
+/** Run a caller's callback without letting it break ours. */
+function notify(fn: () => void): void {
+  try {
+    fn()
+  } catch (e) {
+    console.error(e)
   }
 }
 

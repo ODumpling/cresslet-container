@@ -3,9 +3,10 @@
 onmessage = ({ data }) => {
   if (data.type === 'throw') throw new Error('boom from the worker')
   if (data.type === 'port') {
-    // answer on the port it was sent, and send one back
+    // answer on the port it was sent, and send one back through the worker's own channel
     const { port1, port2 } = new MessageChannel()
-    data.port.postMessage({ pong: true, back: port2 }, [port2])
+    data.port.postMessage({ pong: true })
+    postMessage({ back: true }, [port2])
     port1.onmessage = (e) => postMessage({ via: 'returned port', got: e.data })
     return
   }

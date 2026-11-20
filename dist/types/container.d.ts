@@ -172,6 +172,7 @@ export declare class Container {
     }): Promise<ProjectWorker>;
     /** The relay port to start workers on. Never falls back to this page's origin when there is a `previewOrigin`. */
     private workerRelay;
+    private checkRelayEnabled;
     /**
      * A message the SW posts to the page that owns an instance (directly, or forwarded by the relay). `exclusive`: the
      * channel is this container's own (the relay port), so every request on it is ours to answer, if only with a 400;

@@ -330,6 +330,32 @@ describe('Container.boot({ previewOrigin })', () => {
     c.teardown()
   })
 
+  it('a relay that reconnects after the deadline still runs later workers', async () => {
+    const ports: MessagePort[] = []
+    const page = fakePage((port) => {
+      ports.push(port)
+      port.onmessage = () => {}
+      if (ports.length === 1) port.postMessage({ type: 'cresslet-relay-ready' })
+    })
+    vi.stubGlobal('fetch', async () => new Response('/* node worker */'))
+    const c = await Container.boot({ previewOrigin: PREVIEW, npmCache: false })
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    // the relay reloads and takes longer than the deadline to come back
+    const hello = { origin: PREVIEW, source: page.frame.contentWindow, data: { type: 'cresslet-relay-hello' } }
+    page.listeners.forEach((fn) => fn(hello))
+    const late = c.nodeChannel()
+    const lateResult = late.then(() => 'ok', (e: Error) => e.message)
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(await lateResult).toMatch(/did not reconnect/)
+    vi.useRealTimers()
+    ports[1].postMessage({ type: 'cresslet-relay-ready' })
+    await new Promise((r) => setTimeout(r, 20))
+    const ch = await c.nodeChannel()
+    ch.terminate()
+    c.teardown()
+    ports.forEach((p) => p.close())
+  })
+
   it('answers malformed (or misaddressed) requests from the relay with a 400 and closes the reply port', async () => {
     let relayPort!: MessagePort
     fakePage((port) => {

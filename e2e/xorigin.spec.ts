@@ -479,9 +479,11 @@ for (const mode of ['previewOrigin', 'same origin'] as const)
       // MessagePorts pass through both ways
       const ports = await new Promise((resolve) => {
         const ch = new MessageChannel()
-        ch.port1.onmessage = (e) => {
-          e.data.back.postMessage('hi back')
-          w.onmessage = (e2) => resolve({ pong: e.data.pong, ...e2.data })
+        let pong = false
+        ch.port1.onmessage = (e) => (pong = e.data.pong)
+        w.onmessage = (e) => {
+          if (e.data.back) e.ports[0].postMessage('hi back')
+          else resolve({ pong, ...e.data })
         }
         w.postMessage({ type: 'port', port: ch.port2 }, [ch.port2])
       })
