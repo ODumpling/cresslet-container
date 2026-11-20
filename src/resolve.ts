@@ -5,6 +5,8 @@ export interface ResolveFs {
   isFile(p: string): boolean
   isDir(p: string): boolean
   readText(p: string): string | null
+  /** Real path (symlinks resolved): linked packages (workspaces) then resolve their imports from where they are. */
+  realpath?(p: string): string
 }
 
 export interface ResolveOptions {
@@ -93,13 +95,24 @@ export function splitBare(spec: string): { name: string; sub: string } {
   return { name: parts.slice(0, n).join('/'), sub: parts.slice(n).join('/') }
 }
 
+function realOrSame(fs: ResolveFs, p: string): string {
+  if (!fs.realpath) return p
+  try {
+    return fs.realpath(p)
+  } catch {
+    return p
+  }
+}
+
 export function resolveModule(fs: ResolveFs, spec: string, fromDir: string, opts: ResolveOptions): Resolved {
   if (spec.startsWith('/') || spec.startsWith('./') || spec.startsWith('../') || spec === '.' || spec === '..') {
     const abs = normalize(spec.startsWith('/') ? spec : join(fromDir, spec))
     const mapped = opts.browser ? browserMap(fs, abs) : abs
     if (mapped === false) return false
     const r = resolveFileOrDir(fs, mapped, opts)
-    if (r) return r
+    // its real path, as node: a file reached through a link (`node node_modules/ws/cli.js`) resolves its own
+    // relative imports from where it really is
+    if (r) return realOrSame(fs, r)
     throw new ResolveError(`Cannot find module '${spec}' from '${fromDir}'`)
   }
   if (spec.startsWith('#')) {
@@ -126,7 +139,7 @@ export function resolveModule(fs: ResolveFs, spec: string, fromDir: string, opts
     if (!d.endsWith('/node_modules')) {
       const pkgDir = join(d, 'node_modules', name)
       if (fs.isDir(pkgDir)) {
-        const r = resolvePackage(fs, pkgDir, sub, opts)
+        const r = resolvePackage(fs, fs.realpath?.(pkgDir) ?? pkgDir, sub, opts)
         if (r !== null) return r
       }
     }

@@ -42,6 +42,15 @@ export function exportTree(fs: VFS, dir: string, excludes: RegExp[] = [], rel = 
 
 /** Convert a glob ('**', '*', '?', '{a,b}') to an anchored RegExp over relative POSIX paths. */
 export function globToRegExp(glob: string): RegExp {
+  return toRegExp(glob, false)
+}
+
+/** As `globToRegExp`, plus `[abc]` / `[!abc]` character classes (npm's workspace globs). */
+export function workspaceGlobToRegExp(glob: string): RegExp {
+  return toRegExp(glob, true)
+}
+
+function toRegExp(glob: string, classes: boolean): RegExp {
   let re = ''
   for (let i = 0; i < glob.length; i++) {
     const c = glob[i]
@@ -52,7 +61,13 @@ export function globToRegExp(glob: string): RegExp {
         i += slash ? 2 : 1
       } else re += '[^/]*'
     } else if (c === '?') re += '[^/]'
-    else if (c === '{') {
+    else if (classes && c === '[' && glob.indexOf(']', i + 2) > i) {
+      const end = glob.indexOf(']', i + 2)
+      const body = glob.slice(i + 1, end)
+      re += `[${body.startsWith('!') || body.startsWith('^') ? '^/' + body.slice(1).replace(/[\\\]^]/g, '\\$&') : body.replace(/[\\\]^]/g, '\\$&')}]`
+      i = end
+    }
+    else if (c === '{' && glob.indexOf('}', i) > i) {
       const end = glob.indexOf('}', i)
       re += '(?:' + glob.slice(i + 1, end).split(',').map(escape).join('|') + ')'
       i = end

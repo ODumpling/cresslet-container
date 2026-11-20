@@ -2,7 +2,7 @@
 import type { Container } from './container'
 import type { Command, CommandContext } from './process'
 import { aborted, crlf, errorMessage } from './process'
-import { join, resolve } from './path'
+import { dirname, join, resolve } from './path'
 import { install, readPkg, splitPkgSpec, writePkg, binEntries } from './npm/install'
 import { mimeType } from './dev/project'
 import { interactive, Shell } from './shell/jsh'
@@ -43,13 +43,23 @@ function parseFlags(args: string[]) {
   return { flags, rest }
 }
 
+/** `node_modules/.bin` of cwd and every ancestor (as npm puts on PATH: hoisted workspace deps' bins live at the root). */
+function binPath(cwd: string): string {
+  const dirs: string[] = []
+  for (let d = cwd; ; d = dirname(d)) {
+    dirs.push(join(d, 'node_modules/.bin'))
+    if (d === '/' || dirname(d) === d) break
+  }
+  return dirs.join(':')
+}
+
 /** Run a package.json script through jsh with node_modules/.bin on PATH. */
 async function runScript(ctx: CommandContext, cwd: string, name: string, extra: string[], quiet = false): Promise<number> {
   const c = ctx.container
   const pkg = readPkg(c.vfs, cwd)
   const script = pkg?.scripts?.[name]
   if (script === undefined) return -1
-  const env = { ...ctx.env, PATH: `${join(cwd, 'node_modules/.bin')}:${ctx.env.PATH ?? ''}`, npm_lifecycle_event: name, npm_package_name: pkg?.name ?? '', npm_package_version: pkg?.version ?? '', INIT_CWD: cwd }
+  const env = { ...ctx.env, PATH: `${binPath(cwd)}:${ctx.env.PATH ?? ''}`, npm_lifecycle_event: name, npm_package_name: pkg?.name ?? '', npm_package_version: pkg?.version ?? '', INIT_CWD: cwd }
   const sh = new Shell(c, cwd, env)
   const io = { stdout: ctx.stdout, stderr: ctx.stderr, stdin: ctx.stdin, signal: ctx.signal, isTTY: ctx.isTTY }
   for (const phase of [`pre${name}`, name, `post${name}`]) {
@@ -79,7 +89,16 @@ export const npm: Command = async (ctx) => {
       case 'install':
       case 'add':
       case 'ci':
-        await install(c.vfs, c.registry, { cwd, add: rest, dev: flags.has('D') || flags.has('save-dev'), exact: flags.has('E') || flags.has('save-exact'), out: ctx.stdout, signal: ctx.signal })
+      case 'clean-install':
+        // -w/--workspace(s) aren't supported: refused rather than read as package names to add at the root
+        if (flags.has('w') || flags.has('workspace') || flags.has('workspaces') || flags.has('include-workspace-root')) throw new Error(`npm ${sub}: -w/--workspace/--workspaces are not supported in cresslet (run it at the project root)`)
+        if (flags.has('help') || flags.has('h') || flags.has('usage')) {
+          ctx.stdout.write(`npm ${sub} [pkg...] [-D] [-E]   (ci: install exactly what package-lock.json lists, from an empty node_modules)\n`)
+          return 0
+        }
+        // (refused before anything changes: a dry run would otherwise install, and `ci` wipe node_modules)
+        if (flags.has('dry-run')) throw new Error(`npm ${sub} --dry-run is not supported in cresslet`)
+        await install(c.vfs, c.registry, { cwd, add: sub === 'ci' || sub === 'clean-install' ? [] : rest, ci: sub === 'ci' || sub === 'clean-install', dev: flags.has('D') || flags.has('save-dev'), exact: flags.has('E') || flags.has('save-exact'), out: ctx.stdout, signal: ctx.signal })
         return 0
       case 'un':
       case 'uninstall':
@@ -170,7 +189,7 @@ export const npm: Command = async (ctx) => {
       case 'help':
       case '-h':
       case '--help':
-        ctx.stdout.write(`npm (cresslet ${NPM_VERSION})\n  install|i [pkg...] [-D]   uninstall <pkg...>   run <script>   start   test   init -y   exec|npx <bin>   ls\n`)
+        ctx.stdout.write(`npm (cresslet ${NPM_VERSION})\n  install|i [pkg...] [-D]   ci   uninstall <pkg...>   run <script>   start   test   init -y   exec|npx <bin>   ls\n`)
         return 0
     }
     // `npm <script>` shorthand is not npm behaviour; report unknown command
@@ -198,8 +217,8 @@ export const npx: Command = async (ctx) => {
   }
   const { name } = splitPkgSpec(spec)
   const bin = name.startsWith('@') ? name.split('/')[1] : name
-  const local = c.which(bin, ctx.cwd, { ...ctx.env, PATH: `${join(ctx.cwd, 'node_modules/.bin')}:${ctx.env.PATH ?? ''}` })
-  if (local && !pkgSpec) return c.exec(bin, { ...ctx, args: rest, env: { ...ctx.env, PATH: `${join(ctx.cwd, 'node_modules/.bin')}:${ctx.env.PATH ?? ''}` } })
+  const local = c.which(bin, ctx.cwd, { ...ctx.env, PATH: `${binPath(ctx.cwd)}:${ctx.env.PATH ?? ''}` })
+  if (local && !pkgSpec) return c.exec(bin, { ...ctx, args: rest, env: { ...ctx.env, PATH: `${binPath(ctx.cwd)}:${ctx.env.PATH ?? ''}` } })
   // install into a temp prefix and run its bin
   const prefix = `/tmp/npx/${(pkgSpec ?? spec).replace(/[^\w.-]/g, '_')}`
   if (!c.vfs.isDir(join(prefix, 'node_modules'))) {

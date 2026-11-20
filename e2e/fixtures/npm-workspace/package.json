@@ -1,0 +1,1 @@
+{"name":"mono","version":"1.0.0","private":true,"workspaces":["packages/*"],"dependencies":{"ms":"^2.0.0"},"devDependencies":{"semver":"^7.0.0"},"scripts":{"hi":"greet-cli"}}

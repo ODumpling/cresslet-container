@@ -26,6 +26,8 @@ export interface Packument {
     versions: Record<string, Manifest>;
 }
 export interface Registry {
+    /** Registry URL: lockfile tarball URLs on registry.npmjs.org are fetched from here instead (as npm does). */
+    readonly base?: string;
     packument(name: string): Promise<Packument>;
     tarball(url: string, integrity?: string): Promise<Uint8Array>;
     /** Wait (bounded, best-effort) for pending persistent-cache writes. */

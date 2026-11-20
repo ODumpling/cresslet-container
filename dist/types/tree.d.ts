@@ -19,3 +19,5 @@ export declare function mountTree(fs: VFS, tree: FileSystemTree, at: string): vo
 export declare function exportTree(fs: VFS, dir: string, excludes?: RegExp[], rel?: string): FileSystemTree;
 /** Convert a glob ('**', '*', '?', '{a,b}') to an anchored RegExp over relative POSIX paths. */
 export declare function globToRegExp(glob: string): RegExp;
+/** As `globToRegExp`, plus `[abc]` / `[!abc]` character classes (npm's workspace globs). */
+export declare function workspaceGlobToRegExp(glob: string): RegExp;
