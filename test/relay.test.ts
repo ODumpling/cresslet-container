@@ -332,10 +332,13 @@ describe('Container.boot({ previewOrigin })', () => {
 
   it('a relay that reconnects after the deadline still runs later workers', async () => {
     const ports: MessagePort[] = []
+    let registered: () => void
+    const reRegistered = new Promise<void>((r) => (registered = r))
     const page = fakePage((port) => {
       ports.push(port)
-      port.onmessage = () => {}
-      if (ports.length === 1) port.postMessage({ type: 'cresslet-relay-ready' })
+      const n = ports.length
+      port.onmessage = (e) => n === 2 && e.data?.type === 'cresslet-register' && registered()
+      if (n === 1) port.postMessage({ type: 'cresslet-relay-ready' })
     })
     vi.stubGlobal('fetch', async () => new Response('/* node worker */'))
     const c = await Container.boot({ previewOrigin: PREVIEW, npmCache: false })
@@ -349,7 +352,7 @@ describe('Container.boot({ previewOrigin })', () => {
     expect(await lateResult).toMatch(/did not reconnect/)
     vi.useRealTimers()
     ports[1].postMessage({ type: 'cresslet-relay-ready' })
-    await new Promise((r) => setTimeout(r, 20))
+    await reRegistered
     const ch = await c.nodeChannel()
     ch.terminate()
     c.teardown()

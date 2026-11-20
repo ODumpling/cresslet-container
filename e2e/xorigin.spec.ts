@@ -477,16 +477,16 @@ for (const mode of ['previewOrigin', 'same origin'] as const)
         w.postMessage({ code: 'export default (n) => n * 2', n: 21, body }, [body])
       })
       // MessagePorts pass through both ways
-      const ports = await new Promise((resolve) => {
-        const ch = new MessageChannel()
-        let pong = false
-        ch.port1.onmessage = (e) => (pong = e.data.pong)
+      const ch = new MessageChannel()
+      const pong = new Promise((resolve) => (ch.port1.onmessage = (e) => resolve(e.data.pong)))
+      const back = new Promise((resolve) => {
         w.onmessage = (e) => {
           if (e.data.back) e.ports[0].postMessage('hi back')
-          else resolve({ pong, ...e.data })
+          else resolve(e.data)
         }
-        w.postMessage({ type: 'port', port: ch.port2 }, [ch.port2])
       })
+      w.postMessage({ type: 'port', port: ch.port2 }, [ch.port2])
+      const ports = { pong: await pong, ...((await back) as object) }
       const error = await new Promise<string>((resolve) => {
         w.onerror = (e) => resolve(e.message)
         w.postMessage({ type: 'throw' })
