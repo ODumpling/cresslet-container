@@ -16,6 +16,12 @@ const shims = {
     b.onResolve({ filter: /^process\/?$/ }, () => ({ path: `${root}src/node/shims/process.cjs` }))
     b.onResolve({ filter: /^abort-controller$/ }, () => ({ path: `${root}src/node/shims/abort-controller.cjs` }))
     b.onResolve({ filter: /^cjs-lexer-js$/ }, () => ({ path: `${root}node_modules/cjs-module-lexer/lexer.js` }))
+    // `import text from 'pkg/file.js?raw'` (as in vite/vitest): embed a file's source as a minified string
+    b.onResolve({ filter: /\?raw$/ }, (a) => ({ path: `${root}node_modules/${a.path.slice(0, -4)}`, namespace: 'raw' }))
+    b.onLoad({ filter: /.*/, namespace: 'raw' }, async (a) => {
+      const { code } = await esbuild.transform(readFileSync(a.path, 'utf8'), { minify: true, legalComments: 'inline' })
+      return { contents: code, loader: 'text' }
+    })
   },
 }
 

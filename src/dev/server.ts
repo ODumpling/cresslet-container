@@ -8,6 +8,9 @@ import { clientCode, errorModule, styleModule } from './client'
 import { DepOptimizer, scanImports } from './deps'
 import { ASSET_EXT, envDefines, jsxOptions, loadEnv, matchPaths, mimeType, readProjectConfig, SCRIPT_EXT, type ProjectConfig } from './project'
 import { findModuleScripts } from '../build/html'
+import { ModuleGraph, type HmrUpdate } from './hmr'
+import { refreshRuntimeModule, refreshTransform, refreshUtilsCode, REFRESH_RUNTIME_URL, REFRESH_UTILS_URL } from './refresh'
+import refreshRuntimeCjs from 'react-refresh/cjs/react-refresh-runtime.development.js?raw'
 
 export interface DevServerOptions {
   root?: string
@@ -36,19 +39,117 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   let defines = { ...envDefines(env), 'process.env.NODE_ENV': '"development"' }
   const deps = new DepOptimizer(vfs, fs, root, { wasmURL: c.esbuildWasmUrl, define: { 'process.env.NODE_ENV': '"development"' } })
   deps.onStale = () => scheduleReload('dependencies re-optimized')
-  const transformCache = new Map<string, { mtime: number; code: string }>()
+  /**
+   * Transformed scripts, with what the graph needs to re-learn them after a full reload resets it. Valid only for the
+   * same mtime and source revision: two writes in one millisecond keep the mtime, the revision still moves.
+   */
+  const transformCache = new Map<string, { mtime: number; gen: number; code: string; imports: Set<string>; boundary: boolean }>()
+  /** Bumped per module by each HMR flush: an in-flight transform from an older generation must not be cached or report errors. */
+  const generation = new Map<string, number>()
+  const bump = (f: string) => generation.set(f, (generation.get(f) ?? 0) + 1)
+  /** Bumped by every full reload (graph reset): work started for the previous page must not touch the new one's state. */
+  let pageGen = 0
+  /** Generation of the transform that last published a module's graph edges/accept (current page only). */
+  const published = new Map<string, number>()
+  /** Modules with a transform in flight (current page): a change to one isn't "never served", even without a graph node. */
+  const inflight = new Map<string, number>()
+  /** Whether a transform of `f` started at generation `gen` during page `page` is still current. */
+  const fresh = (f: string, gen: number, page: number) => page === pageGen && (generation.get(f) ?? 0) === gen
   let lastError = ''
   let lastErrorFile = ''
 
-  // ---- file watching -> live reload ----
+  // ---- file watching -> HMR, else live reload ----
+  const graph = new ModuleGraph()
+  /** Last HMR timestamp per module: imports of it are rewritten to `?t=<ts>` so re-executed importers get the new copy. */
+  const hmrStamp = new Map<string, number>()
+  /** Modules with a relative import that didn't resolve (yet). */
+  const unresolved = new Set<string>()
+  /** Files served as-is (e.g. a runtime `fetch('/data.json')`): outside the module graph, but the page uses them. */
+  const served = new Set<string>()
   let reloadTimer: ReturnType<typeof setTimeout> | null = null
   let depsTimer: ReturnType<typeof setTimeout> | null = null
+  let flushTimer: ReturnType<typeof setTimeout> | null = null
+  const pending = new Set<string>()
+  let closed = false
+  const post = (m: unknown) => {
+    if (!closed) bc.postMessage(m)
+  }
   const scheduleReload = (_why: string) => {
     if (reloadTimer) clearTimeout(reloadTimer)
     reloadTimer = setTimeout(() => {
       reloadTimer = null
-      bc.postMessage({ type: 'reload' })
+      pending.clear()
+      lastError = lastErrorFile = '' // the page starts over; a still-broken module reports again when requested
+      graph.reset() // so is its module graph: edges/boundaries are re-learnt from what the new page requests
+      pageGen++
+      published.clear()
+      inflight.clear()
+      post({ type: 'reload' })
     }, 60)
+  }
+  const scheduleHmr = (abs: string) => {
+    // the source revision changes now, not at the flush: a transform started inside the debounce window must be
+    // newer than one started before the change (publication order, last-error set/clear)
+    bump(abs)
+    pending.add(abs)
+    if (flushTimer) clearTimeout(flushTimer)
+    flushTimer = setTimeout(flushHmr, 60)
+  }
+  const flushHmr = () => {
+    flushTimer = null
+    if (reloadTimer || !pending.size) return
+    // a module that failed to transform may be fixed by this change (e.g. a newly created import target)
+    if (lastErrorFile) {
+      const n = graph.nodes.get(lastErrorFile)
+      // deleted, or no longer imported by anything: its error is no longer the page's problem
+      if (!vfs.isFile(lastErrorFile) || (n && !n.importers.size && !graph.isEntry(lastErrorFile))) lastError = lastErrorFile = ''
+      else if (!n) return scheduleReload('recovering from an error')
+      else pending.add(lastErrorFile)
+    }
+    const files = [...pending]
+    pending.clear()
+    for (const f of files) bump(f)
+    // deleted/renamed modules: forget them (all of them, before anything returns) so stale edges don't steer later updates
+    const gone = files.filter((f) => graph.nodes.has(f) && !vfs.isFile(f))
+    for (const f of gone) {
+      graph.remove(f)
+      published.delete(f)
+      hmrStamp.delete(f)
+      transformCache.delete(f)
+      unresolved.delete(f)
+      if (f === lastErrorFile) lastError = lastErrorFile = ''
+    }
+    if (gone.length) return scheduleReload(gone[0])
+    const updates = new Map<string, HmrUpdate>()
+    const chain = new Set<string>()
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i]
+      // a module whose first transform is in flight has no node yet, but the page is about to run it
+      if (!graph.nodes.has(f) && !inflight.has(f)) {
+        // never served to the page, so it can't affect it, unless it's something loaded outside the module graph
+        // or a module whose import of it failed to resolve
+        if (vfs.isDir(f)) continue
+        if (served.has(f)) return scheduleReload(f)
+        if (!SCRIPT_EXT.test(f) && !f.endsWith('.css')) {
+          if (ASSET_EXT.test(f)) return scheduleReload(f)
+          continue // README, dotfiles, editor temp files...
+        }
+        for (const u of unresolved) if (!files.includes(u)) files.push(u)
+        continue
+      }
+      const r = graph.propagate(f)
+      if (!r) return scheduleReload(f)
+      for (const u of r.updates) updates.set(u.file, u)
+      for (const m of r.chain) chain.add(m)
+    }
+    if (!updates.size) return
+    const t = Date.now()
+    for (const m of chain) {
+      hmrStamp.set(m, t)
+      transformCache.delete(m)
+      bump(m)
+    }
+    post({ type: 'update', updates: [...updates.values()].map((u) => ({ kind: u.kind, url: toUrl(u.file) + (u.kind === 'css' ? '?import' : ''), t })) })
   }
   const watcher = vfs.watch(root, { recursive: true }, (_ev, file) => {
     if (file.startsWith('node_modules/') || file === 'node_modules') {
@@ -69,7 +170,8 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       defines = { ...envDefines(env), 'process.env.NODE_ENV': '"development"' }
       transformCache.clear()
     }
-    scheduleReload(file)
+    if (/^(tsconfig.*\.json|jsconfig\.json|package\.json|\.env.*)$/.test(file) || /\.html?$/.test(file) || file.startsWith('public/')) return scheduleReload(file)
+    scheduleHmr(join(root, file))
   })
 
   // ---- resolution helpers ----
@@ -102,24 +204,31 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   }
 
   /** Rewrite one import specifier from `importer` to a URL the browser can fetch. */
-  const rewrite = (spec: string, importer: string): string => {
+  const rewrite = (spec: string, importer: string, onLocal?: (abs: string) => void): string => {
     if (/^(https?:|data:|blob:|\/\/|\/@)/.test(spec)) return spec
     const [clean, query] = splitQuery(spec)
     const local = resolveLocal(spec, importer)
-    if (local) return toUrl(local) + flagFor(local, query)
+    if (local) {
+      onLocal?.(local)
+      const q = flagFor(local, query)
+      const t = hmrStamp.get(local)
+      return toUrl(local) + (t ? `${q ? q + '&' : '?'}t=${t}` : q)
+    }
     if (isNodeBuiltin(clean)) return '/@cresslet/empty'
     if (/\.(css)$/.test(clean)) return `/@modules/${clean}${query ? query + '&import' : '?import'}`
     return `/@modules/${clean}${query}`
   }
 
   // ---- transforms ----
-  const importsPlugin = (importer: string): Plugin => ({
+  const importsPlugin = (importer: string, locals?: Set<string>, onUnresolved?: () => void): Plugin => ({
     name: 'cresslet-dev-imports',
     setup(build) {
       build.onResolve({ filter: /.*/ }, (a) => {
         if (a.kind === 'entry-point') return { path: a.path, namespace: 'cresslet-entry' }
         try {
-          const url = rewrite(a.path, a.importer && a.importer !== '<stdin>' ? a.importer : importer)
+          let local = false
+          const url = rewrite(a.path, a.importer && a.importer !== '<stdin>' ? a.importer : importer, (l) => ((local = true), locals?.add(l)))
+          if (!local && /^\.\.?\//.test(a.path)) onUnresolved?.()
           if (url.startsWith('/@modules/')) {
             const s = splitQuery(url.slice('/@modules/'.length))[0]
             if (!s.endsWith('.css')) deps.add([s])
@@ -133,6 +242,15 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     },
   })
 
+  const SCRIPT_LOADERS = new Set(['ts', 'tsx', 'jsx', 'js'])
+  /** Whether esbuild's output has JSX: a static import of the automatic runtime, or a call of the classic factory (outside strings/comments). */
+  const hasJsx = (code: string, importsRuntime: boolean) => {
+    if (importsRuntime) return true
+    const [head, ...rest] = (cfg.jsxFactory ?? 'React.createElement').split('.').map((p) => p.replace(/[$]/g, '\\$'))
+    const call = new RegExp(`(?<![\\w$.])${[head + '\\d*', ...rest].join('\\s*\\.\\s*')}\\s*\\(`) // not document.createElement
+    return call.test(code.replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\[\s\S])*`/g, ' '))
+  }
+  const jsxRuntimes = () => new Set([cfg.jsxImportSource, 'react'].flatMap((s) => [`${s}/jsx-runtime`, `${s}/jsx-dev-runtime`]))
   const loaderOf = (p: string) => {
     const e = extname(p)
     return e === '.tsx' ? 'tsx' : e === '.ts' || e === '.mts' || e === '.cts' ? 'ts' : e === '.jsx' ? 'jsx' : 'jsx'
@@ -140,9 +258,32 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
 
   const transformScript = async (abs: string): Promise<string> => {
     const st = vfs.stat(abs)
+    const gen = generation.get(abs) ?? 0
+    const page = pageGen
     const hit = transformCache.get(abs)
-    if (hit && hit.mtime === st.mtimeMs) return hit.code
+    if (hit && hit.mtime === st.mtimeMs && hit.gen === gen) {
+      publish(abs, hit.imports, hit.boundary, gen, page)
+      return hit.code
+    }
+    inflight.set(abs, (inflight.get(abs) ?? 0) + 1)
+    try {
+      return await buildScript(abs, st.mtimeMs, gen, page)
+    } finally {
+      const k = (inflight.get(abs) ?? 0) - 1
+      if (page === pageGen) k > 0 ? inflight.set(abs, k) : inflight.delete(abs) // a reset already cleared it
+    }
+  }
+  const buildScript = async (abs: string, mtime: number, gen: number, page: number): Promise<string> => {
     const es = await loadEsbuild(c.esbuildWasmUrl)
+    const locals = new Set<string>()
+    unresolved.delete(abs)
+    const runtimes = jsxRuntimes()
+    let importsRuntime = false
+    const jsxRuntimePlugin: Plugin = {
+      name: 'cresslet-jsx-runtime',
+      // static imports only: esbuild's JSX output imports the runtime statically; a dynamic `import()` of it isn't JSX
+      setup: (b) => b.onResolve({ filter: /jsx-(dev-)?runtime$/ }, (a) => void (importsRuntime ||= a.kind === 'import-statement' && runtimes.has(a.path))),
+    }
     const r = await es.build({
       entryPoints: [abs],
       bundle: true,
@@ -155,17 +296,40 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       ...jsxOptions(cfg),
       tsconfigRaw: cfg.tsconfigRaw as never,
       define: defines,
-      plugins: [importsPlugin(abs)],
+      plugins: [jsxRuntimePlugin, importsPlugin(abs, locals, () => unresolved.add(abs))],
       logLevel: 'silent',
       absWorkingDir: root,
     })
-    const code = r.outputFiles[0].text
-    transformCache.set(abs, { mtime: st.mtimeMs, code })
+    let code = r.outputFiles[0].text
+    let boundary = false
+    // every script esbuild loads (incl. .ts hook modules, .js JSX): hooks need signatures wherever they're defined
+    if (cfg.refresh && SCRIPT_LOADERS.has(loaderOf(abs))) {
+      const rr = refreshTransform(code, toUrl(abs))
+      code = rr.code
+      // only component modules can be boundaries: a .ts/.js module exporting API_URL / an enum must not self-accept
+      boundary = rr.boundary && (loaderOf(abs) === 'jsx' || loaderOf(abs) === 'tsx') && hasJsx(r.outputFiles[0].text, importsRuntime)
+    }
+    // the graph describes the code the page actually runs, even if the file changed meanwhile
+    publish(abs, locals, boundary, gen, page)
+    // changed while this transform was in flight: serve it, but don't cache stale code
+    if (!fresh(abs, gen, page)) return code
+    transformCache.set(abs, { mtime, gen, code, imports: locals, boundary })
     return code
+  }
+  /**
+   * Record a transform's edges/accept, unless it is from a previous page (after a full reload) or a newer transform of
+   * the module already published; a stale transform still publishes when nothing newer has (its code is what runs).
+   */
+  const publish = (abs: string, imports: Set<string>, boundary: boolean, gen: number, page: number) => {
+    if (page !== pageGen || gen < (published.get(abs) ?? -1)) return
+    published.set(abs, gen)
+    graph.setImports(abs, imports)
+    graph.ensure(abs).accept = boundary ? 'self' : null
   }
 
   const transformInline = async (code: string, htmlPath: string): Promise<string> => {
     const es = await loadEsbuild(c.esbuildWasmUrl)
+    const locals = new Set<string>()
     const r = await es.build({
       stdin: { contents: code, resolveDir: dirname(htmlPath), loader: 'tsx', sourcefile: htmlPath },
       bundle: true,
@@ -174,14 +338,16 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       target: 'es2022',
       ...jsxOptions(cfg),
       define: defines,
-      plugins: [importsPlugin(htmlPath)],
+      plugins: [importsPlugin(htmlPath, locals)],
       logLevel: 'silent',
     })
+    for (const l of locals) graph.ensure(l).importers.add(htmlPath)
     return r.outputFiles[0].text
   }
 
   const cssModule = async (abs: string, asModule: boolean): Promise<string> => {
     const es = await loadEsbuild(c.esbuildWasmUrl)
+    const cssDeps = new Set<string>()
     const urlPlugin: Plugin = {
       name: 'cresslet-css-urls',
       setup(build) {
@@ -202,11 +368,12 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
               if (clean.startsWith('/') && vfs.isFile(pub)) return { path: clean, external: true }
               return { path: a.path, external: true }
             }
-            if (a.kind === 'import-rule') return { path: target, namespace: 'cresslet-entry' }
+            if (a.kind === 'import-rule') return cssDeps.add(target), { path: target, namespace: 'cresslet-entry' }
             return { path: toUrl(target), external: true }
           }
           if (a.kind === 'composes-from') {
             const t = resolveLocal(a.path, importer)
+            if (t) cssDeps.add(t)
             return t ? { path: t, namespace: 'cresslet-entry' } : { path: a.path, external: true }
           }
           return { path: a.path, external: true }
@@ -230,16 +397,31 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       })
       const js = r.outputFiles.find((f) => f.path.endsWith('.js'))!.text
       const css = r.outputFiles.find((f) => f.path.endsWith('.css'))?.text ?? ''
+      cssDeps.delete(abs)
+      trackCss(abs, cssDeps, null) // class names are exports: updates go through the importing component
       return styleModule(css, toUrl(abs), js)
     }
     const r = await es.build({ entryPoints: [abs], bundle: true, write: false, outdir: '/__dev__', plugins: [urlPlugin], logLevel: 'silent' })
     const css = r.outputFiles[0]?.text ?? ''
+    if (abs.startsWith(root + '/')) trackCss(abs, cssDeps, asModule ? 'self' : 'link')
     return asModule ? styleModule(css, toUrl(abs)) : css
   }
 
+  const trackCss = (abs: string, imports: Set<string>, accept: 'self' | 'link' | null) => {
+    graph.setImports(abs, imports)
+    graph.ensure(abs, 'css').accept = accept
+    for (const d of imports) graph.ensure(d, 'css')
+  }
+
   const transformHtml = async (abs: string): Promise<string> => {
-    let html = vfs.readText(abs)
-    html = html.replace(/%(\w+)%/g, (m, k) => (k in env ? String(env[k]) : m))
+    let html = vfs.readText(abs).replace(/%(\w+)%/g, (m, k) => (k in env ? String(env[k]) : m))
+    graph.setEntries(
+      abs,
+      findModuleScripts(html).map((src) => {
+        const [p] = splitQuery(src)
+        return p.startsWith('/') ? fromUrl(p) : join(dirname(abs), p)
+      }),
+    )
     // transform inline module scripts
     const inline = /<script\b([^>]*\btype\s*=\s*["']?module["']?[^>]*)>([\s\S]*?)<\/script>/gi
     const parts: Promise<string>[] = []
@@ -250,7 +432,9 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     const done = await Promise.all(parts)
     let i = 0
     html = html.replace(inline, () => done[i++])
-    const tag = `<script type="module" src="/@cresslet/client"></script>`
+    let tag = `<script type="module" src="/@cresslet/client"></script>`
+    // React Fast Refresh must hook React before react-dom evaluates: load the runtime ahead of the app's scripts
+    if (cfg.refresh) tag += `\n    <script type="module" src="${REFRESH_UTILS_URL}"></script>`
     if (/<head[^>]*>/i.test(html)) html = html.replace(/<head[^>]*>/i, (h) => `${h}\n    ${tag}`)
     else html = tag + html
     return html
@@ -289,6 +473,8 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       if (pathname === '/@cresslet/client') return new Response(clientCode(channelName, `/__cresslet__/${c.instanceId}/${port}`), { headers: JS })
       if (pathname === '/@cresslet/last-error') return new Response(lastError, { headers: { 'content-type': 'text/plain', ...NO_CACHE } })
       if (pathname === '/@cresslet/empty') return new Response('export default {}', { headers: JS })
+      if (pathname === REFRESH_UTILS_URL) return new Response(refreshUtilsCode(), { headers: JS })
+      if (pathname === REFRESH_RUNTIME_URL) return new Response(refreshRuntimeModule(refreshRuntimeCjs), { headers: JS })
       if (pathname.startsWith('/@modules/')) {
         const spec = pathname.slice('/@modules/'.length)
         if (/^chunk-[\w-]+\.js$/.test(spec.split('/').pop()!) && !deps.has(spec)) {
@@ -323,14 +509,21 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
         if (ASSET_EXT.test(abs) || !SCRIPT_EXT.test(abs)) return new Response(`export default ${JSON.stringify(pathname)}`, { headers: JS })
       }
       if (SCRIPT_EXT.test(abs)) {
+        const gen = generation.get(abs) ?? 0
+        const page = pageGen
         try {
           const code = await transformScript(abs)
-          if (lastErrorFile === abs) lastError = lastErrorFile = ''
+          // a stale success (file changed / page reloaded meanwhile) must not clear a newer error
+          if (lastErrorFile === abs && fresh(abs, gen, page)) lastError = lastErrorFile = ''
           return new Response(code, { headers: JS })
         } catch (e) {
-          lastError = formatErrors(e)
-          lastErrorFile = abs
-          return new Response(errorModule(lastError), { headers: JS })
+          const msg = formatErrors(e)
+          // the file changed / the page reloaded while this transform ran: its error is not the page's current problem
+          if (fresh(abs, gen, page)) {
+            lastError = msg
+            lastErrorFile = abs
+          }
+          return new Response(errorModule(msg), { headers: JS })
         }
       }
       return fileResponse(abs)
@@ -342,13 +535,15 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     }
   }
 
-  const fileResponse = (abs: string) => new Response(vfs.readFile(abs) as BodyInit, { headers: { 'content-type': mimeType(abs), ...NO_CACHE } })
+  const fileResponse = (abs: string) => (served.add(abs), new Response(vfs.readFile(abs) as BodyInit, { headers: { 'content-type': mimeType(abs), ...NO_CACHE } }))
 
   const url = c.ports.open(port, handler, 'dev-server')
   return {
     url,
     port,
     close() {
+      closed = true
+      for (const t of [reloadTimer, depsTimer, flushTimer]) if (t) clearTimeout(t)
       watcher.close()
       bc.close()
       c.ports.close(port)

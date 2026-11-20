@@ -1,4 +1,32 @@
-// Browser-side live-reload + error overlay client, served at /@cresslet/client.
+// Browser-side HMR / live-reload + error overlay client, served at /@cresslet/client.
+
+/**
+ * Point the active `<link rel=stylesheet>`s for `pathname` at `href`. Each active link has at most one pending
+ * replacement (a newer edit supersedes it); the active link goes only once its replacement has loaded, and stays if
+ * the replacement fails. Returns false when the page has no such link. Plain JS: inlined into the client.
+ */
+export const SWAP_LINKS = `function swapLinks(doc, pathname, href) {
+  const links = [...doc.querySelectorAll('link[rel="stylesheet"]')].filter((l) => !l.__cressletPending && new URL(l.href, doc.baseURI).pathname === pathname);
+  if (!links.length) return false;
+  for (const l of links) {
+    if (l.__cressletNext) l.__cressletNext.remove();
+    const next = l.cloneNode();
+    next.__cressletPending = true;
+    next.href = href;
+    l.__cressletNext = next;
+    next.onload = () => {
+      if (l.__cressletNext !== next) return;
+      next.__cressletPending = false;
+      l.remove();
+    };
+    next.onerror = () => {
+      if (l.__cressletNext === next) l.__cressletNext = null;
+      next.remove();
+    };
+    l.after(next);
+  }
+  return true;
+}`
 
 export function clientCode(channel: string, prefix: string): string {
   return `const CH = ${JSON.stringify(channel)};
@@ -20,16 +48,71 @@ export function showOverlay(msg) {
 }
 export function clearOverlay() { overlay?.remove(); }
 window.__cresslet_overlay = showOverlay;
+// navigate via the preview prefix rather than location.reload(): works even when the browser can't
+// attribute a clean (prefix-stripped) URL to this preview
+function reload() { location.replace(location.pathname.startsWith(PREFIX + '/') ? location.href : PREFIX + location.pathname + location.search + location.hash); }
+
+// ---- HMR ----
+// An error outside an HMR update (failed initial load, uncaught runtime error) may have left the page half-initialised:
+// the next change then does a full reload instead of a hot update.
+let updating = 0;
+let stale = false;
+/** Called by modules that failed to transform. */
+export function moduleError(msg) {
+  if (!updating) stale = true;
+  showOverlay(msg);
+}
+${SWAP_LINKS}
+let queue = Promise.resolve();
+async function applyUpdates(updates) {
+  if (stale) return reload();
+  updating++;
+  try {
+    let refresh = false;
+    let failed;
+    for (const u of updates) {
+      const url = u.url + (u.url.includes('?') ? '&' : '?') + 't=' + u.t;
+      if (u.kind === 'css-link') {
+        if (!swapLinks(document, u.url, url)) return reload();
+        continue;
+      }
+      // one failing boundary (e.g. a syntax error) must not hold back the others in this batch;
+      // the server re-sends it once it is fixed
+      let mod;
+      try {
+        mod = await import(url);
+      } catch (err) {
+        failed = err;
+        continue;
+      }
+      if (u.kind === 'js') {
+        const rt = await import('/@cresslet/refresh');
+        // added/removed exports, or a default that now is another component: importers hold the old bindings
+        if (!rt.isBoundary(mod) || rt.exportsChanged(u.url)) return reload();
+        refresh = true;
+      }
+    }
+    if (refresh) (await import('/@cresslet/refresh')).performRefresh();
+    if (failed) throw failed;
+    clearOverlay();
+    console.debug('[cresslet] hot updated', updates.map((u) => u.url).join(', '));
+  } catch (err) {
+    showOverlay((err && err.stack) || String(err));
+  } finally {
+    updating--;
+  }
+}
+
 const bc = new BroadcastChannel(CH);
 bc.onmessage = (e) => {
   const m = e.data || {};
-  // navigate via the preview prefix rather than location.reload(): works even when the browser can't
-  // attribute a clean (prefix-stripped) URL to this preview
-  if (m.type === 'reload') location.replace(location.pathname.startsWith(PREFIX + '/') ? location.href : PREFIX + location.pathname + location.search + location.hash);
+  if (m.type === 'reload') reload();
+  else if (m.type === 'update') queue = queue.then(() => applyUpdates(m.updates));
   else if (m.type === 'error') showOverlay(m.message);
   else if (m.type === 'clear') clearOverlay();
 };
 window.addEventListener('error', (e) => {
+  if (!updating) stale = true;
   const msg = (e.error && e.error.stack) || e.message;
   // a module that failed to transform breaks linking of its importers (browser-specific messages);
   // prefer the dev server's pending transform error when there is one
@@ -49,9 +132,9 @@ ${exportsCode || 'export default ' + JSON.stringify(css) + ';'}
 }
 
 export function errorModule(message: string): string {
-  return `import { showOverlay } from '/@cresslet/client';
+  return `import { moduleError } from '/@cresslet/client';
 const msg = ${JSON.stringify(message)};
-showOverlay(msg);
+moduleError(msg);
 throw new Error(msg);
 `
 }
