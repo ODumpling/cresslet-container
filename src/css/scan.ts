@@ -6,8 +6,14 @@ import { join, normalize } from '../path'
 /** Files Tailwind never scans: styles, lockfiles, binaries/media. */
 const SKIP_EXT = /\.(css|scss|sass|less|styl|lock|log|map|png|jpe?g|gif|webp|avif|ico|bmp|tiff?|woff2?|ttf|otf|eot|mp4|webm|mov|mp3|wav|ogg|flac|pdf|zip|gz|tgz|br|wasm|exe|dll|so|dylib|node|db|sqlite)$/i
 const SKIP_NAMES = new Set(['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lockb', 'npm-shrinkwrap.json'])
-/** Directories auto-detection skips (Tailwind skips gitignored paths; projects here rarely have a .gitignore). */
-const SKIP_DIRS = new Set(['node_modules', 'dist', 'build', 'coverage', 'out'])
+/** Auto-detection skips these directories at any depth (Tailwind skips gitignored paths; projects here rarely have a .gitignore)... */
+const SKIP_ANY_DIRS = new Set(['node_modules'])
+/** ...and these only at the scope root (a `src/build/` or `components/out/` folder is source). */
+const SKIP_ROOT_DIRS = new Set(['dist', 'build', 'coverage', 'out'])
+/** Larger files aren't sources (generated bundles, data dumps): checked before reading/decoding. */
+const MAX_FILE = 2_000_000
+/** Yield to the event loop this often (ms) while walking a large tree. */
+const SLICE_MS = 8
 
 /** Class-candidate tokens in a source file. */
 export function extractCandidates(text: string, into = new Set<string>()): Set<string> {
@@ -35,6 +41,9 @@ export interface SourceSpec {
 }
 /** compile()'s `root`: null = auto-detect from the project root, 'none' = `source(none)`, or `source("dir")`. */
 export type SourceRoot = null | 'none' | { base: string; pattern: string }
+/** One stylesheet's source rules: one entry per Tailwind compile it ran (usually one). */
+export type SourceRules = { root: SourceRoot; sources: SourceSpec[] }[]
+export const rulesKey = (rules: SourceRules): string => JSON.stringify(rules.map((r) => [r.root, r.sources.map((s) => [s.base, s.pattern, s.negated])]))
 
 /** Minimal glob -> RegExp (`**`, `*`, `?`, `{a,b}`), matched against an absolute path. */
 export function globToRegExp(glob: string): RegExp {
@@ -74,61 +83,81 @@ function compileSource(base: string, pattern: string): { dir: string; match: Reg
 interface Scope {
   dir: string
   match: RegExp | null
-  /** auto-detection: skip node_modules/dist/dot-dirs; explicit `@source` paths are scanned as given */
+  /** auto-detection: skip node_modules/dot-dirs (+ dist/build/out/coverage at its root); explicit `@source` paths are scanned as given */
   auto: boolean
 }
 
-/** The union of every Tailwind stylesheet's sources, and the candidates found in them (only ever grows, like Tailwind). */
+let scannerIds = 0
+const tick = () => new Promise<void>((r) => setTimeout(r, 0))
+const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now())
+
+/** One set of source rules (a stylesheet's), and the candidates found in its sources (only ever grows, like Tailwind). */
 export class CandidateScanner {
+  /** Unique per scanner: names its candidate set in the CSS worker. */
+  readonly id = ++scannerIds
   private scopes: Scope[] = []
   private excludes: RegExp[] = []
-  private keys = new Set<string>()
   private files = new Map<string, Set<string>>()
   readonly candidates = new Set<string>()
-  private scanned = false
+  /** Bumped when a changed file brings new candidates after the scan (a build that read the old set is stale). */
+  revision = 0
+  private scan: Promise<void> | null = null
+  private done = false
 
   constructor(
     private vfs: VFS,
     private root: string,
-  ) {}
-
-  /** Add a stylesheet's sources; returns true when that widened the scan (callers must re-request with candidates()). */
-  addSources(root: SourceRoot, sources: SourceSpec[]): boolean {
-    let changed = false
+    rules: SourceRules = [{ root: null, sources: [] }],
+  ) {
+    const keys = new Set<string>()
     const scope = (s: Scope, key: string) => {
-      if (this.keys.has(key)) return
-      this.keys.add(key)
-      this.scopes.push(s)
-      changed = true
-      if (this.scanned) this.walk(s)
+      if (!keys.has(key)) keys.add(key), this.scopes.push(s)
     }
-    if (root === null) scope({ dir: this.root, match: null, auto: true }, 'auto:' + this.root)
-    else if (root !== 'none') scope({ dir: normalize(join(root.base, root.pattern)), match: null, auto: true }, 'auto:' + join(root.base, root.pattern))
-    for (const s of sources) {
-      const c = compileSource(s.base, s.pattern)
-      const key = `${s.negated ? '!' : ''}${s.base}\0${s.pattern}`
-      if (s.negated) {
-        if (!this.keys.has(key)) this.keys.add(key), this.excludes.push(c.match ?? new RegExp('^' + c.dir.replace(/[.+^$()|[\]\\*?{}]/g, '\\$&') + '(?:/|$)'))
-      } else scope({ ...c, auto: false }, key)
+    for (const r of rules) {
+      if (r.root === null) scope({ dir: this.root, match: null, auto: true }, 'auto:' + this.root)
+      else if (r.root !== 'none') {
+        const dir = normalize(join(r.root.base, r.root.pattern))
+        scope({ dir, match: null, auto: true }, 'auto:' + dir)
+      }
+      for (const s of r.sources) {
+        const c = compileSource(s.base, s.pattern)
+        const key = `${s.negated ? '!' : ''}${s.base}\0${s.pattern}`
+        if (!s.negated) scope({ ...c, auto: false }, key)
+        else if (!keys.has(key)) keys.add(key), this.excludes.push(c.match ?? new RegExp('^' + c.dir.replace(/[.+^$()|[\]\\*?{}]/g, '\\$&') + '(?:/|$)'))
+      }
     }
-    return changed
   }
 
-  /** Every candidate in every source file (scans lazily, once). */
-  all(): string[] {
-    if (!this.scanned) {
-      this.scanned = true
-      for (const s of this.scopes) this.walk(s)
-    }
+  /** Every candidate in every source file (scans once, lazily, yielding between slices of a large tree). */
+  async all(): Promise<string[]> {
+    this.scan ??= this.walkAll()
+    await this.scan
     return [...this.candidates]
   }
 
-  /** Whether a changed file is a source; re-extracts it. Returns true when it brought new candidates. */
+  /**
+   * A file changed: re-extract it if it's a source. Applies as soon as the scan has started (the walk skips files this
+   * already read); before that the scan will read it. Returns true when it brought new candidates.
+   */
   update(file: string): boolean {
-    if (!this.scanned || !this.inScope(file)) return false
-    const text = this.vfs.tryReadText(file)
-    if (text == null) return false
-    return this.extract(file, text)
+    if (!this.scan || !this.inScope(file)) return false
+    const text = this.read(file)
+    if (text == null) {
+      this.files.delete(file)
+      return false
+    }
+    const grew = this.extract(file, text)
+    if (grew && this.done) this.revision++
+    return grew
+  }
+
+  private read(file: string): string | null {
+    try {
+      if (this.vfs.stat(file).size > MAX_FILE) return null
+    } catch {
+      return null
+    }
+    return this.vfs.tryReadText(file)
   }
 
   private extract(file: string, text: string): boolean {
@@ -144,7 +173,7 @@ export class CandidateScanner {
     return this.scopes.some((s) => {
       if (file !== s.dir && !file.startsWith(s.dir === '/' ? '/' : s.dir + '/')) return false
       if (s.match && !s.match.test(file)) return false
-      return !s.auto || !this.autoSkips(file.slice(s.dir.length + 1))
+      return !s.auto || !autoSkips(file.slice(s.dir === '/' ? 1 : s.dir.length + 1))
     })
   }
 
@@ -153,26 +182,71 @@ export class CandidateScanner {
     return !SKIP_EXT.test(name) && !SKIP_NAMES.has(name)
   }
 
-  private autoSkips(rel: string): boolean {
-    const segs = rel.split('/')
-    return segs.slice(0, -1).some((d) => SKIP_DIRS.has(d) || d.startsWith('.'))
-  }
-
-  private walk(s: Scope): void {
-    const visit = (p: string, rel: string) => {
-      if (this.vfs.isFile(p)) {
-        if (this.isSource(p) && (!s.match || s.match.test(p)) && !this.excludes.some((r) => r.test(p)) && !this.files.has(p)) {
-          const t = this.vfs.tryReadText(p)
-          if (t != null && t.length < 2_000_000) this.extract(p, t)
-        }
-        return
+  private async walkAll(): Promise<void> {
+    let t = now()
+    for (const s of this.scopes) {
+      let scopeReal: string
+      try {
+        scopeReal = this.vfs.realpath(s.dir)
+      } catch {
+        continue
       }
-      if (!this.vfs.isDir(p)) return
-      for (const name of this.vfs.readdir(p)) {
-        if (s.auto && (SKIP_DIRS.has(name) || name.startsWith('.')) && this.vfs.isDir(join(p, name))) continue
-        visit(join(p, name), rel ? rel + '/' + name : name)
+      // real paths of directories walked: a directory symlink into one of them (an ancestor, a loop, a second path to
+      // the same tree) or above the scope is not followed
+      const seen = new Set<string>()
+      const stack: { path: string; real: string; top: boolean }[] = []
+      if (this.vfs.isFile(s.dir)) this.visitFile(s, s.dir)
+      else if (this.vfs.isDir(s.dir)) stack.push({ path: s.dir, real: scopeReal, top: true })
+      while (stack.length) {
+        const d = stack.pop()!
+        if (seen.has(d.real)) continue
+        seen.add(d.real)
+        let entries
+        try {
+          entries = this.vfs.readdirEntries(d.path)
+        } catch {
+          continue
+        }
+        for (const e of entries) {
+          const p = d.path === '/' ? '/' + e.name : d.path + '/' + e.name
+          let dir = e.isDirectory()
+          if (e.isSymbolicLink()) {
+            if (this.vfs.isFile(p)) dir = false
+            else if (this.vfs.isDir(p)) dir = true
+            else continue // dangling
+          }
+          if (dir) {
+            if (s.auto && (SKIP_ANY_DIRS.has(e.name) || e.name.startsWith('.') || (d.top && SKIP_ROOT_DIRS.has(e.name)))) continue
+            let real = p
+            if (e.isSymbolicLink()) {
+              try {
+                real = this.vfs.realpath(p)
+              } catch {
+                continue
+              }
+              if (seen.has(real) || scopeReal === real || scopeReal.startsWith(real === '/' ? '/' : real + '/') || d.real.startsWith(real + '/')) continue
+            } else real = d.real === '/' ? '/' + e.name : d.real + '/' + e.name
+            stack.push({ path: p, real, top: false })
+          } else this.visitFile(s, p)
+          if (now() - t > SLICE_MS) {
+            await tick()
+            t = now()
+          }
+        }
       }
     }
-    visit(s.dir, '')
+    this.done = true
   }
+
+  private visitFile(s: Scope, p: string): void {
+    if (this.files.has(p) || !this.isSource(p) || (s.match && !s.match.test(p)) || this.excludes.some((r) => r.test(p))) return
+    const t = this.read(p)
+    if (t != null) this.extract(p, t)
+  }
+}
+
+/** Auto-detection: whether a path relative to the scope dir is in a skipped directory. */
+function autoSkips(rel: string): boolean {
+  const segs = rel.split('/').slice(0, -1)
+  return (segs.length > 0 && SKIP_ROOT_DIRS.has(segs[0])) || segs.some((d) => SKIP_ANY_DIRS.has(d) || d.startsWith('.'))
 }

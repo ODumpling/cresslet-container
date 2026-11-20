@@ -1,6 +1,6 @@
 import type { Container } from '../container';
 import type { VFS } from '../vfs';
-import { CandidateScanner, type SourceRoot, type SourceSpec } from './scan';
+import { type SourceRules } from './scan';
 /** CSS that needs Tailwind (keep in sync with TAILWIND_RE in worker.cjs). */
 export declare const TAILWIND_RE: RegExp;
 export declare const POSTCSS_CONFIGS: string[];
@@ -10,9 +10,20 @@ export interface CssRequest {
     root: string;
     file: string;
     css: string;
+    /** Every candidate for this stylesheet (the backend sends the worker only what it hasn't seen for `candidateSet`). */
     candidates: string[];
+    /** Names an append-only candidate set (one per scanner): the worker accumulates it across requests. */
+    candidateSet?: string;
+    /** Owner of the worker-side state (compilers, candidate sets): a dev server, or one build. */
+    session?: string;
+    /** Only report the stylesheet's Tailwind source rules (no utilities built): the caller then scans those sources. */
+    discover?: boolean;
     postcssConfig: string | null;
     env: 'development' | 'production';
+    /** The project depends on Tailwind: a PostCSS config without a Tailwind plugin still gets v4 compiled. */
+    tailwind?: boolean;
+    /** false: project code (`@plugin`, `@config`) is not run (`boot({ cssPlugins: false })`). */
+    plugins?: boolean;
 }
 export interface CssResult {
     css: string;
@@ -21,45 +32,80 @@ export interface CssResult {
     /** directories whose files the output depends on (PostCSS `dir-dependency`, e.g. Tailwind v3 content globs) */
     dirs: string[];
     /** one entry per Tailwind compile that ran: its `@source`s and `source(...)` root */
-    tailwind: {
-        sources: SourceSpec[];
-        root: SourceRoot;
-    }[];
+    tailwind: SourceRules;
     warnings: string[];
 }
+/** A failed request: what the compile had read (or tried to) before it failed, so changing/creating those retries it. */
+export type CssError = Error & {
+    deps?: string[];
+    dirs?: string[];
+};
 /** Where requests run: the node worker in the container; in-process in tests. */
 export interface CssBackend {
     process(req: CssRequest): Promise<CssResult>;
     /** Drop the worker (plugins/config changed); the next request starts a fresh one. */
     restart(): void;
+    /** Forget a session's worker-side state (its dev server closed / its build finished). */
+    release?(session: string): void;
 }
 export interface CssMode {
     postcssConfig: string | null;
     tailwind: boolean;
 }
-export declare function detectCssMode(vfs: VFS, root: string): CssMode;
+export declare function detectCssMode(vfs: VFS, root: string, plugins?: boolean): CssMode;
 export interface CssProcessed {
     css: string;
     deps: string[];
     dirs: string[];
-    /** output depends on project sources (Tailwind content scanning): re-process when they bring new candidates */
-    content: boolean;
+    /** the scanner (source rules key) whose candidates the output was built from: re-process when it grows; null: none */
+    scanner: string | null;
 }
 export declare class CssPipeline {
     private c;
     private root;
     private env;
     mode: CssMode;
-    scanner: CandidateScanner;
-    constructor(c: Pick<Container, 'vfs' | 'cssWorker'>, root: string, env: CssRequest['env']);
+    /** Names this pipeline's state in the worker: a build gets a fresh one (no classes from dev or earlier builds). */
+    readonly session: string;
+    /** One scanner per distinct set of source rules: stylesheets with different `@source`/`source()` don't mix. */
+    private scanners;
+    /** Last source rules seen per stylesheet (for its text): known before its first candidate build. null: no Tailwind v4. */
+    private rules;
+    /** Bumped whenever a scanner gains candidates (a build that read the old ones is stale). */
+    revision: number;
+    private plugins;
+    constructor(c: Pick<Container, 'vfs' | 'cssWorker'> & {
+        cssPlugins?: boolean;
+    }, root: string, env: CssRequest['env']);
     get active(): boolean;
     /** Re-detect after package.json / PostCSS config / node_modules changes. */
     reset(): void;
+    /** Free this pipeline's worker-side state. */
+    release(): void;
     needs(text: string): boolean;
+    /** A project file changed: the scanners whose candidates it grew (their stylesheets need re-serving). */
+    update(file: string): string[];
     process(file: string, css: string): Promise<CssProcessed>;
-    private newScanner;
+    private scannerFor;
 }
-/** The container's CSS worker: one `node` process, started on first use, JSON lines over stdin/stdout. */
-export declare function nodeCssBackend(c: Container): CssBackend & {
+/** A running CSS worker: JSON lines in, output to the `io` callbacks. */
+export interface CssWorkerProcess {
+    write(line: string): void;
+    kill(): void;
+    exited: Promise<number>;
+}
+export type CssWorkerSpawn = (io: {
+    stdout(s: string): void;
+    stderr(s: string): void;
+}) => CssWorkerProcess;
+/**
+ * The container's CSS worker: one `node` process, started on first use, JSON lines over stdin/stdout. Each request
+ * has a timeout (the worker is recycled); requests a restart supersedes are retried once on the new worker; candidate
+ * sets go over as deltas (per worker instance: a new worker gets the whole set).
+ */
+export declare function nodeCssBackend(c: Container, o?: {
+    timeoutMs?: number;
+    spawn?: CssWorkerSpawn;
+}): CssBackend & {
     close(): void;
 };

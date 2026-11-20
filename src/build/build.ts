@@ -60,6 +60,7 @@ export async function build(c: Container, o: BuildOptions = {}): Promise<{ files
   for (const r of [...scriptRefs, ...styleRefs]) entryFor.set(localPath(r), r)
   if (!scriptRefs.length && !styleRefs.length) throw new Error('build: index.html has no <script type="module" src> entries')
 
+  // a fresh pipeline (session) per build: Tailwind starts from this build's candidates, none from dev or earlier builds
   const css = new CssPipeline(c, root, 'production')
   let result
   try {
@@ -87,6 +88,8 @@ export async function build(c: Container, o: BuildOptions = {}): Promise<{ files
     })
   } catch (e) {
     throw new Error(`build failed:\n${formatErrors(e)}`)
+  } finally {
+    css.release() // its compilers/candidates were this build's only
   }
 
   vfs.rm(outDir, { recursive: true, force: true })

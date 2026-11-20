@@ -9,7 +9,7 @@ import { DepOptimizer, scanImports } from './deps'
 import { ASSET_EXT, envDefines, jsxOptions, loadEnv, matchPaths, mimeType, readProjectConfig, SCRIPT_EXT, type ProjectConfig } from './project'
 import { findModuleScripts } from '../build/html'
 import { ModuleGraph, type HmrUpdate } from './hmr'
-import { CSS_CONFIG_RE, CssPipeline } from '../css/pipeline'
+import { CSS_CONFIG_RE, CssPipeline, type CssError } from '../css/pipeline'
 import { refreshRuntimeModule, refreshTransform, refreshUtilsCode, REFRESH_RUNTIME_URL, REFRESH_UTILS_URL } from './refresh'
 import refreshRuntimeCjs from 'react-refresh/cjs/react-refresh-runtime.development.js?raw'
 
@@ -26,10 +26,12 @@ export interface DevServerHandle {
 }
 
 interface CssUses {
-  candidates: boolean
+  /** scanners (source rules keys) whose candidates the output was built from */
+  scanners: Set<string>
   files: Set<string>
   dirs: string[]
 }
+const newUses = (): CssUses => ({ scanners: new Set(), files: new Set(), dirs: [] })
 
 const NO_CACHE = { 'cache-control': 'no-cache, no-store' }
 const JS = { 'content-type': 'text/javascript; charset=utf-8', ...NO_CACHE }
@@ -73,6 +75,9 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   const contentCss = new Map<string, CssUses>()
   /** `<link rel=stylesheet>` CSS that failed to process: reported to the overlay (no module to throw from). */
   const cssErrors = new Map<string, string>()
+  /** Recent file changes (sequence-numbered): a stylesheet build checks whether what it read changed meanwhile. */
+  let changeSeq = 0
+  const changes: { seq: number; file: string }[] = []
 
   // ---- file watching -> HMR, else live reload ----
   const graph = new ModuleGraph()
@@ -98,6 +103,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       lastError = lastErrorFile = '' // the page starts over; a still-broken module reports again when requested
       graph.reset() // so is its module graph: edges/boundaries are re-learnt from what the new page requests
       contentCss.clear()
+      cssErrors.clear() // a still-broken <link> stylesheet reports again when the new page requests it
       pageGen++
       published.clear()
       inflight.clear()
@@ -141,6 +147,9 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     const chain = new Set<string>()
     for (let i = 0; i < files.length; i++) {
       const f = files[i]
+      // a stylesheet whose first build (on this page) is in flight: that build redoes (or re-serves) it when it sees the
+      // change; an importer's edge alone doesn't make it a published node
+      if (f.endsWith('.css') && inflight.has(f) && !published.has(f)) continue
       // a module whose first transform is in flight has no node yet, but the page is about to run it
       if (!graph.nodes.has(f) && !inflight.has(f)) {
         // never served to the page, so it can't affect it, unless it's something loaded outside the module graph
@@ -181,6 +190,13 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       }, 400)
       return
     }
+    const abs = join(root, file)
+    changes.push({ seq: ++changeSeq, file: abs })
+    if (changes.length > 2000) changes.splice(0, changes.length - 1000)
+    if (!vfs.isFile(abs)) cssErrors.delete(abs)
+    // Tailwind: every changed source updates the candidates (before any full-reload return, whether or not a Tailwind
+    // stylesheet is on the page yet: the reloaded / next request must see them); contentCss picks what to re-serve
+    const grown = cssPipe.mode.tailwind ? cssPipe.update(abs) : []
     if (/^(\.git|dist)\//.test(file)) return
     if (/^(tsconfig.*\.json|jsconfig\.json|package\.json)$/.test(file)) cfg = readProjectConfig(vfs, root)
     if (file === 'package.json' || CSS_CONFIG_RE.test(file)) {
@@ -193,12 +209,8 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       transformCache.clear()
     }
     if (/^(tsconfig.*\.json|jsconfig\.json|package\.json|\.env.*)$/.test(file) || /\.html?$/.test(file) || file.startsWith('public/')) return scheduleReload(file)
-    const abs = join(root, file)
-    // Tailwind: a source that brings new class candidates re-serves the stylesheets built from them
-    if (contentCss.size && !file.endsWith('.css')) {
-      const grew = cssPipe.scanner.update(abs)
-      for (const [f, u] of contentCss) if ((grew && u.candidates) || u.files.has(abs) || u.dirs.some((d) => abs.startsWith(d + '/'))) scheduleHmr(f)
-    }
+    // a source that brings new class candidates re-serves the stylesheets built from them (configs/content dirs too)
+    for (const [f, u] of contentCss) if (grown.some((k) => u.scanners.has(k)) || u.files.has(abs) || u.dirs.some((d) => abs.startsWith(d + '/'))) scheduleHmr(f)
     scheduleHmr(abs)
   })
 
@@ -373,19 +385,74 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     return r.outputFiles[0].text
   }
 
-  const cssModule = async (abs: string, asModule: boolean): Promise<string> => {
+  /** Whether a stylesheet build that started at `seq`/`rev` read something that changed since (itself, a dep, candidates). */
+  const cssStale = (abs: string, deps: Set<string>, uses: CssUses, seq: number, rev: number) => {
+    if (uses.scanners.size && cssPipe.revision !== rev) return true
+    if (changes.length && changes[0].seq > seq + 1) return true // log trimmed past it
+    for (let i = changes.length - 1; i >= 0 && changes[i].seq > seq; i--) {
+      const f = changes[i].file
+      if (f === abs || deps.has(f) || uses.files.has(f) || uses.dirs.some((d) => f.startsWith(d + '/'))) return true
+    }
+    return false
+  }
+  /**
+   * Serve a stylesheet. Like scripts: graph edges/errors are published only for the current page and module revision;
+   * a build whose inputs changed before it finished is redone (and, if they keep changing, re-served by an update).
+   * `link`: a `<link rel=stylesheet>` (errors go to the overlay).
+   */
+  const cssModule = async (abs: string, asModule: boolean, link = false): Promise<string> => {
+    const tracked = abs.startsWith(root + '/')
+    const isModule = /\.module\.css$/.test(abs)
+    const accept = isModule ? null : asModule ? 'self' : 'link'
+    const firstPage = pageGen
+    inflight.set(abs, (inflight.get(abs) ?? 0) + 1)
     try {
-      return await buildCss(abs, asModule)
-    } catch (e) {
-      // keep a node so fixing the file hot-updates (it never got one: tracking happens on success)
-      if (abs.startsWith(root + '/') && !/\.module\.css$/.test(abs) && !graph.nodes.get(abs)?.accept) graph.ensure(abs, 'css').accept = asModule ? 'self' : 'link'
-      throw e
+      for (let attempt = 0; ; attempt++) {
+        const gen = generation.get(abs) ?? 0
+        const page = pageGen
+        const seq = changeSeq
+        const rev = cssPipe.revision
+        const cssDeps = new Set<string>()
+        const uses = newUses()
+        try {
+          const out = await buildCss(abs, asModule, cssDeps, uses)
+          const stale = cssStale(abs, cssDeps, uses, seq, rev)
+          if (stale && attempt < 2 && page === pageGen) continue
+          if (tracked) publishCss(abs, cssDeps, accept, uses, gen, page)
+          if (fresh(abs, gen, page)) cssErrors.delete(abs)
+          if (stale && tracked && page === pageGen) scheduleHmr(abs) // still changing: the page gets the newer one
+          return out
+        } catch (e) {
+          const stale = cssStale(abs, cssDeps, uses, seq, rev)
+          if (stale && attempt < 2 && page === pageGen) continue
+          // keep a node, with what it read (incl. missing imports/configs), so fixing or creating those hot-updates it
+          if (tracked && !isModule) publishCss(abs, cssDeps, graph.nodes.get(abs)?.accept ?? accept, uses, gen, page)
+          if (link && tracked && fresh(abs, gen, page)) {
+            // a stylesheet can't report its own error: tell the overlay (and keep it for a client that isn't up yet)
+            const msg = formatErrors(e)
+            cssErrors.set(abs, msg)
+            post({ type: 'error', message: msg })
+          }
+          if (stale && tracked && page === pageGen) scheduleHmr(abs)
+          throw e
+        }
+      }
+    } finally {
+      const k = (inflight.get(abs) ?? 0) - 1
+      if (firstPage === pageGen) k > 0 ? inflight.set(abs, k) : inflight.delete(abs) // a reset already cleared it
     }
   }
-  const buildCss = async (abs: string, asModule: boolean): Promise<string> => {
+  const buildCss = async (abs: string, asModule: boolean, cssDeps: Set<string>, uses: CssUses): Promise<string> => {
     const es = await loadEsbuild(c.esbuildWasmUrl)
-    const cssDeps = new Set<string>()
-    const uses: CssUses = { candidates: false, files: new Set(), dirs: [] }
+    /** What processing a stylesheet read: stylesheets join the CSS graph; anything else (configs, plugins, sources) re-serves it. */
+    const addDeps = (from: string, deps: string[] = [], dirs: string[] = []) => {
+      for (const d of deps) {
+        if (!d.startsWith(root + '/') || d.includes('/node_modules/') || d === from) continue
+        if (/\.(css|pcss|postcss)$/.test(d)) cssDeps.add(d)
+        else uses.files.add(d)
+      }
+      uses.dirs.push(...dirs.filter((d) => d === root || d.startsWith(root + '/')))
+    }
     const urlPlugin: Plugin = {
       name: 'cresslet-css-urls',
       setup(build) {
@@ -421,15 +488,10 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
           try {
             const r = await cssPipe.process(a.path, contents)
             contents = r.css
-            for (const d of r.deps) {
-              if (!d.startsWith(root + '/') || d.includes('/node_modules/') || d === a.path) continue
-              // stylesheets join the CSS graph; anything else (configs, plugins, sources) re-serves this one
-              if (/\.(css|pcss|postcss)$/.test(d)) cssDeps.add(d)
-              else uses.files.add(d)
-            }
-            uses.dirs.push(...r.dirs.filter((d) => d === root || d.startsWith(root + '/')))
-            if (r.content) uses.candidates = true
+            addDeps(a.path, r.deps, r.dirs)
+            if (r.scanner !== null) uses.scanners.add(r.scanner)
           } catch (e) {
+            addDeps(a.path, (e as CssError).deps, (e as CssError).dirs)
             return { errors: [{ text: e instanceof Error ? e.message : String(e) }] }
           }
           return { contents, loader: /\.module\.css$/.test(a.path) ? 'local-css' : 'css', resolveDir: dirname(a.path) }
@@ -448,18 +510,19 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       })
       const js = r.outputFiles.find((f) => f.path.endsWith('.js'))!.text
       const css = r.outputFiles.find((f) => f.path.endsWith('.css'))?.text ?? ''
-      cssDeps.delete(abs)
-      trackCss(abs, cssDeps, null, uses) // class names are exports: updates go through the importing component
-      return styleModule(css, toUrl(abs), js)
+      return styleModule(css, toUrl(abs), js) // class names are exports: updates go through the importing component
     }
     const r = await es.build({ entryPoints: [abs], bundle: true, write: false, outdir: '/__dev__', plugins: [urlPlugin], logLevel: 'silent' })
     const css = r.outputFiles[0]?.text ?? ''
-    if (abs.startsWith(root + '/')) trackCss(abs, cssDeps, asModule ? 'self' : 'link', uses)
     return asModule ? styleModule(css, toUrl(abs)) : css
   }
 
-  const trackCss = (abs: string, imports: Set<string>, accept: 'self' | 'link' | null, uses: CssUses) => {
-    if (uses.candidates || uses.files.size || uses.dirs.length) contentCss.set(abs, uses)
+  /** Record a stylesheet build's edges / content deps: only for the current page, and not over a newer build's. */
+  const publishCss = (abs: string, imports: Set<string>, accept: 'self' | 'link' | null, uses: CssUses, gen: number, page: number) => {
+    if (page !== pageGen || gen < (published.get(abs) ?? -1)) return
+    published.set(abs, gen)
+    imports.delete(abs)
+    if (uses.scanners.size || uses.files.size || uses.dirs.length) contentCss.set(abs, uses)
     else contentCss.delete(abs)
     graph.setImports(abs, imports)
     graph.ensure(abs, 'css').accept = accept
@@ -537,7 +600,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
         if (spec.endsWith('.css')) {
           const file = resolveModule(fs, spec, root, { ...BROWSER_OPTS, conditions: ['style', ...BROWSER_OPTS.conditions] })
           if (!file) return new Response('', { headers: JS })
-          return new Response(has('import') ? await cssModule(file, true) : await cssModule(file, false), { headers: has('import') ? JS : { 'content-type': 'text/css', ...NO_CACHE } })
+          return new Response(has('import') ? await cssModule(file, true) : await cssModule(file, false, true), { headers: has('import') ? JS : { 'content-type': 'text/css', ...NO_CACHE } })
         }
         const r = await deps.get(spec)
         return new Response('code' in r ? r.code : errorModule(r.error), { headers: JS })
@@ -559,14 +622,9 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       if (ext === '.css') {
         if (has('import')) return new Response(await cssModule(abs, true), { headers: JS })
         try {
-          const text = await cssModule(abs, false)
-          cssErrors.delete(abs)
-          return new Response(text, { headers: { 'content-type': 'text/css; charset=utf-8', ...NO_CACHE } })
+          return new Response(await cssModule(abs, false, true), { headers: { 'content-type': 'text/css; charset=utf-8', ...NO_CACHE } })
         } catch (e) {
-          // a stylesheet can't report its own error: tell the overlay (and keep it for a client that isn't up yet)
           const msg = formatErrors(e)
-          cssErrors.set(abs, msg)
-          post({ type: 'error', message: msg })
           return new Response(`/* ${msg.replace(/\*\//g, '* /')} */`, { status: 500, headers: { 'content-type': 'text/css; charset=utf-8', ...NO_CACHE } })
         }
       }
@@ -610,6 +668,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     close() {
       closed = true
       for (const t of [reloadTimer, depsTimer, flushTimer]) if (t) clearTimeout(t)
+      cssPipe.release()
       watcher.close()
       bc.close()
       c.ports.close(port)

@@ -33,6 +33,11 @@ export interface BootOptions {
    * Unset (or equal to the page's origin): previews share the host origin.
    */
   previewOrigin?: string
+  /**
+   * Run project code when processing CSS: PostCSS configs (and their plugins), Tailwind `@plugin` / `@config`.
+   * Default true. `false`: PostCSS configs are ignored and `@plugin`/`@config` fail; Tailwind v4 itself still compiles.
+   */
+  cssPlugins?: boolean
 }
 
 export interface ContainerEvents {
@@ -90,6 +95,8 @@ export class Container {
   readonly fs: FsApi
   /** Origin previews are served from when it differs from the page's (`boot({ previewOrigin })`), else null. */
   readonly previewOrigin: string | null
+  /** Whether CSS processing runs project code (`boot({ cssPlugins })`). */
+  readonly cssPlugins: boolean
   private relayPort: MessagePort | null = null
   private listeners = new Map<string, Set<Handler>>()
   private commands = new Map<string, Command>()
@@ -102,6 +109,7 @@ export class Container {
     this.registry = new HttpRegistry(opts.registry ?? 'https://registry.npmjs.org', { cache: opts.npmCache === false ? null : sharedIdbCache() })
     dropLegacyCache()
     this.esbuildWasmUrl = opts.esbuildWasmUrl ?? DEFAULT_WASM_URL
+    this.cssPlugins = opts.cssPlugins !== false
     let previewOrigin: string | null = null
     if (opts.previewOrigin !== undefined) {
       previewOrigin = toOrigin(opts.previewOrigin)

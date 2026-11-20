@@ -1,18 +1,22 @@
-import { describe, expect, it } from 'vitest'
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync, utimesSync } from 'node:fs'
+import { describe, expect, it, vi } from 'vitest'
+import { mkdirSync, mkdtempSync, statSync, symlinkSync, writeFileSync, utimesSync } from 'node:fs'
+import { spawn as spawnProcess } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { VFS } from '../src/vfs'
 import { CandidateScanner, extractCandidates, globToRegExp } from '../src/css/scan'
-import { CssPipeline, detectCssMode, TAILWIND_RE, type CssRequest, type CssResult } from '../src/css/pipeline'
+import { CssPipeline, detectCssMode, nodeCssBackend, TAILWIND_RE, type CssRequest, type CssResult, type CssWorkerSpawn } from '../src/css/pipeline'
 
 // The CSS worker script is plain CommonJS: run it in real Node against the repo's tailwindcss/postcss/autoprefixer.
+const workerPath = fileURLToPath(new URL('../src/css/worker.cjs', import.meta.url))
 const worker = createRequire(import.meta.url)('../src/css/worker.cjs') as {
-  handle(req: Partial<CssRequest>): Promise<CssResult>
+  handle(req: Partial<CssRequest> & { candidatesReset?: boolean }): Promise<CssResult>
+  release(session: string): void
   TAILWIND_RE: RegExp
   exportTarget(exp: unknown, sub: string): string | null
+  rebaseUrls(css: string, fromDir: string, toDir: string): string
 }
 const repoModules = fileURLToPath(new URL('../node_modules', import.meta.url))
 
@@ -63,10 +67,8 @@ describe('CandidateScanner', () => {
     return v
   }
 
-  it('auto-detects from the root, skipping node_modules, dist and css', () => {
-    const s = new CandidateScanner(vfs(), '/p')
-    s.addSources(null, [])
-    const all = s.all()
+  it('auto-detects from the root, skipping node_modules, dist and css', async () => {
+    const all = await new CandidateScanner(vfs(), '/p').all()
     expect(all).toContain('flex')
     expect(all).toContain('from-lib')
     expect(all).not.toContain('from-node-modules')
@@ -74,25 +76,92 @@ describe('CandidateScanner', () => {
     expect(all).not.toContain('.from-css')
   })
 
-  it('explicit @source reaches node_modules; source(none) + negated sources', () => {
+  it('explicit @source reaches node_modules; source(none) + negated sources', async () => {
     const v = vfs()
-    const s = new CandidateScanner(v, '/p')
-    expect(s.addSources('none', [{ base: '/p/src', pattern: '../node_modules/lib', negated: false }])).toBe(true)
-    expect(s.all()).toEqual(['from-node-modules'])
-    const t = new CandidateScanner(v, '/p')
-    t.addSources(null, [{ base: '/p', pattern: 'lib', negated: true }])
-    expect(t.all()).not.toContain('from-lib')
+    expect(await new CandidateScanner(v, '/p', [{ root: 'none', sources: [{ base: '/p/src', pattern: '../node_modules/lib', negated: false }] }]).all()).toEqual(['from-node-modules'])
+    expect(await new CandidateScanner(v, '/p', [{ root: null, sources: [{ base: '/p', pattern: 'lib', negated: true }] }]).all()).not.toContain('from-lib')
+    expect(await new CandidateScanner(v, '/p', [{ root: { base: '/p', pattern: 'lib' }, sources: [] }]).all()).toEqual(['from-lib'])
   })
 
-  it('update() reports only new candidates', () => {
+  it('dist/build/out/coverage are skipped only at the scope root; node_modules and dot-dirs at any depth', async () => {
+    const v = vfs()
+    const w = (p: string, s: string) => v.writeFile('/p/' + p, s, { mkdirp: true })
+    w('build/x.js', '"root-build"')
+    w('src/build/x.js', '"nested-build"')
+    w('src/out/x.js', '"nested-out"')
+    w('src/node_modules/x.js', '"nested-nm"')
+    w('src/.cache/x.js', '"nested-dot"')
+    const s = new CandidateScanner(v, '/p')
+    const all = await s.all()
+    expect(all).toEqual(expect.arrayContaining(['nested-build', 'nested-out']))
+    for (const k of ['root-build', 'nested-nm', 'nested-dot', 'from-dist']) expect(all).not.toContain(k)
+    // update() applies the same rules
+    w('src/build/y.js', '"nested-build-2"')
+    expect(s.update('/p/src/build/y.js')).toBe(true)
+    w('build/y.js', '"root-build-2"')
+    expect(s.update('/p/build/y.js')).toBe(false)
+    w('src/node_modules/y.js', '"nested-nm-2"')
+    expect(s.update('/p/src/node_modules/y.js')).toBe(false)
+  })
+
+  it('does not follow directory symlinks into ancestors or loops; other symlinks are followed', async () => {
+    const v = vfs()
+    v.symlink('/p', '/p/src/up') // ancestor
+    v.symlink('.', '/p/src/self') // loop
+    v.symlink('/', '/p/src/rootfs') // above the scope
+    v.writeFile('/shared/ui.js', '"from-shared"', { mkdirp: true })
+    v.symlink('/shared', '/p/src/shared')
+    v.symlink('/shared/ui.js', '/p/src/ui-link.js')
+    const all = await new CandidateScanner(v, '/p').all()
+    expect(all).toEqual(expect.arrayContaining(['flex', 'from-shared']))
+    expect(all).not.toContain('from-node-modules')
+  })
+
+  it('checks a file size before reading it', async () => {
+    const v = vfs()
+    v.writeFile('/p/src/huge.js', new Uint8Array(2_000_001).fill(0x61))
+    const read: string[] = []
+    const orig = v.tryReadText.bind(v)
+    v.tryReadText = (p: string) => (read.push(p), orig(p))
+    await new CandidateScanner(v, '/p').all()
+    expect(read).toContain('/p/src/App.tsx')
+    expect(read).not.toContain('/p/src/huge.js')
+  })
+
+  it('yields to the event loop while walking a large tree', async () => {
+    const v = new VFS()
+    for (let i = 0; i < 300; i++) v.writeFile(`/p/src/d${i % 10}/f${i}.js`, `"c-${i}"`, { mkdirp: true })
+    let t = 0
+    const spy = vi.spyOn(performance, 'now').mockImplementation(() => (t += 5))
+    try {
+      let ticked = false
+      setTimeout(() => (ticked = true), 0)
+      const scan = new CandidateScanner(v, '/p').all()
+      const all = await scan
+      expect(ticked).toBe(true)
+      expect(all).toHaveLength(300)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('update() reports only new candidates; it applies once the scan has started', async () => {
     const v = vfs()
     const s = new CandidateScanner(v, '/p')
-    s.addSources(null, [])
-    s.all()
+    expect(s.update('/p/src/App.tsx')).toBe(false) // not scanning yet: the scan reads it
+    let t = 0
+    const spy = vi.spyOn(performance, 'now').mockImplementation(() => (t += 5)) // the walk yields after each entry
+    const scan = s.all()
+    v.writeFile('/p/src/App.tsx', '<div className="p-4 flex mid-scan" />')
+    expect(s.update('/p/src/App.tsx')).toBe(true)
+    expect(await scan).toContain('mid-scan')
+    spy.mockRestore()
+    expect(s.revision).toBe(0) // nobody built from the old set yet
     v.writeFile('/p/src/App.tsx', '<div className="p-4 flex" />')
     expect(s.update('/p/src/App.tsx')).toBe(false)
     v.writeFile('/p/src/App.tsx', '<div className="p-4 flex text-red-500" />')
     expect(s.update('/p/src/App.tsx')).toBe(true)
+    expect(s.revision).toBe(1)
     v.writeFile('/p/node_modules/lib/index.js', '"new-thing"')
     expect(s.update('/p/node_modules/lib/index.js')).toBe(false)
   })
@@ -105,35 +174,89 @@ describe('CSS mode', () => {
     expect(detectCssMode(v, '/p')).toEqual({ postcssConfig: null, tailwind: true })
     v.writeFile('/p/postcss.config.mjs', 'export default {}')
     expect(detectCssMode(v, '/p').postcssConfig).toBe('/p/postcss.config.mjs')
+    expect(detectCssMode(v, '/p', false).postcssConfig).toBe(null) // cssPlugins: false
     expect(TAILWIND_RE.source).toBe(worker.TAILWIND_RE.source)
     for (const css of ['@import "tailwindcss";', "@import 'tailwindcss/utilities.css' layer(utilities);", '.a { @apply flex; }', '@theme { --x: 1 }', '@tailwind utilities;', '.a { margin: --spacing(2) }']) expect(TAILWIND_RE.test(css)).toBe(true)
     for (const css of ['body { color: red }', '@import "./other.css";', '@media (min-width: 1px) {}']) expect(TAILWIND_RE.test(css)).toBe(false)
   })
 
-  it('pipeline: plain CSS skips the worker; Tailwind gets candidates and re-builds when @source widens the scan', async () => {
-    const v = new VFS()
-    v.writeFile('/p/package.json', JSON.stringify({ dependencies: { tailwindcss: '^4' } }), { mkdirp: true })
-    v.writeFile('/p/src/App.tsx', '<b className="flex" />', { mkdirp: true })
-    v.writeFile('/p/lib/x.js', '"underline"', { mkdirp: true })
-    v.writeFile('/p/node_modules/ui/a.js', '"italic"', { mkdirp: true })
+  /** A backend that answers like the worker: each stylesheet's rules come from a `rules` map (by file). */
+  const fakeBackend = (rules: Record<string, CssResult['tailwind']>) => {
     const reqs: CssRequest[] = []
     const backend = {
       restart() {},
       async process(r: CssRequest): Promise<CssResult> {
         reqs.push(r)
-        return { css: r.candidates.sort().join(' '), deps: [], dirs: [], warnings: [], tailwind: [{ root: null, sources: [{ base: '/p/src', pattern: '../node_modules/ui', negated: false }] }] }
+        return { css: r.discover ? '' : [...r.candidates].sort().join(' '), deps: [], dirs: [], warnings: [], tailwind: rules[r.file] ?? [] }
       },
     }
+    return { reqs, backend }
+  }
+  const tailwindProject = () => {
+    const v = new VFS()
+    v.writeFile('/p/package.json', JSON.stringify({ dependencies: { tailwindcss: '^4' } }), { mkdirp: true })
+    v.writeFile('/p/src/App.tsx', '<b className="flex" />', { mkdirp: true })
+    v.writeFile('/p/lib/x.js', '"underline"', { mkdirp: true })
+    v.writeFile('/p/node_modules/ui/a.js', '"italic"', { mkdirp: true })
+    return v
+  }
+
+  it('pipeline: plain CSS skips the worker; source rules are discovered before the first candidate build', async () => {
+    const v = tailwindProject()
+    const { reqs, backend } = fakeBackend({ '/p/src/index.css': [{ root: 'none', sources: [{ base: '/p/src', pattern: '../node_modules/ui', negated: false }] }] })
     const p = new CssPipeline({ vfs: v, cssWorker: () => backend }, '/p', 'development')
     expect((await p.process('/p/src/a.css', 'body{}')).css).toBe('body{}')
     expect(reqs).toHaveLength(0)
-    const r = await p.process('/p/src/index.css', '@import "tailwindcss";')
-    expect(reqs).toHaveLength(2)
-    expect(reqs[0].candidates).not.toContain('italic')
-    expect(r.css.split(' ')).toEqual(expect.arrayContaining(['flex', 'underline', 'italic']))
-    expect(r.content).toBe(true)
-    await p.process('/p/src/index.css', '@import "tailwindcss";')
-    expect(reqs).toHaveLength(3) // sources already known: one request
+    const r = await p.process('/p/src/index.css', '@import "tailwindcss" source(none);')
+    expect(reqs.map((q) => q.discover)).toEqual([true, false])
+    // source(none): only the @source dir, from the very first build
+    expect(r.css).toBe('italic')
+    expect(reqs[1].candidateSet).toMatch(new RegExp('^' + p.session + ':'))
+    expect(r.scanner).not.toBeNull()
+    await p.process('/p/src/index.css', '@import "tailwindcss" source(none);')
+    expect(reqs).toHaveLength(3) // rules known for this text: one request
+  })
+
+  it('pipeline: stylesheets with different source rules get separate candidate sets; updates report the grown ones', async () => {
+    const v = tailwindProject()
+    const { backend } = fakeBackend({
+      '/p/a.css': [{ root: null, sources: [{ base: '/p', pattern: 'lib', negated: true }] }],
+      '/p/b.css': [{ root: { base: '/p', pattern: 'lib' }, sources: [] }],
+    })
+    const p = new CssPipeline({ vfs: v, cssWorker: () => backend }, '/p', 'development')
+    const a = await p.process('/p/a.css', '@import "tailwindcss";')
+    const b = await p.process('/p/b.css', '@import "tailwindcss" source("../lib");')
+    expect(a.css.split(' ')).toContain('flex')
+    expect(a.css.split(' ')).not.toContain('underline')
+    expect(b.css).toBe('underline')
+    v.writeFile('/p/lib/x.js', '"underline grid"')
+    expect(p.update('/p/lib/x.js')).toEqual([b.scanner])
+    expect(p.revision).toBe(1)
+    v.writeFile('/p/src/App.tsx', '<b className="flex italic" />')
+    expect(p.update('/p/src/App.tsx')).toEqual([a.scanner])
+  })
+
+  it('pipeline: rules that change with the stylesheet (or its imports) are re-discovered', async () => {
+    const v = tailwindProject()
+    const rules: Record<string, CssResult['tailwind']> = { '/p/a.css': [{ root: null, sources: [] }] }
+    const { reqs, backend } = fakeBackend(rules)
+    const p = new CssPipeline({ vfs: v, cssWorker: () => backend }, '/p', 'development')
+    await p.process('/p/a.css', '@import "tailwindcss";')
+    rules['/p/a.css'] = [{ root: 'none', sources: [{ base: '/p', pattern: 'lib', negated: false }] }] // an @import'ed file added these
+    const r = await p.process('/p/a.css', '@import "tailwindcss";')
+    expect(r.css).toBe('underline')
+    expect(reqs.slice(2).map((q) => q.discover)).toEqual([false, false])
+    expect(reqs[2].candidateSet).not.toBe(reqs[3].candidateSet)
+  })
+
+  it('pipeline: cssPlugins: false ignores PostCSS configs and tells the worker not to run plugins', async () => {
+    const v = tailwindProject()
+    v.writeFile('/p/postcss.config.js', 'module.exports = {}')
+    const { reqs, backend } = fakeBackend({})
+    const p = new CssPipeline({ vfs: v, cssWorker: () => backend, cssPlugins: false }, '/p', 'development')
+    expect(p.mode.postcssConfig).toBe(null)
+    await p.process('/p/a.css', '@import "tailwindcss";')
+    expect(reqs[0]).toMatchObject({ postcssConfig: null, plugins: false })
   })
 })
 
@@ -199,5 +322,179 @@ describe('CSS worker (real tailwindcss / postcss / autoprefixer)', () => {
   it('PostCSS config errors name the plugin', async () => {
     const dir = project({ 'postcss.config.cjs': "module.exports = { plugins: { 'postcss-does-not-exist': {} } }\n" })
     await expect(worker.handle({ root: dir, file: join(dir, 'a.css'), css: 'a{}', postcssConfig: join(dir, 'postcss.config.cjs') })).rejects.toThrow(/PostCSS plugin 'postcss-does-not-exist' can't be loaded/)
+  })
+
+  it('url() rebasing: unquoted, quoted, spaces, package CSS; absolute/data:/#/protocol-relative untouched', () => {
+    const css = [
+      '.a { background: url(img.png) }',
+      '.b { background: url( "../up dir/x.png?v=1#f" ) }',
+      ".c { background: url('./q.svg') }",
+      '.d { background: url(/abs.png), url(data:image/png;base64,AA==), url(#grad), url(//cdn.example/x.png), url(https://x.test/y.png) }',
+      '/* url(./in-comment.png) */ .e { content: "url(./in-string.png)" }',
+      '@import url("./nested.css");',
+    ].join('\n')
+    const out = worker.rebaseUrls(css, '/p/node_modules/pkg/dist', '/p/src')
+    expect(out).toContain('url(../node_modules/pkg/dist/img.png)')
+    expect(out).toContain('url("../node_modules/pkg/up dir/x.png?v=1#f")')
+    expect(out).toContain("url('../node_modules/pkg/dist/q.svg')")
+    expect(out).toContain('url(/abs.png), url(data:image/png;base64,AA==), url(#grad), url(//cdn.example/x.png), url(https://x.test/y.png)')
+    expect(out).toContain('url(./in-comment.png)')
+    expect(out).toContain('"url(./in-string.png)"')
+    expect(out).toContain('@import url("./nested.css");')
+    // an unquoted result that needs quoting gets it
+    expect(worker.rebaseUrls('.a{background:url(a.png)}', '/p/my dir', '/p')).toBe('.a{background:url("./my dir/a.png")}')
+  })
+
+  it('a failed compile reports what it tried to read: a missing @import / @config target', async () => {
+    const dir = project({})
+    const file = join(dir, 'src/a.css')
+    const err = await worker.handle({ root: dir, file, css: '@import "tailwindcss";\n@import "./missing.css";\n', candidates: [] }).then(() => null, (e) => e)
+    expect(err.deps).toContain(join(dir, 'src/missing.css'))
+    const err2 = await worker.handle({ root: dir, file, css: '@import "tailwindcss";\n@config "../tailwind.config.js";\n', candidates: [] }).then(() => null, (e) => e)
+    expect(err2.deps).toContain(join(dir, 'tailwind.config.js'))
+    // creating it: the next request compiles
+    mkdirSync(join(dir, 'src'))
+    writeFileSync(join(dir, 'src/missing.css'), '.made { color: red }\n')
+    expect((await worker.handle({ root: dir, file, css: '@import "tailwindcss";\n@import "./missing.css";\n', candidates: [] })).css).toContain('.made')
+  })
+
+  it('discovery: reports the source rules without building utilities', async () => {
+    const dir = project({})
+    const r = await worker.handle({ root: dir, file: join(dir, 'd.css'), css: '@import "tailwindcss" source(none);\n@source not "./legacy";\n', candidates: ['flex'], discover: true, session: 's-disc' })
+    expect(r.css).toBe('')
+    expect(r.tailwind[0]).toEqual({ root: 'none', sources: [{ base: dir, pattern: './legacy', negated: true }] })
+  })
+
+  it('candidate sets: requests carry deltas the worker accumulates; a different set (new rules) gets a fresh compiler; release drops a session', async () => {
+    const dir = project({})
+    const file = join(dir, 'a.css')
+    const base = { root: dir, file, css: '@import "tailwindcss/utilities.css";\n', session: 's1' }
+    expect((await worker.handle({ ...base, candidateSet: 's1:1', candidates: ['flex'] })).css).toMatch(/\.flex/)
+    const r = await worker.handle({ ...base, candidateSet: 's1:1', candidates: ['underline'] })
+    expect(r.css).toMatch(/\.flex/)
+    expect(r.css).toMatch(/\.underline/)
+    const other = await worker.handle({ ...base, candidateSet: 's1:2', candidates: ['italic'] })
+    expect(other.css).toMatch(/\.italic/)
+    expect(other.css).not.toMatch(/\.underline/)
+    worker.release('s1')
+    expect((await worker.handle({ ...base, candidateSet: 's1:1', candidates: ['grid'] })).css).not.toMatch(/\.flex/)
+  })
+
+  it('a production session starts fresh (no dev classes) and config/plugins see NODE_ENV=production', async () => {
+    const dir = project({
+      'postcss.config.cjs': "module.exports = (ctx) => ({ plugins: [{ postcssPlugin: 'env', Once(root) { root.append({ text: 'env:' + ctx.env + ':' + process.env.NODE_ENV }) } }] })\n",
+    })
+    const file = join(dir, 'a.css')
+    const req = { root: dir, file, css: '@import "tailwindcss/utilities.css";\n', postcssConfig: join(dir, 'postcss.config.cjs'), tailwind: true }
+    const dev = await worker.handle({ ...req, session: 'dev', candidateSet: 'dev:1', candidates: ['underline'], env: 'development' })
+    expect(dev.css).toMatch(/\.underline/)
+    expect(dev.css).toContain('env:development:development')
+    const prod = await worker.handle({ ...req, session: 'prod-1', candidateSet: 'prod-1:1', candidates: ['flex'], env: 'production' })
+    expect(prod.css).toMatch(/\.flex/)
+    expect(prod.css).not.toMatch(/\.underline/)
+    expect(prod.css).toContain('env:production:production')
+  })
+
+  it('PostCSS config without a Tailwind plugin in a Tailwind v4 project: v4 compiles, then the config plugins', async () => {
+    const dir = project({ 'postcss.config.cjs': "module.exports = { plugins: { autoprefixer: { overrideBrowserslist: ['safari 8'] } } }\n" })
+    const req = { root: dir, file: join(dir, 'a.css'), css: '@import "tailwindcss/utilities.css";\n', candidates: ['flex'], postcssConfig: join(dir, 'postcss.config.cjs') }
+    const r = await worker.handle({ ...req, tailwind: true })
+    expect(r.css).toContain('display: -webkit-flex')
+    expect(r.tailwind).toHaveLength(1)
+    // not a Tailwind project: the config's plugins only
+    const dir2 = project({ 'postcss.config.cjs': "module.exports = { plugins: { autoprefixer: {} } }\n" })
+    expect((await worker.handle({ ...req, root: dir2, file: join(dir2, 'a.css'), postcssConfig: join(dir2, 'postcss.config.cjs') })).tailwind).toHaveLength(0)
+  })
+
+  it('staleness by content (same size and mtime), plugin helpers reload on recompile, plugin instances are cached with the config', async () => {
+    const dir = project({
+      'src/theme.css': '@theme { --color-brand: #111111; }\n',
+      'src/plugin.cjs': "const h = require('./helper.cjs')\nmodule.exports = function ({ addBase }) { addBase({ ':root': { '--helper': h.value } }) }\n",
+      'src/helper.cjs': "module.exports = { value: 'one' }\n",
+      'postcss.config.cjs': "globalThis.__made = 0\nmodule.exports = { plugins: [ (() => { globalThis.__made++; return { postcssPlugin: 'count' } })() ] }\n",
+    })
+    const file = join(dir, 'src/index.css')
+    const css = '@import "tailwindcss/theme.css" layer(theme);\n@import "./theme.css";\n@plugin "./plugin.cjs";\n.x { color: var(--color-brand) }\n'
+    const req = { root: dir, file, css, candidates: [], postcssConfig: join(dir, 'postcss.config.cjs'), tailwind: true, session: 'st' }
+    expect((await worker.handle(req)).css).toContain('#111111')
+    const theme = join(dir, 'src/theme.css')
+    const st = statSync(theme)
+    writeFileSync(theme, '@theme { --color-brand: #222222; }\n')
+    utimesSync(theme, st.atime, st.mtime)
+    expect((await worker.handle(req)).css).toContain('#222222')
+    writeFileSync(join(dir, 'src/helper.cjs'), "module.exports = { value: 'two' }\n")
+    expect((await worker.handle({ ...req, css: css + '/* edit */\n' })).css).toContain('--helper: two')
+    expect((globalThis as { __made?: number }).__made).toBe(1)
+  })
+
+  it('plugins: false (boot({ cssPlugins: false })): @plugin / @config are refused, Tailwind core compiles', async () => {
+    const dir = project({ 'src/plugin.cjs': 'module.exports = () => {}\n' })
+    const file = join(dir, 'src/a.css')
+    await expect(worker.handle({ root: dir, file, css: '@import "tailwindcss";\n@plugin "./plugin.cjs";\n', candidates: [], plugins: false })).rejects.toThrow(/@plugin '.\/plugin.cjs' not loaded: project CSS plugins are disabled/)
+    expect((await worker.handle({ root: dir, file, css: '@import "tailwindcss";\n', candidates: ['flex'], plugins: false })).css).toMatch(/\.flex/)
+  })
+})
+
+describe('CSS worker process (nodeCssBackend over a real node child)', () => {
+  /** Spawns worker.cjs in Node; records what went over stdin. */
+  const nodeSpawn = () => {
+    const lines: Record<string, unknown>[] = []
+    let spawned = 0
+    const spawn: CssWorkerSpawn = (io) => {
+      spawned++
+      const p = spawnProcess(process.execPath, [workerPath], { stdio: ['pipe', 'pipe', 'pipe'] })
+      p.stdout.setEncoding('utf8').on('data', io.stdout)
+      p.stderr.setEncoding('utf8').on('data', io.stderr)
+      return {
+        write: (l) => (lines.push(JSON.parse(l)), void p.stdin.write(l)),
+        kill: () => void p.kill(),
+        exited: new Promise((r) => p.on('exit', (code) => r(code ?? 1))),
+      }
+    }
+    return { spawn, lines, spawns: () => spawned }
+  }
+  const req = (dir: string, o: Partial<CssRequest> = {}): CssRequest => ({ root: dir, file: join(dir, 'a.css'), css: '@import "tailwindcss/utilities.css";\n', candidates: [], postcssConfig: null, env: 'development', ...o })
+
+  it('sends candidate deltas per worker instance; a restart retries in-flight requests on the new worker', async () => {
+    const dir = project({
+      'postcss.config.cjs': "module.exports = { plugins: [{ postcssPlugin: 'slow', Once: () => new Promise((r) => setTimeout(r, 400)) }] }\n",
+    })
+    const s = nodeSpawn()
+    const b = nodeCssBackend({} as never, { spawn: s.spawn })
+    try {
+      expect((await b.process(req(dir, { candidateSet: 'x:1', candidates: ['flex'] }))).css).toMatch(/\.flex/)
+      const r = await b.process(req(dir, { candidateSet: 'x:1', candidates: ['flex', 'underline'] }))
+      expect(r.css).toMatch(/\.flex/)
+      expect(r.css).toMatch(/\.underline/)
+      expect(s.lines.map((l) => l.candidates)).toEqual([['flex'], ['underline']])
+      // a slow request superseded by a restart: retried (whole set: a new worker) instead of failing
+      const slow = b.process(req(dir, { candidateSet: 'x:1', candidates: ['flex', 'underline'], postcssConfig: join(dir, 'postcss.config.cjs'), tailwind: true }))
+      await new Promise((r) => setTimeout(r, 100))
+      b.restart()
+      expect((await slow).css).toMatch(/\.underline/)
+      expect(s.spawns()).toBe(2)
+      expect(s.lines.at(-1)!.candidates).toEqual(['flex', 'underline'])
+      // release: the worker forgets the session; its next request sends the whole set again
+      b.release!('x')
+      await b.process(req(dir, { candidateSet: 'x:1', candidates: ['flex', 'underline', 'grid'] }))
+      expect(s.lines.at(-2)).toEqual({ op: 'release', session: 'x' })
+      expect(s.lines.at(-1)!.candidates).toEqual(['flex', 'underline', 'grid'])
+    } finally {
+      b.close()
+    }
+  })
+
+  it('a request that never finishes times out: the worker is recycled and the next request works', async () => {
+    const dir = project({ 'postcss.config.cjs': "module.exports = { plugins: [{ postcssPlugin: 'hang', Once: (root) => root.toString().includes('HANG') ? new Promise(() => {}) : undefined }] }\n" })
+    const s = nodeSpawn()
+    const b = nodeCssBackend({} as never, { spawn: s.spawn, timeoutMs: 1000 })
+    try {
+      const pc = { postcssConfig: join(dir, 'postcss.config.cjs') }
+      await expect(b.process(req(dir, { ...pc, css: '/* HANG */' }))).rejects.toThrow(/CSS worker timed out after 1s processing .*a\.css/)
+      expect((await b.process(req(dir, { ...pc, css: 'a { color: red }' }))).css).toContain('color: red')
+      expect(s.spawns()).toBe(2)
+    } finally {
+      b.close()
+    }
   })
 })

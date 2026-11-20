@@ -26,6 +26,11 @@ export interface BootOptions {
      * Unset (or equal to the page's origin): previews share the host origin.
      */
     previewOrigin?: string;
+    /**
+     * Run project code when processing CSS: PostCSS configs (and their plugins), Tailwind `@plugin` / `@config`.
+     * Default true. `false`: PostCSS configs are ignored and `@plugin`/`@config` fail; Tailwind v4 itself still compiles.
+     */
+    cssPlugins?: boolean;
 }
 export interface ContainerEvents {
     'server-ready': (port: number, url: string) => void;
@@ -93,6 +98,8 @@ export declare class Container {
     readonly fs: FsApi;
     /** Origin previews are served from when it differs from the page's (`boot({ previewOrigin })`), else null. */
     readonly previewOrigin: string | null;
+    /** Whether CSS processing runs project code (`boot({ cssPlugins })`). */
+    readonly cssPlugins: boolean;
     private relayPort;
     private listeners;
     private commands;

@@ -85,6 +85,11 @@ test.describe.serial('Tailwind CSS v4', () => {
     expect(await frame.evaluate(() => (window as unknown as Win).__marker)).toBe(1)
   })
 
+  test('a class added to index.html applies after the full reload', async () => {
+    await write(page, 'index.html', '<!doctype html>\n<html><head><meta charset="utf-8" /></head><body><p id="from-html" class="italic">html</p><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>\n')
+    await expect(page.frameLocator('#frame').locator('#from-html')).toHaveCSS('font-style', 'italic')
+  })
+
   test('c.build() emits the same Tailwind CSS', async () => {
     const out = await page.evaluate(async () => {
       const c = (window as unknown as Win).container

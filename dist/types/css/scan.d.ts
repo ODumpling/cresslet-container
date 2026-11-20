@@ -11,28 +11,40 @@ export type SourceRoot = null | 'none' | {
     base: string;
     pattern: string;
 };
+/** One stylesheet's source rules: one entry per Tailwind compile it ran (usually one). */
+export type SourceRules = {
+    root: SourceRoot;
+    sources: SourceSpec[];
+}[];
+export declare const rulesKey: (rules: SourceRules) => string;
 /** Minimal glob -> RegExp (`**`, `*`, `?`, `{a,b}`), matched against an absolute path. */
 export declare function globToRegExp(glob: string): RegExp;
-/** The union of every Tailwind stylesheet's sources, and the candidates found in them (only ever grows, like Tailwind). */
+/** One set of source rules (a stylesheet's), and the candidates found in its sources (only ever grows, like Tailwind). */
 export declare class CandidateScanner {
     private vfs;
     private root;
+    /** Unique per scanner: names its candidate set in the CSS worker. */
+    readonly id: number;
     private scopes;
     private excludes;
-    private keys;
     private files;
     readonly candidates: Set<string>;
-    private scanned;
-    constructor(vfs: VFS, root: string);
-    /** Add a stylesheet's sources; returns true when that widened the scan (callers must re-request with candidates()). */
-    addSources(root: SourceRoot, sources: SourceSpec[]): boolean;
-    /** Every candidate in every source file (scans lazily, once). */
-    all(): string[];
-    /** Whether a changed file is a source; re-extracts it. Returns true when it brought new candidates. */
+    /** Bumped when a changed file brings new candidates after the scan (a build that read the old set is stale). */
+    revision: number;
+    private scan;
+    private done;
+    constructor(vfs: VFS, root: string, rules?: SourceRules);
+    /** Every candidate in every source file (scans once, lazily, yielding between slices of a large tree). */
+    all(): Promise<string[]>;
+    /**
+     * A file changed: re-extract it if it's a source. Applies as soon as the scan has started (the walk skips files this
+     * already read); before that the scan will read it. Returns true when it brought new candidates.
+     */
     update(file: string): boolean;
+    private read;
     private extract;
     private inScope;
     private isSource;
-    private autoSkips;
-    private walk;
+    private walkAll;
+    private visitFile;
 }
