@@ -133,6 +133,7 @@ export async function install(vfs: VFS, registry: Registry, o: InstallOptions): 
   linkBins(vfs, o.cwd, placements)
   writeLock(vfs, o.cwd, pkg, placements)
   if (!vfs.isDir(nm)) vfs.mkdir(nm, { recursive: true })
+  await registry.flush?.() // so a reload right after the install still hits the persistent cache
   const secs = ((Date.now() - t0) / 1000).toFixed(1)
   const parts = [`added ${todo.length} package${todo.length === 1 ? '' : 's'}`]
   if (removed) parts.push(`removed ${removed} package${removed === 1 ? '' : 's'}`)
