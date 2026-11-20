@@ -24,6 +24,8 @@ export const BROADCAST_CLOSE = 'cresslet-broadcast-close'
 export const WORKER_SCRIPT = 'cresslet-worker-script'
 export const PROC_SPAWN = 'cresslet-proc-spawn'
 export const WORKER_SPAWN = 'cresslet-worker-spawn'
+/** host -> relay: the container is going away; unregister this origin's service worker (per-preview origins only). */
+export const RELAY_DISPOSE = 'cresslet-relay-dispose'
 
 /** SW -> owning page messages the relay forwards. */
 export const SW_TO_PAGE = new Set(['cresslet-who', 'cresslet-request'])
@@ -44,8 +46,38 @@ export function toOrigin(s: string | null | undefined): string | null {
   }
 }
 
-export function relayUrl(previewOrigin: string, hostOrigin: string): string {
-  return `${previewOrigin}/cresslet-relay.html?host=${encodeURIComponent(hostOrigin)}`
+/** `sw: false`: a relay that only runs workers (no service worker on its origin; see `previewOrigins`). */
+export function relayUrl(previewOrigin: string, hostOrigin: string, opts: { sw?: boolean } = {}): string {
+  return `${previewOrigin}/cresslet-relay.html?host=${encodeURIComponent(hostOrigin)}${opts.sw === false ? '&sw=0' : ''}`
+}
+
+/** `boot({ previewOrigins })`: the origin for one preview port (`port` 0: where the container's workers run). */
+export function expandOriginTemplate(template: string, instanceId: string, port: number): string {
+  return template.replaceAll('{id}', instanceId).replaceAll('{port}', String(port))
+}
+
+/**
+ * Check a `previewOrigins` template: once `{id}` and `{port}` are filled in, it must be a bare http(s) origin, and both
+ * placeholders must change it (so every container and port gets an origin of its own). Returns the error, or null.
+ */
+export function originTemplateError(template: unknown): string | null {
+  if (typeof template !== 'string') return 'must be a string'
+  if (!template.includes('{id}') || !template.includes('{port}')) return 'must contain {id} and {port}'
+  const at = (id: string, port: number) => {
+    try {
+      const u = new URL(expandOriginTemplate(template, id, port))
+      const bare = u.pathname === '/' && !u.search && !u.hash && !u.username && !u.password && !template.endsWith('#') && !template.endsWith('?')
+      return bare ? toOrigin(u.href) : null
+    } catch {
+      return null
+    }
+  }
+  const a = at('a0', 1)
+  const b = at('b1', 1)
+  const c = at('a0', 2)
+  if (!a || !b || !c || !at('zz9zz9zz', 65535) || !at('zz9zz9zz', 0)) return 'must be an http(s) origin (no path) once {id} and {port} are filled in'
+  if (a === b || a === c) return 'must put {id} and {port} in the origin (host or port)'
+  return null
 }
 
 /**

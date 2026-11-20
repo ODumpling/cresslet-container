@@ -129,17 +129,22 @@ export class PortTable {
   constructor(
     public instanceId: string,
     private events: PortEvents,
-    /** Origin previews are served from. Default: the page's own origin. */
-    private previewOrigin?: string,
+    /** Origin previews are served from, or one per port (`boot({ previewOrigins })`). Default: the page's own origin. */
+    private previewOrigin?: string | ((port: number) => string),
   ) {}
 
-  /** Origin previews are served from. */
-  origin(): string {
-    return this.previewOrigin ?? (typeof location !== 'undefined' ? location.origin : 'http://localhost')
+  /** Origin previews (`port`'s, with per-preview origins: then `port` is required) are served from. */
+  origin(port?: number): string {
+    const o = this.previewOrigin
+    if (typeof o === 'function') {
+      if (port === undefined) throw new TypeError('ports.origin(port): previews have one origin per port (previewOrigins)')
+      return o(port)
+    }
+    return o ?? (typeof location !== 'undefined' ? location.origin : 'http://localhost')
   }
 
   url(port: number): string {
-    return `${this.origin()}${PREVIEW_PREFIX}${this.instanceId}/${port}/`
+    return `${this.origin(port)}${PREVIEW_PREFIX}${this.instanceId}/${port}/`
   }
 
   open(port: number, handler: PortHandler, owner = 'user'): string {
@@ -243,7 +248,7 @@ export class PortTable {
       return reply.close()
     }
     const req = new Request(requestUrl(m))
-    Object.defineProperty(req, 'headers', { value: new Headers(websocketHeaders(offered, this.origin())), enumerable: true })
+    Object.defineProperty(req, 'headers', { value: new Headers(websocketHeaders(offered, this.origin(m.port))), enumerable: true })
     const pending: PendingUpgrade = { protocols: offered, socket }
     upgrades.set(req, pending)
     // also told over the socket, but Firefox drops that one when the page unloads before its receiver has started

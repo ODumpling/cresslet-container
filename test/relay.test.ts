@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Container } from '../src/container'
 import { PortTable } from '../src/ports'
-import { acceptHello, acceptInit, isChannelName, isPageToSw, isProcSpawn, isSwToPage, isWorkerScript, newestWorker, relayErrorText, relayUrl, toOrigin } from '../src/relay-protocol'
+import { acceptHello, acceptInit, expandOriginTemplate, isChannelName, isPageToSw, isProcSpawn, isSwToPage, isWorkerScript, newestWorker, originTemplateError, relayErrorText, relayUrl, toOrigin } from '../src/relay-protocol'
 import { decodeResult, encodeResult, HEADER, STATE_DONE, STATE_GROW, SyncReplier } from '../src/node/protocol'
 import { relayChannel } from '../src/node/channel'
 
@@ -383,5 +383,178 @@ describe('Container.boot({ previewOrigin })', () => {
     }
     c.teardown()
     relayPort.close()
+  })
+})
+
+describe('previewOrigins templates', () => {
+  it('accepts origins with {id} and {port} in the host (or port)', () => {
+    for (const t of ['https://{id}-{port}.preview.example.com', 'http://{id}-{port}.localhost:4402', 'https://{port}.{id}.preview.example/', 'http://{id}.localhost:{port}'])
+      expect(originTemplateError(t), t).toBeNull()
+    expect(expandOriginTemplate('https://{id}-{port}.preview.example.com', 'abc123', 5173)).toBe('https://abc123-5173.preview.example.com')
+    expect(relayUrl('https://a-0.p.example', HOST, { sw: false })).toBe(`https://a-0.p.example/cresslet-relay.html?host=${encodeURIComponent(HOST)}&sw=0`)
+  })
+  it('rejects templates that would share an origin, or are not bare origins', () => {
+    for (const t of [
+      'https://preview.example.com', // no placeholders
+      'https://{id}.preview.example.com', // no {port}
+      'https://{port}.preview.example.com', // no {id}
+      'https://preview.example.com/{id}/{port}', // placeholders in the path: one origin
+      'https://{id}.preview.example.com/?p={port}',
+      'https://{id}.preview.example.com#{port}',
+      'https://{port}:x@{id}.preview.example.com',
+      'ftp://{id}-{port}.preview.example.com',
+      'https://{id}-{port}.preview.example.com/x',
+    ])
+      expect(originTemplateError(t), t).not.toBeNull()
+    expect(originTemplateError(5)).not.toBeNull()
+  })
+  it('PortTable gives each port its own origin', () => {
+    const t = new PortTable('abc', { open() {}, close() {} }, (p) => `https://abc-${p}.preview.example`)
+    expect(t.url(3000)).toBe('https://abc-3000.preview.example/__cresslet__/abc/3000/')
+    expect(t.url(3001)).toBe('https://abc-3001.preview.example/__cresslet__/abc/3001/')
+    expect(() => t.origin()).toThrow(/one origin per port/)
+  })
+})
+
+describe('Container.boot({ previewOrigins })', () => {
+  const TEMPLATE = 'https://{id}-{port}.preview.example.net'
+  interface Frame {
+    src: string
+    allow?: string
+    removed: number
+    contentWindow: { postMessage(m: unknown, origin: string, transfer: MessagePort[]): void }
+    remove(): void
+    setAttribute(): void
+    style: Record<string, string>
+  }
+  /** A fake page whose relay frames (one per origin) say hello; `relay(origin, port)` plays the relay. */
+  function fakePage(relay: (origin: string, port: MessagePort, frame: Frame) => void) {
+    const listeners = new Set<(ev: unknown) => void>()
+    const frames: Frame[] = []
+    vi.stubGlobal('location', { origin: HOST })
+    vi.stubGlobal('addEventListener', (t: string, fn: (ev: unknown) => void) => t === 'message' && listeners.add(fn))
+    vi.stubGlobal('removeEventListener', (t: string, fn: (ev: unknown) => void) => t === 'message' && listeners.delete(fn))
+    vi.stubGlobal('document', {
+      createElement: () => {
+        const frame: Frame = {
+          src: '',
+          removed: 0,
+          style: {},
+          setAttribute() {},
+          remove() {
+            this.removed++
+          },
+          contentWindow: { postMessage: (_m, origin, transfer) => relay(origin, transfer[0], frame) },
+        }
+        frames.push(frame)
+        return frame
+      },
+      body: {
+        appendChild: (frame: Frame) =>
+          queueMicrotask(() => listeners.forEach((fn) => fn({ origin: new URL(frame.src).origin, source: frame.contentWindow, data: { type: 'cresslet-relay-hello' } }))),
+      },
+    })
+    return { frames, listeners }
+  }
+  afterEach(() => vi.unstubAllGlobals())
+  const tick = (ms = 20) => new Promise((r) => setTimeout(r, ms))
+
+  it('rejects bad templates, and previewOrigin together with previewOrigins', async () => {
+    await expect(Container.boot({ previewOrigins: 'https://preview.example.net/{id}/{port}', npmCache: false })).rejects.toThrow(/previewOrigins must be an http\(s\) origin|previewOrigins must put/)
+    await expect(Container.boot({ previewOrigins: TEMPLATE, previewOrigin: 'https://p.example.net', npmCache: false })).rejects.toThrow(/not both/)
+  })
+
+  it('runs workers on the {port}=0 origin, frames one relay per preview port, and fires server-ready once it is up', async () => {
+    const got = new Map<string, { type: string }[]>()
+    const ports = new Map<string, MessagePort>()
+    let release!: () => void
+    const held = new Promise<void>((r) => (release = r))
+    const page = fakePage((origin, port) => {
+      ports.set(origin, port)
+      got.set(origin, [])
+      port.onmessage = (e) => got.get(origin)!.push(e.data)
+      // the first preview relay takes a while (its service worker installs)
+      if (origin.includes('-3000.')) void held.then(() => port.postMessage({ type: 'cresslet-relay-ready' }))
+      else port.postMessage({ type: 'cresslet-relay-ready' })
+    })
+    vi.stubGlobal('fetch', async () => new Response('/* node worker */'))
+    const c = await Container.boot({ previewOrigins: TEMPLATE, npmCache: false })
+    const at = (p: number) => `https://${c.instanceId}-${p}.preview.example.net`
+    expect(c.previewOrigins).toBe(TEMPLATE)
+    expect(c.previewOrigin).toBeNull()
+    expect(page.frames).toHaveLength(1)
+    expect(page.frames[0].src).toBe(`${at(0)}/cresslet-relay.html?host=${encodeURIComponent(HOST)}&sw=0`)
+    expect(page.frames[0].allow).toBe('cross-origin-isolated')
+    const ch = await c.nodeChannel()
+    await tick()
+    // the workers relay runs workers, and no service worker: nothing is registered with it
+    expect(got.get(at(0))!.map((m) => m.type)).toEqual(['cresslet-worker-script', 'cresslet-proc-spawn'])
+    ch.terminate()
+
+    const ready: [number, string][] = []
+    c.on('server-ready', (p, url) => ready.push([p, url]))
+    const a = c.servePort(3000, () => new Response('A'))
+    const b = c.servePort(3001, () => new Response('B'))
+    expect(a.url).toBe(`${at(3000)}/__cresslet__/${c.instanceId}/3000/`)
+    await tick()
+    expect(page.frames.map((f) => f.src.split('/cresslet-relay')[0])).toEqual([at(0), at(3000), at(3001)])
+    expect(page.frames[1].allow).toBeUndefined()
+    expect(ready).toEqual([[3001, b.url]]) // 3000's relay isn't up yet
+    release()
+    await tick()
+    expect(ready).toEqual([[3001, b.url], [3000, a.url]])
+    expect(got.get(at(3000))).toEqual([{ type: 'cresslet-register', instanceId: c.instanceId }])
+
+    // dev server notifications go to that port's relay only
+    c.previewChannel(`cresslet:${c.instanceId}:3001`).postMessage({ type: 'reload' })
+    c.previewChannel(`cresslet:someone-else:3000`).postMessage({ type: 'reload' })
+    await tick()
+    expect(got.get(at(3001))!.at(-1)).toEqual({ type: 'cresslet-broadcast', channel: `cresslet:${c.instanceId}:3001`, message: { type: 'reload' } })
+    expect(got.get(at(3000))!.map((m) => m.type)).toEqual(['cresslet-register'])
+
+    // a preview's relay reaches its own port only
+    const ask = async (relay: string, p: number) => {
+      const r = new MessageChannel()
+      const msgs: { type: string; status?: number; data?: Uint8Array }[] = []
+      const ended = new Promise<void>((res) => (r.port1.onmessage = (e) => (msgs.push(e.data), e.data.type === 'end' && res())))
+      ports.get(relay)!.postMessage({ type: 'cresslet-request', instanceId: c.instanceId, port: p, path: '/', method: 'GET', headers: [], body: null }, [r.port2])
+      await ended
+      r.port1.close()
+      return [msgs[0].status, new TextDecoder().decode(msgs[1]?.data)]
+    }
+    expect(await ask(at(3000), 3000)).toEqual([200, 'A'])
+    expect(await ask(at(3000), 3001)).toEqual([400, 'Cresslet: malformed preview request'])
+    expect(await ask(at(3001), 3001)).toEqual([200, 'B'])
+
+    const closed: number[] = []
+    c.on('port', (p, ev) => ev === 'close' && closed.push(p))
+    b.close()
+    expect(closed).toEqual([3001])
+    c.teardown()
+    await tick()
+    expect(got.get(at(3000))!.slice(-2)).toEqual([{ type: 'cresslet-unregister', instanceId: c.instanceId }, { type: 'cresslet-relay-dispose' }])
+    expect(got.get(at(0))!.map((m) => m.type)).not.toContain('cresslet-relay-dispose')
+    ports.forEach((p) => p.close())
+  })
+
+  it('reports a preview relay that fails, without server-ready, and retries on the next open', async () => {
+    let fails = true
+    fakePage((origin, port) => {
+      if (origin.includes('-3000.') && fails) port.postMessage({ type: 'cresslet-relay-error', message: 'registration failed' })
+      else port.postMessage({ type: 'cresslet-relay-ready' })
+    })
+    const c = await Container.boot({ previewOrigins: TEMPLATE, npmCache: false })
+    const events: unknown[] = []
+    c.on('error', (e) => events.push(e))
+    c.on('server-ready', (p) => events.push(p))
+    const s = c.servePort(3000, () => new Response('A'))
+    await tick()
+    expect(events).toEqual([{ message: 'port 3000: preview relay: registration failed' }])
+    s.close()
+    fails = false
+    c.servePort(3000, () => new Response('A'))
+    await tick()
+    expect(events.at(-1)).toBe(3000)
+    c.teardown()
   })
 })

@@ -2,7 +2,8 @@
 // Routes: / -> demo/index.html, /cresslet-sw.js -> dist/cresslet-sw.js (origin root => scope "/").
 // A second listener (PREVIEW_PORT, default PORT+1) is a separate preview origin for `boot({ previewOrigin })`: it serves
 // only the relay, the service worker and a blank page, with the headers the README asks of a preview origin.
-// Open http://localhost:4400/?previewOrigin=http://127.0.0.1:4401 to try it.
+// Open http://localhost:4400/?previewOrigin=http://127.0.0.1:4401 to try it. It answers any host name, so per-preview
+// origins work too: http://localhost:4400/?previewOrigins=http://{id}-{port}.localhost:4401 (browsers resolve *.localhost).
 import { createServer } from 'node:http'
 import { readFile, stat } from 'node:fs/promises'
 import { extname, join, normalize } from 'node:path'

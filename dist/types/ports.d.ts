@@ -43,14 +43,14 @@ export declare function upgradeWebSocket(req: Request, opts?: {
 export declare class PortTable {
     instanceId: string;
     private events;
-    /** Origin previews are served from. Default: the page's own origin. */
+    /** Origin previews are served from, or one per port (`boot({ previewOrigins })`). Default: the page's own origin. */
     private previewOrigin?;
     private ports;
     constructor(instanceId: string, events: PortEvents, 
-    /** Origin previews are served from. Default: the page's own origin. */
-    previewOrigin?: string | undefined);
-    /** Origin previews are served from. */
-    origin(): string;
+    /** Origin previews are served from, or one per port (`boot({ previewOrigins })`). Default: the page's own origin. */
+    previewOrigin?: string | ((port: number) => string) | undefined);
+    /** Origin previews (`port`'s, with per-preview origins: then `port` is required) are served from. */
+    origin(port?: number): string;
     url(port: number): string;
     open(port: number, handler: PortHandler, owner?: string): string;
     close(port: number): void;

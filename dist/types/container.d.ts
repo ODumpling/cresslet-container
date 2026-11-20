@@ -41,6 +41,14 @@ export interface BootOptions {
      */
     previewOrigin?: string;
     /**
+     * One origin per preview instead of one for all: a template with `{id}` (the container's `instanceId`) and `{port}`,
+     * e.g. 'https://{id}-{port}.preview.example.com', so previews can't script each other or read each other's storage.
+     * Each port's preview gets its own relay frame and service worker on its origin (framed when the port opens;
+     * `server-ready` / `port` fire once it's connected), which answers only that port. `node` processes and project
+     * workers run on the `{port}` = 0 origin, which no preview shares. Not with `previewOrigin`.
+     */
+    previewOrigins?: string;
+    /**
      * Load project plugins and configs when processing CSS: PostCSS configs (and their plugins), Tailwind `@plugin` /
      * `@config`, Less `@plugin`. Default true. `false`: PostCSS configs are ignored and those `@plugin`/`@config` fail;
      * Tailwind v4, Sass and Less themselves still compile (the installed packages' own code still runs).
@@ -120,16 +128,25 @@ export declare class Container {
     readonly fs: FsApi;
     /** Origin previews are served from when it differs from the page's (`boot({ previewOrigin })`), else null. */
     readonly previewOrigin: string | null;
+    /** The per-preview origin template (`boot({ previewOrigins })`), else null. See `ports.url(port)` for a preview's URL. */
+    readonly previewOrigins: string | null;
     /** Whether CSS processing runs project code (`boot({ cssPlugins })`). */
     readonly cssPlugins: boolean;
     /** Workdir snapshots (`boot({ persist })`), else null. */
     readonly persistence: Persistence | null;
     private persist;
-    private relayPort;
-    /** Whether the relay connected at boot (previews, and `node`, run on the preview origin). */
+    /** Origin `node` processes and project workers run on (by its relay), when not this page's. */
+    private workersOrigin;
+    /** The relay on `workersOrigin` (with `previewOrigin`, it also serves every preview). */
+    private relay;
+    /** Whether the workers relay connected at boot (previews, and `node`, run on the preview origin). */
     private relayBooted;
-    /** The current relay connection once it's ready (set up its service worker and message handler), else rejected. */
-    private relayConn;
+    /** `previewOrigins`: each preview port's relay (on its own origin), by port. */
+    private previewRelays;
+    /** `previewOrigins`: open ports whose `port` / `server-ready` were emitted (after their relay connected). */
+    private announced;
+    /** No service worker or relays (`serviceWorkerUrl: false`). */
+    private previewsOff;
     /** The relay port the node worker script was last sent on. */
     private relayScriptPort;
     /** Kill switches of `node` processes and project workers running in the relay (they die with its document). */
@@ -213,16 +230,23 @@ export declare class Container {
      * A message the SW posts to the page that owns an instance (directly, or forwarded by the relay). `exclusive`: the
      * channel is this container's own (the relay port), so every request on it is ours to answer, if only with a 400;
      * on the page's shared SW channel, requests for other instance ids belong to other containers in this page.
+     * `onlyPort`: a per-preview relay (`previewOrigins`) speaks for that one preview, so it may only reach that port.
      */
     private onSwMessage;
     /**
      * Channel for notifying this container's previews (used by the dev server). A BroadcastChannel on the page's origin,
      * or, with a separate preview origin, re-posted by the relay on the preview origin's BroadcastChannel of that name.
+     * With `previewOrigins` only the relay of the port in the name (`cresslet:<instanceId>:<port>`) gets it; other names
+     * go nowhere.
      */
     previewChannel(name: string): PreviewChannel;
+    /** `previewOrigins`: the relay on `port`'s preview origin, framed on first use and kept until teardown. */
+    private previewRelay;
     /**
-     * Frame the preview origin's relay and bridge its service worker over a MessagePort (see relay-protocol.ts). Rejects
-     * (leaving no frame or listener behind) if the first handshake fails or times out.
+     * Frame a preview origin's relay and bridge it over a MessagePort (see relay-protocol.ts). `workers`: it runs this
+     * container's `node` processes and project workers. `sw`: it registers that origin's service worker, whose requests
+     * it forwards (`onlyPort`: for that preview port only). `ready` rejects (leaving no frame or listener behind) if the
+     * first handshake fails or times out.
      */
     private connectRelay;
     private connectServiceWorker;

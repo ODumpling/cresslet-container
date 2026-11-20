@@ -15,6 +15,7 @@ import {
   isWorkerScript,
   isWorkerSpawn,
   newestWorker,
+  RELAY_DISPOSE,
   RELAY_ERROR,
   RELAY_HELLO,
   RELAY_READY,
@@ -22,7 +23,10 @@ import {
   toOrigin,
 } from './relay-protocol'
 
-const host = toOrigin(new URLSearchParams(location.search).get('host'))
+const params = new URLSearchParams(location.search)
+const host = toOrigin(params.get('host'))
+/** `sw=0`: this relay only runs workers (`boot({ previewOrigins })`): no service worker on this origin. */
+const withSw = params.get('sw') !== '0'
 const SW_URL = '/cresslet-sw.js?xorigin=1'
 
 let port: MessagePort | null = null
@@ -44,6 +48,11 @@ function onInit(ev: MessageEvent) {
 }
 
 async function connect(p: MessagePort) {
+  if (!withSw) {
+    p.onmessage = (ev) => onHostMessage(ev, null, null)
+    p.postMessage({ type: RELAY_READY })
+    return
+  }
   const sw = serviceWorkers()
   if (!sw) {
     p.postMessage({ type: RELAY_ERROR, message: `Service workers unavailable on ${location.origin} (${THIRD_PARTY_HINT})` })
@@ -67,24 +76,28 @@ async function connect(p: MessagePort) {
     p.postMessage({ type: RELAY_ERROR, message: `Service worker registration failed on ${location.origin}: ${e instanceof Error ? e.message : e} (${THIRD_PARTY_HINT})` })
     return
   }
-  p.onmessage = (ev) => {
-    const d = ev.data
-    if (isProcSpawn(d, ev.ports)) spawn(ev.ports[0])
-    else if (isWorkerSpawn(d, ev.ports)) spawnProjectWorker(ev.ports[0], d.source, d.name)
-    else if (isWorkerScript(d)) {
-      if (workerUrl) URL.revokeObjectURL(workerUrl)
-      workerUrl = URL.createObjectURL(new Blob([d.source], { type: 'text/javascript' }))
-    } else if (isPageToSw(d)) (reg.active ?? active).postMessage({ type: d.type, instanceId: d.instanceId })
-    else if (d?.type === BROADCAST && isChannelName(d.channel)) {
-      let bc = channels.get(d.channel)
-      if (!bc) channels.set(d.channel, (bc = new BroadcastChannel(d.channel)))
-      bc.postMessage(d.message)
-    } else if (d?.type === BROADCAST_CLOSE && isChannelName(d.channel)) {
-      channels.get(d.channel)?.close()
-      channels.delete(d.channel)
-    }
-  }
+  p.onmessage = (ev) => onHostMessage(ev, reg, active)
   p.postMessage({ type: RELAY_READY })
+}
+
+/** A message from the host (`reg` / `active`: this origin's service worker, unless `sw=0`). */
+function onHostMessage(ev: MessageEvent, reg: ServiceWorkerRegistration | null, active: ServiceWorker | null) {
+  const d = ev.data
+  if (isProcSpawn(d, ev.ports)) spawn(ev.ports[0])
+  else if (isWorkerSpawn(d, ev.ports)) spawnProjectWorker(ev.ports[0], d.source, d.name)
+  else if (isWorkerScript(d)) {
+    if (workerUrl) URL.revokeObjectURL(workerUrl)
+    workerUrl = URL.createObjectURL(new Blob([d.source], { type: 'text/javascript' }))
+  } else if (isPageToSw(d)) (reg?.active ?? active)?.postMessage({ type: d.type, instanceId: d.instanceId })
+  else if (d?.type === RELAY_DISPOSE) void reg?.unregister().catch(() => {})
+  else if (d?.type === BROADCAST && isChannelName(d.channel)) {
+    let bc = channels.get(d.channel)
+    if (!bc) channels.set(d.channel, (bc = new BroadcastChannel(d.channel)))
+    bc.postMessage(d.message)
+  } else if (d?.type === BROADCAST_CLOSE && isChannelName(d.channel)) {
+    channels.get(d.channel)?.close()
+    channels.delete(d.channel)
+  }
 }
 
 /**
