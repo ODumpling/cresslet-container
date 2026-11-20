@@ -342,7 +342,10 @@ export class VfsPersistence implements Persistence {
     try {
       // the other backend may hold a copy saved while this one wasn't usable (OPFS before a browser update, or
       // read-only for a while): restore the newer one
-      const [mine, theirs] = await Promise.all([this.store.read(this.key), other?.read(this.key).catch(() => null) ?? null])
+      const [mine, theirs] = await Promise.all([
+        this.store.read(this.key).catch((e) => (console.warn(`[cresslet] VFS snapshot '${this.key}' unreadable:`, e), null)),
+        other?.read(this.key).catch(() => null) ?? null,
+      ])
       this.otherCopy = !!theirs
       const bytes = theirs && (!mine || savedAt(theirs) > savedAt(mine)) ? theirs : mine
       if (bytes) {
@@ -433,8 +436,8 @@ export class VfsPersistence implements Persistence {
     this.gen++
     this.queued = null
     this.otherCopy = false // deleted too
-    const store = this.store
-    const p = this.queue.catch(() => {}).then(() => clearSnapshot(this.key, store))
+    // the store as of when the delete runs: none after teardown closed it (clearSnapshot opens its own)
+    const p = this.queue.catch(() => {}).then(() => clearSnapshot(this.key, this.store))
     this.queue = p
     return p
   }
@@ -447,9 +450,16 @@ export class VfsPersistence implements Persistence {
     this.cancelTimer()
     // also when nothing is pending: a write in progress that fails is retried. The container's listeners are gone
     // by the time this fails: warn instead
-    const store = this.store
-    void this.flush()
-      .catch((e) => console.warn(`[cresslet] VFS snapshot '${this.key}' not saved on teardown:`, e))
-      .then(() => store?.close())
+    void this.flush().catch((e) => console.warn(`[cresslet] VFS snapshot '${this.key}' not saved on teardown:`, e))
+    // release the store once nothing is queued on it (e.g. `teardown(); await persistence.clear()`)
+    const closeWhenIdle = () => {
+      const q = this.queue
+      void q.catch(() => {}).then(() => {
+        if (q !== this.queue) return closeWhenIdle()
+        this.store?.close()
+        this.store = null
+      })
+    }
+    closeWhenIdle()
   }
 }

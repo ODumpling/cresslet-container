@@ -112,7 +112,7 @@ describe('snapshot codec', () => {
 describe('VfsPersistence', () => {
   afterEach(() => vi.useRealTimers())
 
-  async function setup(opts = {}, store = new MemoryStore(), other = new MemoryStore('indexeddb'), dir = W) {
+  async function setup(opts = {}, store: SnapshotStore = new MemoryStore(), other: SnapshotStore | null = new MemoryStore('indexeddb'), dir = W) {
     const fs = new VFS()
     fs.mkdir(W, { recursive: true })
     const errors: string[] = []
@@ -354,6 +354,26 @@ describe('VfsPersistence', () => {
       const back = new VFS()
       restoreSnapshot(back, W, store.data.get('default')!)
       expect(back.readdir(W)).toEqual([])
+    }
+  })
+
+  it('clear() after teardown still deletes, with the IndexedDB store closed', async () => {
+    vi.stubGlobal('indexedDB', new IDBFactory())
+    try {
+      const store = (await idbStore())!
+      const { fs, p } = await setup({ debounceMs: 60_000 }, store, null)
+      fs.writeFile(`${W}/a`, '1')
+      await p.flush()
+      p.close()
+      const cleared = p.clear() // right away, as `teardown(); await persistence.clear()`
+      await cleared
+      await new Promise((r) => setTimeout(r, 10))
+      await p.clear() // and once the store is closed
+      const check = (await idbStore(false))!
+      expect(await check.read('default')).toBeNull()
+      check.close()
+    } finally {
+      vi.unstubAllGlobals()
     }
   })
 
