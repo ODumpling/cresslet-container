@@ -28,7 +28,7 @@ Install: `pnpm add github:ODumpling/cresslet-container` (dist is committed) or l
    `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp`.
 2. **Serve `dist/cresslet-sw.js` from your origin root** (default URL `/cresslet-sw.js`, scope `/`; override with `boot({ serviceWorkerUrl })`). Service workers must be same-origin, so copy it even when loading the library from a CDN.
 3. `dist/node-worker.js` is loaded via `new URL('./node-worker.js', import.meta.url)`; cross-origin (CDN) copies are wrapped in a same-origin blob worker automatically.
-4. esbuild-wasm (0.28.2) loads lazily from jsDelivr; override with `boot({ esbuildWasmUrl })`.
+4. esbuild-wasm (0.28.2) loads lazily from jsDelivr; override with `boot({ esbuildWasmUrl })`. So does brotli-wasm (3.0.1, `pkg.web/brotli_wasm_bg.wasm`) for `zlib` brotli in browsers whose CompressionStream lacks it (Chromium), on first use; override with `boot({ brotliWasmUrl })`.
 5. Optional, recommended when the host keeps secrets in storage: a **separate preview origin** (`boot({ previewOrigin })`, see [below](#separate-preview-origin)). Previews and project code in workers (`node`, the CSS worker, `c.projectWorker`) then run there.
 
 `pnpm demo` serves `demo/` with these headers (http://localhost:4400), plus a preview origin on http://127.0.0.1:4401 (try http://localhost:4400/?previewOrigin=http://127.0.0.1:4401).
@@ -36,7 +36,7 @@ Install: `pnpm add github:ODumpling/cresslet-container` (dist is committed) or l
 ## API
 
 ```ts
-const c = await Container.boot({ serviceWorkerUrl?, esbuildWasmUrl?, registry?, workdir? /* '/home/project' */, npmCache? /* true, or { maxBytes } */, previewOrigin? /* e.g. 'https://preview.example.com' */ })
+const c = await Container.boot({ serviceWorkerUrl?, esbuildWasmUrl?, brotliWasmUrl?, registry?, workdir? /* '/home/project' */, npmCache? /* true, or { maxBytes } */, previewOrigin? /* e.g. 'https://preview.example.com' */ })
 c.workdir; c.instanceId
 c.fs.readFile(p, 'utf8'?) / writeFile(p, data) /* mkdir -p */ / readdir(p, { withFileTypes? }) / mkdir / rm / rename / stat / exists
 c.fs.watch(p, { recursive? }, (event: 'change' | 'rename', filename) => {}) // { close() }
@@ -91,7 +91,7 @@ The host page keeps COOP/COEP as above. At the **preview origin's root**, serve 
 What it does and doesn't isolate:
 - **One trust boundary per preview origin.** All previews served from one `previewOrigin` (every container, every port, every tab) share that origin: they can script each other's frames and the relay, read each other's storage, and answer each other's requests. Use distinct preview origins for containers that must not trust each other (e.g. different users' projects).
 - **What moves, what doesn't.** Previews, `node` processes and project workers run on the preview origin: they can't open the host's IndexedDB or Cache Storage, and requests to the host are cross-origin. The container itself (VFS, shell, npm, esbuild, the dev server and builds) stays on the host page; it runs no project code there except `servePort` / dev server `middleware` handlers the host registers, and the host's own registered commands. Workers still get the container's VFS (their project's files) over their port, as before.
-- **Workers are in the preview origin's trust boundary.** Previews can script the relay frame, so they can reach the workers it runs, and through a `node` process, its container's VFS: on one preview origin, a project's client code can do what its server code can (and, as above, other containers' previews there can too).
+- **Workers are in the preview origin's trust boundary.** Previews can script the relay frame, so they can reach the workers it runs, and through a `node` process, its container's VFS and commands (`child_process` runs jsh commands, the host's registered commands included): on one preview origin, a project's client code can do what its server code can (and, as above, other containers' previews there can too).
 - **Cross-site preview origins need third-party service workers and storage.** Browsers or settings that block them (some privacy modes, "block third-party cookies" in some browsers) make the relay fail: `boot` rejects with a `preview relay:` error that says so. Fall back to a same-site preview origin or no `previewOrigin`.
 
 Choosing the origin:
@@ -104,7 +104,9 @@ Choosing the origin:
 - **jsh**: quotes, `$VAR`/`${VAR:-x}`, `VAR=x cmd`, `|`, `&&`, `||`, `;`, `>`, `>>`, `<`, `2>`, `2>&1`, `&>`. Builtins: `cd pwd ls cat echo mkdir rm rmdir mv cp touch env export unset which clear exit head tail grep wc sleep true false help`.
 - **npm**: `install|i|add [pkgs] [-D] [-E]`, `ci`, `uninstall`, `run`, `start`, `test`, `init -y`, `exec`, `ls`, `pkg get/set`. Registry installs: semver, abbreviated packuments, parallel tarball fetch, sha integrity check, gunzip + untar, hoisting with nesting on conflict, peers, optional deps, `npm:` aliases, `.bin` shims, `package-lock.json` (written, not read). Persistent package cache in IndexedDB (`cresslet-npm`, shared by all containers on the origin): tarballs keyed by integrity (URL when there is none) and re-verified on read (a bad entry is evicted and refetched); packuments reused for 5 min (stale copy used if the registry is unreachable). A reinstall after a page reload makes no tarball requests. Size-capped at 256 MiB by default (`boot({ npmCache: { maxBytes } })`, `Infinity` for no cap; sizes are approximate: tarball bytes, packument JSON length): a write or read hit that leaves the cache over the cap evicts least-recently-used entries (last write or read hit, across both stores, shared by every container on the origin); an entry bigger than the cap isn't stored. Upgrading from a cache written before the cap existed starts it empty once. Silently in-memory only when IndexedDB is unavailable (e.g. some private modes); opt out with `boot({ npmCache: false })`. `github:`/`git+`/`file:`/URL specs are skipped with a warning; install scripts are skipped with a warning.
 - **npx**: local `.bin`, built-ins, or temp-installs the package.
-- **node**: Web Worker with CommonJS loader over the VFS; ESM/TS/JSX transformed to CJS by esbuild (top-level await supported). Builtins: fs (sync + promises + streams), path, events, process, buffer, util, url, os, assert, stream, timers(/promises), crypto (randomUUID/randomBytes/createHash/createHmac for sha1/256/384/512), http/https (`createServer().listen()` → virtual port; `request`/`get`/`fetch` incl. `localhost:<port>`), querystring, string_decoder, readline, module, tty, net (isIP only), vm, async_hooks, perf_hooks, worker_threads (stub). `child_process`, `net` sockets, `tls`, `zlib`, `dns`, `http2`… throw `[cresslet] … is not supported`. Express works.
+- **node**: Web Worker with CommonJS loader over the VFS; ESM/TS/JSX transformed to CJS by esbuild (top-level await supported). Builtins: fs (sync + promises + streams), path, events, process, buffer, util, url, os, assert, stream, timers(/promises), crypto (randomUUID/randomBytes/createHash/createHmac for sha1/256/384/512), http/https (`createServer().listen()` → virtual port; `request`/`get`/`fetch` incl. `localhost:<port>`), querystring, string_decoder, readline, module, tty, net (isIP only), vm, async_hooks, perf_hooks, worker_threads (stub), zlib, child_process. `net` sockets, `tls`, `dns`, `http2`, `child_process.fork`… throw `[cresslet] … is not supported`. Express works.
+  - **zlib**: gzip, deflate, deflate-raw, unzip and brotli: callbacks, promisified, `create*` streams, `*Sync`. Async calls and streams use the worker's CompressionStream; `*Sync` calls block on the host page over the SAB RPC. Brotli without native support (Chromium) runs on the host in WASM (see `brotliWasmUrl`); its streams then (de)compress once at the end. Output is standard and interoperates with Node, but tuning options (level, windowBits, strategy, flush modes, dictionaries) are ignored, except brotli's `BROTLI_PARAM_QUALITY` in WASM; `flush()` doesn't emit partial output; concatenated gzip members aren't read past the first.
+  - **child_process**: `spawn`, `exec`, `execFile`, `spawnSync`, `execSync`, `execFileSync` run container commands as jsh would (builtins, `node`, `npm`/`npx`, registered commands, files on PATH; `process.execPath` is `node`); `shell: true` and `exec*` lines go through jsh. Stdio is piped as text (`'pipe'`, `'inherit'`, `'ignore'`, or a stream); `cwd`, `env`, `input`, `timeout`, `signal`, `encoding` are honoured; `kill()` aborts the command (exit code `null`, the signal). Children die with their parent; no `fork`/IPC, `detached`, or `stdio: 'inherit'` for stdin (the child gets none).
 - **vite** / **vite dev** / **vite --port N**: built-in dev server. **vite build**: production build. **vite preview**, **serve [dir] [-p N]**: static server with SPA fallback.
 - **tsc**: no-op stub (type-checking skipped; esbuild strips types) so `tsc -b && vite build` scripts work.
 
@@ -133,9 +135,9 @@ Parses `index.html`, bundles each `<script type="module" src>` and local stylesh
 
 ## Limitations
 
-- Not real Node: real `vite`, `next`, `tsc`, native addons, `child_process`, raw sockets don't run (built-ins cover the common workflow).
+- Not real Node: real `vite`, `next`, `tsc`, native addons, raw sockets don't run (built-ins cover the common workflow); `child_process` reaches container commands only, not real binaries.
 - HMR covers CSS and React Fast Refresh only (no `import.meta.hot` API, no Preact/Vue/Svelte HMR; those full-reload). Refresh signatures come from a light pass over esbuild output, not Babel: hook changes are detected per component, but unusual code shapes may remount or reload instead. No Sass/Less/Stylus.
-- CSS: PostCSS plugins must be pure JS (native addons, `child_process`, workers don't run); `postcss-load-config`'s YAML/`.postcssrc` (no extension) and `package.json#postcss` aren't read. Tailwind v4 output isn't run through lightningcss (no `optimize`, nesting/`@property` left for the browser; minified by esbuild in `build`). Content detection ignores `.gitignore` (fixed skip list instead) and tokenizes generically (a superset of Tailwind's own candidates; classes assembled from string fragments are missed, as in Tailwind). Tailwind v3 works through PostCSS but is best-effort (tested: build + HMR of a React app).
+- CSS: PostCSS plugins must be pure JS (native addons, real binaries, workers don't run); `postcss-load-config`'s YAML/`.postcssrc` (no extension) and `package.json#postcss` aren't read. Tailwind v4 output isn't run through lightningcss (no `optimize`, nesting/`@property` left for the browser; minified by esbuild in `build`). Content detection ignores `.gitignore` (fixed skip list instead) and tokenizes generically (a superset of Tailwind's own candidates; classes assembled from string fragments are missed, as in Tailwind). Tailwind v3 works through PostCSS but is best-effort (tested: build + HMR of a React app).
 - `node` needs a cross-origin isolated page; without it sync fs/`require` fail with a clear error.
 - `npm`: no lockfile-driven installs, no workspaces, no git/file deps, no lifecycle scripts. The package cache is cleared with `indexedDB.deleteDatabase('cresslet-npm')`; the browser may also evict it.
 - Without `previewOrigin`, previews and `node` share the host origin (and its storage); a preview at `/` and a host page at `/` can't be told apart on a *top-level* reload. Manual reload of a preview frame after `pushState` is best-effort in WebKit.
@@ -162,14 +164,14 @@ host page ───────────────────────�
 ```sh
 pnpm install
 pnpm build       # dist/: cresslet-container.js, node-worker.js, cresslet-sw.js, cresslet-relay.{html,js}, index.d.ts (+ types/)
-pnpm test        # vitest: VFS, parser, resolver/hoisting, tar, html, module resolution, relay message validation, CSS scanning + worker (real tailwindcss/postcss/autoprefixer)
+pnpm test        # vitest: VFS, parser, resolver/hoisting, tar, html, module resolution, relay message validation, CSS scanning + worker (real tailwindcss/postcss/autoprefixer), zlib/child_process host side
 pnpm test:e2e    # Playwright (chromium); test:e2e:all adds firefox + webkit
 pnpm demo        # http://localhost:4400 (+ preview origin http://127.0.0.1:4401)
 ```
 
 ## Roadmap
 
-VFS persistence (IndexedDB/OPFS snapshots; the npm cache already persists), `import.meta.hot` API + non-React HMR, lockfile-driven installs + workspaces, Sass/Less, more Node compat (zlib, child_process via jsh), real Node via WASM for big CLIs, per-preview origins.
+VFS persistence (IndexedDB/OPFS snapshots; the npm cache already persists), `import.meta.hot` API + non-React HMR, lockfile-driven installs + workspaces, Sass/Less, real Node via WASM for big CLIs, per-preview origins.
 
 ## License
 

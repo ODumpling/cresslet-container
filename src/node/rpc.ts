@@ -60,6 +60,7 @@ let refs = 0
 let onIdle: (() => void) | null = null
 let checkScheduled = false
 const nativeSetTimeout = globalThis.setTimeout.bind(globalThis)
+const nativeClearTimeout = globalThis.clearTimeout.bind(globalThis)
 
 /** Hold the process open; returns a release function (idempotent). */
 export function ref(): () => void {
@@ -88,4 +89,4 @@ export function scheduleIdleCheck(): void {
   }, 0)
 }
 
-export { nativeSetTimeout }
+export { nativeSetTimeout, nativeClearTimeout }

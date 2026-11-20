@@ -16,6 +16,8 @@ const shims = {
     b.onResolve({ filter: /^process\/?$/ }, () => ({ path: `${root}src/node/shims/process.cjs` }))
     b.onResolve({ filter: /^abort-controller$/ }, () => ({ path: `${root}src/node/shims/abort-controller.cjs` }))
     b.onResolve({ filter: /^cjs-lexer-js$/ }, () => ({ path: `${root}node_modules/cjs-module-lexer/lexer.js` }))
+    // brotli-wasm's `web` glue (its package exports don't expose it); the .wasm loads at runtime (boot({ brotliWasmUrl }))
+    b.onResolve({ filter: /^brotli-wasm-web$/ }, () => ({ path: `${root}node_modules/brotli-wasm/pkg.web/brotli_wasm.js` }))
     // `import text from 'pkg/file.js?raw'` (as in vite/vitest): embed a file's source as a minified string
     b.onResolve({ filter: /\?raw$/ }, (a) => ({ path: a.path.startsWith('.') ? join(a.resolveDir, a.path.slice(0, -4)) : `${root}node_modules/${a.path.slice(0, -4)}`, namespace: 'raw' }))
     b.onLoad({ filter: /.*/, namespace: 'raw' }, async (a) => {

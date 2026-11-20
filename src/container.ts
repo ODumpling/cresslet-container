@@ -12,15 +12,23 @@ import { bundleVfs, DEFAULT_WASM_URL, type BuildOptions as EsbuildOptions, type 
 import { createDevServer, type DevServerHandle, type DevServerOptions } from './dev/server'
 import { build, type BuildOptions } from './build/build'
 import { nodeCssBackend, type CssBackend } from './css/pipeline'
-import { dirname, join, normalize, resolve } from './path'
+import { basename, dirname, join, normalize, resolve } from './path'
 import { acceptHello, BROADCAST, BROADCAST_CLOSE, newestWorker, PROC_SPAWN, WORKER_SPAWN, RELAY_ERROR, RELAY_INIT, RELAY_READY, relayErrorText, relayUrl, THIRD_PARTY_HINT, toOrigin, WORKER_SCRIPT } from './relay-protocol'
 import { localChannel, relayChannel, relayWorker, type NodeChannel, type ProjectWorker } from './node/channel'
+import { DEFAULT_BROTLI_WASM_URL } from './node/brotli'
+
+const VIRTUAL_BIN_DIRS = new Set(['/usr/local/bin', '/usr/bin', '/bin'])
 
 export interface BootOptions {
   /** Service worker URL served by the host at its origin root. Default '/cresslet-sw.js'. `false` disables previews. */
   serviceWorkerUrl?: string | false
   /** esbuild.wasm URL (must match esbuild-wasm version). Default: jsDelivr. */
   esbuildWasmUrl?: string
+  /**
+   * brotli WASM URL for `zlib` brotli in `node` where the browser's CompressionStream lacks it (Chromium); must match
+   * brotli-wasm 3.0.1 (`pkg.web/brotli_wasm_bg.wasm`). Fetched on first use. Default: jsDelivr.
+   */
+  brotliWasmUrl?: string
   /** npm registry base. Default 'https://registry.npmjs.org'. */
   registry?: string
   /** Project directory. Default '/home/project'. */
@@ -97,6 +105,7 @@ export class Container {
   readonly ports: PortTable
   readonly registry: Registry
   readonly esbuildWasmUrl: string
+  readonly brotliWasmUrl: string
   readonly resolveFs: ResolveFs
   readonly fs: FsApi
   /** Origin previews are served from when it differs from the page's (`boot({ previewOrigin })`), else null. */
@@ -125,6 +134,7 @@ export class Container {
     this.registry = new HttpRegistry(opts.registry ?? 'https://registry.npmjs.org', { cache })
     dropLegacyCache()
     this.esbuildWasmUrl = opts.esbuildWasmUrl ?? DEFAULT_WASM_URL
+    this.brotliWasmUrl = opts.brotliWasmUrl ?? DEFAULT_BROTLI_WASM_URL
     this.cssPlugins = opts.cssPlugins !== false
     let previewOrigin: string | null = null
     if (opts.previewOrigin !== undefined) {
@@ -253,7 +263,7 @@ export class Container {
   which(name: string, cwd: string, env: Record<string, string | undefined>): string | null {
     if (name.includes('/')) {
       const p = resolve(cwd, name)
-      return this.vfs.isFile(p) ? p : null
+      return this.vfs.isFile(p) ? p : this.virtualBin(name) ? name : null
     }
     if (this.commands.has(name)) return `/usr/local/bin/${name}`
     if (name in builtins) return `${name}: shell builtin`
@@ -276,12 +286,20 @@ export class Container {
       const cmd = COMMANDS[name]
       if (cmd) return cmd(ctx)
     }
+    const bin = this.virtualBin(name)
+    if (bin && !this.vfs.isFile(name)) return this.exec(bin, ctx)
     const file = this.which(name, ctx.cwd, ctx.env)
     if (!file || !this.vfs.isFile(file)) {
       ctx.stderr.write(`jsh: command not found: ${name}\n`)
       return 127
     }
     return this.runFile(file, ctx)
+  }
+
+  /** `/usr/local/bin/node` and the like (`process.execPath`, what `which` reports): the built-in command's name, else null. */
+  private virtualBin(name: string): string | null {
+    const base = basename(name)
+    return VIRTUAL_BIN_DIRS.has(dirname(name)) && (this.commands.has(base) || base in builtins || base in COMMANDS) ? base : null
   }
 
   private runFile(file: string, ctx: CommandContext): Promise<number> {
