@@ -74,10 +74,10 @@ export function isSwRequest(d: unknown): d is SwRequest {
   )
 }
 
-/** Reply to a request that failed validation: 400, then close the reply port (the SW would otherwise wait for its deadline). */
-export function rejectRequest(reply: MessagePort): void {
-  const body = new TextEncoder().encode('Cresslet: malformed preview request')
-  reply.postMessage({ type: 'head', status: 400, statusText: 'Bad Request', headers: [['content-type', 'text/plain']] })
+/** Reply to a request that failed validation: 400 (or `status`), then close the reply port (the SW would otherwise wait for its deadline). */
+export function rejectRequest(reply: MessagePort, status: 400 | 403 = 400, text = 'Cresslet: malformed preview request'): void {
+  const body = new TextEncoder().encode(text)
+  reply.postMessage({ type: 'head', status, statusText: status === 400 ? 'Bad Request' : 'Forbidden', headers: [['content-type', 'text/plain']] })
   reply.postMessage({ type: 'chunk', data: body }, [body.buffer])
   reply.postMessage({ type: 'end' })
   reply.close()

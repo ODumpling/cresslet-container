@@ -529,7 +529,7 @@ describe('Container.boot({ previewOrigins })', () => {
       return [msgs[0].status, new TextDecoder().decode(msgs[1]?.data)]
     }
     expect(await ask(at(3000), 3000)).toEqual([200, 'A'])
-    expect(await ask(at(3000), 3001)).toEqual([400, 'Cresslet: malformed preview request'])
+    expect(await ask(at(3000), 3001)).toEqual([403, "Cresslet: this preview's origin serves port 3000 only"])
     expect(await ask(at(3001), 3001)).toEqual([200, 'B'])
 
     const closed: number[] = []

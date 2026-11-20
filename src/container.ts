@@ -193,6 +193,7 @@ export class Container {
     this.ports = new PortTable(this.instanceId, {
       open: (port, url) => {
         if (!originOf || this.previewsOff) return announce(port, url)
+        if (this.torndown) return // no relay frames after teardown (nothing would remove them)
         // {port} 0 is the workers' origin, never a preview's (and the SW only forwards ports 1-65535 anyway)
         if (!Number.isInteger(port) || port < 1 || port > 65535) return this.emit('error', { message: `port ${port}: previews need a port from 1 to 65535` })
         // the preview's URL works once its origin's relay (and so its service worker) is connected
@@ -538,8 +539,9 @@ export class Container {
       ports[0].postMessage({ owns: d.instanceId === this.instanceId })
       ports[0].close()
     } else if (d.type === 'cresslet-request' && ports[0] && (exclusive || d.instanceId === this.instanceId)) {
-      if (isSwRequest(m) && m.instanceId === this.instanceId && (onlyPort === undefined || m.port === onlyPort) && (!m.websocket || ports[1])) void this.ports.answer(m, ports[0], ports[1])
-      else rejectRequest(ports[0])
+      if (!isSwRequest(m) || m.instanceId !== this.instanceId || (m.websocket && !ports[1])) rejectRequest(ports[0])
+      else if (onlyPort !== undefined && m.port !== onlyPort) rejectRequest(ports[0], 403, `Cresslet: this preview's origin serves port ${onlyPort} only`)
+      else void this.ports.answer(m, ports[0], ports[1])
     }
   }
 

@@ -161,7 +161,7 @@ test.describe.serial('per-preview origins', () => {
         otherSocket: await socket(`/__cresslet__/${id}/3001/live`),
       }
     }, id)
-    expect(got.viaRelay).toEqual([400, 'Cresslet: malformed preview request'])
+    expect(got.viaRelay).toEqual([403, "Cresslet: this preview's origin serves port 3000 only"])
     expect(got.own[0]).toBe(200)
     expect(got.own[1]).toContain('preview A')
     expect(got.ownSocket).toBe('message 3000: hi')
@@ -180,6 +180,27 @@ test.describe.serial('per-preview origins', () => {
       return s.trim()
     })
     expect(out).toBe(origin(0))
+  })
+
+  test("teardown unregisters each preview origin's service worker", async () => {
+    // a plain page on preview A's origin, framed by the host (same storage partition as A's relay)
+    await p.evaluate(
+      (src) =>
+        new Promise((resolve) => {
+          const f = document.createElement('iframe')
+          f.name = 'probe'
+          f.src = src
+          f.onload = resolve
+          document.body.appendChild(f)
+        }),
+      `${origin(3000)}/blank.html`,
+    )
+    const probe = p.frame({ name: 'probe' })!
+    const registrations = () => probe.evaluate(async () => (await navigator.serviceWorker.getRegistrations()).map((r) => new URL(r.active?.scriptURL ?? '').pathname))
+    expect(await registrations()).toEqual(['/cresslet-sw.js'])
+    await p.evaluate(() => (window as unknown as Win).container.teardown())
+    await expect.poll(registrations).toEqual([])
+    await expect.poll(() => p.frames().filter((f) => f.url().includes('/cresslet-relay.html')).length).toBe(0)
   })
 })
 
