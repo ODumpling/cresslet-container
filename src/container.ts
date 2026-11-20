@@ -13,7 +13,8 @@ import { createDevServer, type DevServerHandle, type DevServerOptions } from './
 import { build, type BuildOptions } from './build/build'
 import { nodeCssBackend, type CssBackend } from './css/pipeline'
 import { dirname, join, normalize, resolve } from './path'
-import { acceptHello, BROADCAST, BROADCAST_CLOSE, newestWorker, RELAY_ERROR, RELAY_INIT, RELAY_READY, relayErrorText, relayUrl, THIRD_PARTY_HINT, toOrigin } from './relay-protocol'
+import { acceptHello, BROADCAST, BROADCAST_CLOSE, newestWorker, PROC_SPAWN, WORKER_SPAWN, RELAY_ERROR, RELAY_INIT, RELAY_READY, relayErrorText, relayUrl, THIRD_PARTY_HINT, toOrigin, WORKER_SCRIPT } from './relay-protocol'
+import { localChannel, relayChannel, relayWorker, type NodeChannel, type ProjectWorker } from './node/channel'
 
 export interface BootOptions {
   /** Service worker URL served by the host at its origin root. Default '/cresslet-sw.js'. `false` disables previews. */
@@ -29,7 +30,8 @@ export interface BootOptions {
   /**
    * Serve previews from this origin (e.g. 'https://preview.example.com') instead of the host page's, so preview code
    * can't read the host's storage. The container frames `${previewOrigin}/cresslet-relay.html`, which registers
-   * `${previewOrigin}/cresslet-sw.js`; `serviceWorkerUrl` is then unused (`false` still disables previews).
+   * `${previewOrigin}/cresslet-sw.js` and also runs `node` processes (server code, npm bins, the CSS worker) on that
+   * origin; `serviceWorkerUrl` is then unused (`false` disables previews, and `node` stays on the page's origin).
    * Unset (or equal to the page's origin): previews share the host origin.
    */
   previewOrigin?: string
@@ -98,6 +100,12 @@ export class Container {
   /** Whether CSS processing runs project code (`boot({ cssPlugins })`). */
   readonly cssPlugins: boolean
   private relayPort: MessagePort | null = null
+  /** Whether the relay connected at boot (previews, and `node`, run on the preview origin). */
+  private relayBooted = false
+  /** The relay port the node worker script was last sent on. */
+  private relayScriptPort: MessagePort | null = null
+  /** Kill switches of `node` processes and project workers running in the relay (they die with its document). */
+  private relayProcs = new Set<(reason: string) => void>()
   private listeners = new Map<string, Set<Handler>>()
   private commands = new Map<string, Command>()
   private procs = new Set<ContainerProcess>()
@@ -333,10 +341,59 @@ export class Container {
 
   /** Create a runtime worker shipped next to this module (dist/node-worker.js). */
   createWorker(_name: 'node-worker.js'): Worker {
-    const url = new URL('./node-worker.js', import.meta.url)
+    const url = workerScriptUrl()
     if (typeof location === 'undefined' || url.origin === location.origin) return new Worker(url, { type: 'module', name: 'cresslet-node' })
     const blob = new Blob([`import ${JSON.stringify(url.href)};`], { type: 'text/javascript' })
     return new Worker(URL.createObjectURL(blob), { type: 'module', name: 'cresslet-node' })
+  }
+
+  /**
+   * Start a `node` worker: on the preview origin (run by the relay) when previews are served from a separate
+   * `previewOrigin`, so project code there can't open this page's IndexedDB / Cache Storage; on this page otherwise.
+   */
+  async nodeChannel(): Promise<NodeChannel> {
+    if (!this.onPreviewOrigin()) return localChannel(this.createWorker('node-worker.js'))
+    const source = await scriptSource(workerScriptUrl().href)
+    const relay = this.connectedRelay()
+    if (this.relayScriptPort !== relay) {
+      relay.postMessage({ type: WORKER_SCRIPT, source })
+      this.relayScriptPort = relay
+    }
+    const { port1, port2 } = new MessageChannel()
+    const kill = (reason: string) => ch.onerror?.(reason)
+    const ch = relayChannel(port1, () => this.relayProcs.delete(kill))
+    this.relayProcs.add(kill)
+    relay.postMessage({ type: PROC_SPAWN }, [port2])
+    return ch
+  }
+
+  /**
+   * Start a module Web Worker for project code (e.g. an app's server handler) where `node` runs: on the preview origin
+   * when previews are served from a separate `previewOrigin` (the page fetches `url` and the relay runs it from a
+   * `blob:` URL there, so its imports must be absolute URLs), else `new Worker(url, { type: 'module' })` on this page.
+   * Messages are structured-cloned (transfer lists apply to the hop from this page only); `onerror` gets `{ message }`.
+   */
+  async projectWorker(url: string | URL, opts: { name?: string } = {}): Promise<ProjectWorker> {
+    const href = new URL(url, typeof location === 'undefined' ? undefined : location.href).href
+    if (!this.onPreviewOrigin()) return new Worker(href, { type: 'module', name: opts.name }) as ProjectWorker
+    const source = await scriptSource(href)
+    const relay = this.connectedRelay()
+    const { port1, port2 } = new MessageChannel()
+    const kill = (reason: string) => w.onerror?.({ message: reason })
+    const w = relayWorker(port1, () => this.relayProcs.delete(kill))
+    this.relayProcs.add(kill)
+    relay.postMessage({ type: WORKER_SPAWN, source, name: opts.name }, [port2])
+    return w
+  }
+
+  /** Whether project workers run on the preview origin (a relay connected at boot). */
+  private onPreviewOrigin(): boolean {
+    return !!this.previewOrigin && this.relayBooted
+  }
+
+  private connectedRelay(): MessagePort {
+    if (!this.relayPort) throw new Error('preview relay is not connected')
+    return this.relayPort
   }
 
   // ---------------- service worker bridge ----------------
@@ -380,6 +437,8 @@ export class Container {
     frame.title = 'cresslet preview relay'
     frame.tabIndex = -1
     frame.setAttribute('aria-hidden', 'true')
+    // node workers run in the relay and block on SharedArrayBuffers: the frame must be cross-origin isolated too
+    frame.allow = 'cross-origin-isolated'
     frame.style.display = 'none'
     return new Promise<void>((resolve, reject) => {
       let booted = false
@@ -400,7 +459,8 @@ export class Container {
       }
       const onWindowMessage = (ev: MessageEvent) => {
         if (!acceptHello(ev, { previewOrigin: origin, relay: frame.contentWindow })) return
-        // (re)connect: a reloaded relay says hello again
+        // (re)connect: a reloaded relay says hello again; its node workers died with the old document
+        for (const kill of [...this.relayProcs]) kill('preview relay restarted')
         const ch = new MessageChannel()
         this.relayPort?.close()
         const port = (this.relayPort = ch.port1)
@@ -411,7 +471,7 @@ export class Container {
             ready = true
             port.postMessage({ type: 'cresslet-register', instanceId: this.instanceId })
             if (!booted) {
-              booted = true
+              booted = this.relayBooted = true
               clearTimeout(timer)
               resolve()
             }
@@ -469,6 +529,22 @@ export class Container {
     for (const fn of this.cleanups.splice(0)) fn()
     this.listeners.clear()
   }
+}
+
+const workerScriptUrl = () => new URL('./node-worker.js', import.meta.url)
+const sources = new Map<string, Promise<string>>()
+/** A worker script's source, for the relay to run as a blob: worker on the preview origin (no extra files to serve there). */
+function scriptSource(href: string): Promise<string> {
+  let s = sources.get(href)
+  if (!s) {
+    s = fetch(href).then((r) => {
+      if (!r.ok) throw new Error(`fetching ${href}: HTTP ${r.status}`)
+      return r.text()
+    })
+    sources.set(href, s)
+    s.catch(() => sources.delete(href))
+  }
+  return s
 }
 
 export type { FileSystemTree, ContainerProcess, SpawnOptions, Command, CommandContext, DevServerOptions, DevServerHandle, BuildOptions, Dirent, Stats }

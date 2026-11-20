@@ -283,3 +283,206 @@ test.describe.serial('preview origin trust boundary', () => {
     await expect(page.frameLocator('#frame').getByRole('heading', { name: 'Hello from Cresslet' })).toBeVisible()
   })
 })
+
+// ---------------- node on the preview origin ----------------
+// A studio keeps its projects in IndexedDB on the host origin. Project server code (`node`, npm bins, the CSS worker)
+// must not be able to read it: with `previewOrigin`, node workers run in the relay, on the preview origin.
+
+/** Boot a bare container on a blank host page that keeps a "studio" database and cache with a secret in them. */
+async function bootBlank(page: Page, previewOrigin?: string) {
+  page.on('pageerror', (e) => console.log('[pageerror]', e.message))
+  await page.goto(`${HOST}/demo/blank.html`)
+  await page.evaluate(async (previewOrigin) => {
+    await new Promise<void>((resolve, reject) => {
+      const req = indexedDB.open('studio', 1)
+      req.onupgradeneeded = () => req.result.createObjectStore('files')
+      req.onerror = () => reject(req.error)
+      req.onsuccess = () => {
+        const tx = req.result.transaction('files', 'readwrite')
+        tx.objectStore('files').put('API_KEY=host-secret', '.env.cresslet')
+        tx.oncomplete = () => (req.result.close(), resolve())
+      }
+    })
+    await (await caches.open('studio-cache')).put('/secret', new Response('host-secret'))
+    const { Container } = await import('/dist/cresslet-container.js')
+    ;(window as unknown as Win).container = await Container.boot(previewOrigin ? { previewOrigin } : {})
+  }, previewOrigin)
+}
+
+/** Run a shell command line in the page's container; returns exit code + merged output. */
+const sh = (page: Page, line: string) =>
+  page.evaluate(async (line) => {
+    const p = await (window as unknown as Win).container.spawn('jsh', ['-c', line])
+    let out = ''
+    const piped = p.output.pipeTo(new WritableStream({ write: (d) => void (out += d) }))
+    const code = await p.exit
+    await piped.catch(() => {})
+    return { code, out }
+  }, line)
+
+/** What project code can see of the studio's storage (module: `module.exports = probe`). */
+const PROBE = `module.exports = async function probe() {
+  const keepAlive = setInterval(() => {}, 1000) // IndexedDB requests don't hold a node process open
+  const idb = await new Promise((resolve) => {
+    const req = indexedDB.open('studio')
+    req.onerror = () => resolve({ error: String(req.error) })
+    req.onsuccess = () => {
+      const db = req.result
+      const stores = [...db.objectStoreNames]
+      if (!stores.includes('files')) return db.close(), resolve({ stores })
+      const get = db.transaction('files').objectStore('files').get('.env.cresslet')
+      get.onsuccess = () => (db.close(), resolve({ stores, env: get.result }))
+    }
+  })
+  const cache = (await caches.has('studio-cache')) ? await (await (await caches.open('studio-cache')).match(origin + '/secret'))?.text() : null
+  clearInterval(keepAlive)
+  return { origin: globalThis.origin, isolated: crossOriginIsolated, idb, cache }
+}
+`
+
+const NODE_SCRIPT = `const fs = require('fs')
+const probe = require('./probe')
+fs.writeFileSync('/tmp/big.bin', Buffer.alloc(6 * 1024 * 1024, 7)) // bigger than the default sync buffer
+const big = fs.readFileSync('/tmp/big.bin')
+probe().then((r) => console.log(JSON.stringify({ ...r, sync: fs.readFileSync('probe.js', 'utf8').length > 0, big: big.length, last: big[big.length - 1] })))
+`
+
+const lastJson = (out: string) => {
+  try {
+    return JSON.parse(out.trim().split('\n').pop()!)
+  } catch {
+    throw new Error(`no JSON in: ${out}`)
+  }
+}
+
+test('without previewOrigin, node can read the host IndexedDB and Cache Storage (the gap this closes)', async ({ browser }) => {
+  const page = await (await browser.newContext()).newPage()
+  await bootBlank(page)
+  await write(page, 'probe.js', PROBE)
+  await write(page, 'main.js', NODE_SCRIPT)
+  const r = await sh(page, 'node main.js')
+  expect(r.code, r.out).toBe(0)
+  expect(lastJson(r.out)).toMatchObject({ origin: HOST, idb: { stores: ['files'], env: 'API_KEY=host-secret' }, cache: 'host-secret' })
+})
+
+test.describe.serial('node on the preview origin', () => {
+  let page: Page
+  let origin: string
+
+  test.beforeAll(async ({ browser, browserName }) => {
+    origin = drivable(browserName)
+    page = await (await browser.newContext()).newPage()
+    await bootBlank(page, origin)
+    await write(page, 'probe.js', PROBE)
+  })
+
+  test("a node script runs on the preview origin, with sync fs, and can't read the host's storage", async () => {
+    await write(page, 'main.js', NODE_SCRIPT)
+    const r = await sh(page, 'node main.js')
+    expect(r.code, r.out).toBe(0)
+    expect(lastJson(r.out)).toEqual({ origin, isolated: true, idb: { stores: [] }, cache: null, sync: true, big: 6 * 1024 * 1024, last: 7 })
+    // the host still has it
+    expect(await page.evaluate(async () => (await (await caches.match('/secret'))?.text()) ?? null)).toBe('host-secret')
+  })
+
+  test('node -e, TypeScript, stdin and exit codes work through the relay', async () => {
+    expect(await sh(page, `node -e "console.log(require('path').join('a', 'b'), origin)"`)).toEqual({ code: 0, out: `a/b ${origin}\n` })
+    await write(page, 'add.ts', 'const add = (a: number, b: number): number => a + b\nconsole.log(add(2, 3))\nprocess.exit(3)\n')
+    expect(await sh(page, 'node add.ts')).toEqual({ code: 3, out: '5\n' })
+    await write(page, 'up.js', "process.stdin.on('data', (d) => process.stdout.write(String(d).toUpperCase()))\n")
+    expect(await sh(page, 'echo hello | node up.js')).toEqual({ code: 0, out: 'HELLO\n' })
+  })
+
+  test('a node http server answers preview requests, from the preview origin', async () => {
+    await write(
+      page,
+      'server.js',
+      `const http = require('http')\nconst probe = require('./probe')\nhttp.createServer(async (req, res) => {\n  res.setHeader('content-type', 'text/html')\n  res.end('<pre id=out>' + JSON.stringify({ url: req.url, server: await probe() }) + '</pre>')\n}).listen(3000)\n`,
+    )
+    const url = await page.evaluate(
+      () =>
+        new Promise<string>((resolve) => {
+          const c = (window as unknown as Win).container
+          const off = c.on('server-ready', (port, url) => port === 3000 && (off(), resolve(url)))
+          void c.spawn('node', ['server.js'])
+        }),
+    )
+    expect(url.startsWith(`${origin}/__cresslet__/`)).toBe(true)
+    await page.evaluate((src) => {
+      const f = document.createElement('iframe')
+      f.name = 'srv'
+      f.src = src
+      document.body.append(f)
+    }, `${url}api/hello?x=1`)
+    const text = () => page.frame({ name: 'srv' })?.evaluate(() => document.getElementById('out')?.textContent ?? '').catch(() => '') ?? ''
+    await expect.poll(text, { timeout: 30_000 }).not.toBe('')
+    expect(JSON.parse(await text())).toEqual({ url: '/api/hello?x=1', server: { origin, isolated: true, idb: { stores: [] }, cache: null } })
+  })
+
+  test('reloading the relay ends the node processes it ran', async () => {
+    await write(page, 'forever.js', 'setInterval(() => {}, 1000)\n')
+    const exited = await page.evaluate(async () => {
+      const p = await (window as unknown as Win).container.spawn('node', ['forever.js'])
+      let out = ''
+      void p.output.pipeTo(new WritableStream({ write: (d) => void (out += d) }))
+      await new Promise((r) => setTimeout(r, 500))
+      const relay = document.querySelector<HTMLIFrameElement>('iframe[title="cresslet preview relay"]')!
+      relay.src = relay.src
+      const code = await Promise.race([p.exit, new Promise((r) => setTimeout(() => r('still running'), 20_000))])
+      return { code, out }
+    })
+    expect(exited).toEqual({ code: 1, out: 'node: worker error: preview relay restarted\n' })
+    // and new ones run in the reconnected relay
+    expect(await sh(page, 'node -e "console.log(origin)"')).toEqual({ code: 0, out: `${origin}\n` })
+  })
+})
+
+test('the CSS worker (Tailwind v4) runs on the preview origin and the preview gets its styles', async ({ browser, browserName }) => {
+  const origin = drivable(browserName)
+  const page = await (await browser.newContext()).newPage()
+  await bootBlank(page, origin)
+  const files: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'tw', private: true, type: 'module', dependencies: { react: '^19.1.0', 'react-dom': '^19.1.0' }, devDependencies: { tailwindcss: '^4.1.0' } }),
+    'index.html': '<!doctype html>\n<html><head><meta charset="utf-8" /></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>\n',
+    'src/main.tsx': "import { createRoot } from 'react-dom/client'\nimport './index.css'\n\ncreateRoot(document.getElementById('root')!).render(<h1 className=\"text-brand\">Tailwind</h1>)\n",
+    'src/index.css': '@import "tailwindcss";\n\n@theme {\n  --color-brand: rgb(10, 120, 30);\n}\n',
+  }
+  for (const [p, s] of Object.entries(files)) await write(page, p, s)
+  const r = await sh(page, 'npm install')
+  expect(r.code, r.out).toBe(0)
+  await page.evaluate(async () => {
+    const server = await (window as unknown as Win).container.createDevServer()
+    const f = document.createElement('iframe')
+    f.id = 'frame'
+    f.src = server.url
+    document.body.append(f)
+  })
+  await expect(page.frameLocator('#frame').getByRole('heading', { name: 'Tailwind' })).toHaveCSS('color', 'rgb(10, 120, 30)')
+})
+
+for (const mode of ['previewOrigin', 'same origin'] as const)
+  test(`a project worker (Container.projectWorker) runs on the ${mode === 'previewOrigin' ? 'preview origin' : "page's origin without previewOrigin"}`, async ({ browser }) => {
+    const page = await (await browser.newContext()).newPage()
+    await bootBlank(page, mode === 'previewOrigin' ? CROSS_SITE : undefined)
+    const got = await page.evaluate(async () => {
+      const w = await (window as unknown as Win).container.projectWorker('/e2e/fixtures/project-worker.js', { name: 'server' })
+      const reply = await new Promise((resolve, reject) => {
+        w.onmessage = (e) => resolve(e.data)
+        w.onerror = (e) => reject(new Error(e.message))
+        const body = new Uint8Array(1000).buffer
+        w.postMessage({ code: 'export default (n) => n * 2', n: 21, body }, [body])
+      })
+      const error = await new Promise<string>((resolve) => {
+        w.onerror = (e) => resolve(e.message)
+        w.postMessage({ type: 'throw' })
+      })
+      w.terminate()
+      return { reply, error }
+    })
+    expect(got.reply).toEqual(
+      mode === 'previewOrigin'
+        ? { origin: CROSS_SITE, answer: 42, bytes: 1000, stores: [], studioCache: false }
+        : { origin: HOST, answer: 42, bytes: 1000, stores: ['files'], studioCache: true },
+    )
+    expect(got.error).toContain('boom from the worker')
+  })

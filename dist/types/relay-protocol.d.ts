@@ -4,6 +4,9 @@ export declare const RELAY_READY = "cresslet-relay-ready";
 export declare const RELAY_ERROR = "cresslet-relay-error";
 export declare const BROADCAST = "cresslet-broadcast";
 export declare const BROADCAST_CLOSE = "cresslet-broadcast-close";
+export declare const WORKER_SCRIPT = "cresslet-worker-script";
+export declare const PROC_SPAWN = "cresslet-proc-spawn";
+export declare const WORKER_SPAWN = "cresslet-worker-spawn";
 /** SW -> owning page messages the relay forwards. */
 export declare const SW_TO_PAGE: Set<string>;
 /** Host -> SW messages the relay forwards. */
@@ -41,6 +44,19 @@ export declare function isPageToSw(d: unknown): d is {
 };
 /** Relay side: a SW -> page message worth forwarding (always carries exactly one reply port). */
 export declare function isSwToPage(d: unknown, ports: readonly unknown[]): boolean;
+/** Relay side: the node worker script to run processes with. */
+export declare function isWorkerScript(d: unknown): d is {
+    type: string;
+    source: string;
+};
+/** Relay side: start a process, talking to the host over the one transferred port. */
+export declare function isProcSpawn(d: unknown, ports: readonly unknown[]): boolean;
+/** Relay side: start a project worker from `source`, talking to the host over the one transferred port. */
+export declare function isWorkerSpawn(d: unknown, ports: readonly unknown[]): d is {
+    type: string;
+    source: string;
+    name?: string;
+};
 export declare function isChannelName(s: unknown): s is string;
 /** Shown with relay setup errors: cross-site preview origins need third-party service workers/storage. */
 export declare const THIRD_PARTY_HINT = "if the preview origin is cross-site, this browser may block third-party service workers/storage";

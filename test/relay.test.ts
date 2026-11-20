@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Container } from '../src/container'
 import { PortTable } from '../src/ports'
-import { acceptHello, acceptInit, isChannelName, isPageToSw, isSwToPage, newestWorker, relayErrorText, relayUrl, toOrigin } from '../src/relay-protocol'
+import { acceptHello, acceptInit, isChannelName, isPageToSw, isProcSpawn, isSwToPage, isWorkerScript, newestWorker, relayErrorText, relayUrl, toOrigin } from '../src/relay-protocol'
+import { decodeResult, encodeResult, HEADER, STATE_DONE, STATE_GROW, SyncReplier } from '../src/node/protocol'
+import { relayChannel } from '../src/node/channel'
 
 const HOST = 'https://studio.example.com'
 const parent = { name: 'parent' }
@@ -76,6 +78,56 @@ describe('relay: forwarded messages', () => {
     expect(isChannelName('other')).toBe(false)
     expect(isChannelName('cresslet:abc:5173:x')).toBe(false)
     expect(isChannelName(42)).toBe(false)
+  })
+})
+
+describe('relay: node processes', () => {
+  it('spawns only with exactly one port, and takes only a string worker script', () => {
+    expect(isProcSpawn({ type: 'cresslet-proc-spawn' }, [port])).toBe(true)
+    expect(isProcSpawn({ type: 'cresslet-proc-spawn' }, [])).toBe(false)
+    expect(isProcSpawn({ type: 'cresslet-proc-spawn' }, [port, port])).toBe(false)
+    expect(isProcSpawn({ type: 'cresslet-register' }, [port])).toBe(false)
+    expect(isWorkerScript({ type: 'cresslet-worker-script', source: 'x' })).toBe(true)
+    expect(isWorkerScript({ type: 'cresslet-worker-script', source: 1 })).toBe(false)
+    expect(isWorkerScript(null)).toBe(false)
+  })
+
+  it('SyncReplier writes small results in place and grows for big ones', () => {
+    const r = new SyncReplier(new SharedArrayBuffer(HEADER + 16))
+    const state = () => Atomics.load(new Int32Array(r.sab, 0, 2), 0)
+    const read = () => decodeResult(new Uint8Array(r.sab, HEADER, Atomics.load(new Int32Array(r.sab, 0, 2), 1)).slice())
+    r.write(encodeResult(true, 'hi'))
+    expect(state()).toBe(STATE_DONE)
+    expect(read()).toBe('hi')
+    const big = encodeResult(true, 'x'.repeat(100))
+    r.write(big)
+    expect(state()).toBe(STATE_GROW)
+    expect(Atomics.load(new Int32Array(r.sab, 0, 2), 1)).toBe(big.byteLength)
+    r.grow(new SharedArrayBuffer(HEADER + big.byteLength))
+    expect(state()).toBe(STATE_DONE)
+    expect(read()).toBe('x'.repeat(100))
+  })
+
+  it('relayChannel ignores junk and sync-grow from the relay, and closes once', async () => {
+    const { port1, port2 } = new MessageChannel()
+    const onClose = vi.fn()
+    const ch = relayChannel(port1, onClose)
+    const got: unknown[] = []
+    ch.onmessage = (m) => got.push(m)
+    ch.onerror = (m) => got.push(`error: ${m}`)
+    for (const m of [null, 1, { type: 2 }, { type: 'sync-grow', sab: null }, { type: 'stdout', data: 'ok' }, { type: 'worker-error', message: 'boom' }]) port2.postMessage(m)
+    await new Promise((r) => setTimeout(r, 20))
+    expect(got).toEqual([{ type: 'stdout', data: 'ok' }, 'error: boom'])
+    const sent: unknown[] = []
+    port2.onmessage = (e) => sent.push(e.data)
+    ch.reply(encodeResult(true, 1))
+    ch.terminate()
+    ch.terminate()
+    ch.post({ type: 'stdin-end' })
+    await new Promise((r) => setTimeout(r, 20))
+    expect(sent.map((m) => (m as { type: string }).type)).toEqual(['sync-result', 'terminate'])
+    expect(onClose).toHaveBeenCalledTimes(1)
+    port2.close()
   })
 })
 
@@ -243,6 +295,31 @@ describe('Container.boot({ previewOrigin })', () => {
     expect(got).toEqual([{ type: 'cresslet-register', instanceId: c.instanceId }])
     c.teardown()
     relayPort.close()
+  })
+
+  it('runs node workers in the relay: cross-origin-isolated frame, worker script sent once per connection', async () => {
+    let relayPort!: MessagePort
+    const got: { type: string; source?: string }[] = []
+    const spawned: MessagePort[] = []
+    const page = fakePage((port) => {
+      relayPort = port
+      port.onmessage = (e) => (got.push(e.data), e.ports[0] && spawned.push(e.ports[0]))
+      port.postMessage({ type: 'cresslet-relay-ready' })
+    })
+    vi.stubGlobal('fetch', async () => new Response('/* node worker */'))
+    const c = await Container.boot({ previewOrigin: PREVIEW, npmCache: false })
+    expect((page.frame as { allow?: string }).allow).toBe('cross-origin-isolated')
+    const a = await c.nodeChannel()
+    const b = await c.nodeChannel()
+    await new Promise((r) => setTimeout(r, 20))
+    expect(got.map((m) => m.type)).toEqual(['cresslet-register', 'cresslet-worker-script', 'cresslet-proc-spawn', 'cresslet-proc-spawn'])
+    expect(got[1].source).toBe('/* node worker */')
+    expect(spawned).toHaveLength(2)
+    a.terminate()
+    b.terminate()
+    c.teardown()
+    relayPort.close()
+    spawned.forEach((p) => p.close())
   })
 
   it('answers malformed (or misaddressed) requests from the relay with a 400 and closes the reply port', async () => {
