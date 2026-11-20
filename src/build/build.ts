@@ -85,7 +85,12 @@ export async function build(c: Container, o: BuildOptions = {}): Promise<{ files
       // Sass/Less are compiled to CSS by transformCss (the pipeline), then bundled as CSS
       loader: { '.scss': 'css', '.sass': 'css', '.less': 'css', '.module.css': 'local-css', '.module.scss': 'local-css', '.module.sass': 'local-css', '.module.less': 'local-css' },
       plugins: [pathsPlugin(c, cfg)],
-      vfsPlugin: { resolve: PROD_RESOLVE, transformCss: async (p, text) => (await css.process(p, text)).css },
+      vfsPlugin: {
+        resolve: PROD_RESOLVE,
+        transformCss: async (p, text) => (await css.process(p, text)).css,
+        // `url(/icon.svg#x)` in a stylesheet, for a file in public/ (copied to the output root): left as written
+        external: (spec, _importer, kind) => (kind === 'url-token' && spec.startsWith('/') && vfs.isFile(join(root, 'public', spec.replace(/[?#].*$/s, ''))) ? spec : undefined),
+      },
     })
   } catch (e) {
     throw new Error(`build failed:\n${formatErrors(e)}`)

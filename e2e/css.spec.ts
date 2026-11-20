@@ -185,7 +185,8 @@ test.describe.serial('Sass and Less', () => {
       'src/main.js': "import './main.scss'\nimport './extra.sass'\nimport styles from './card.module.scss'\n\ndocument.getElementById('mod').className = styles.card\n",
       'src/main.scss': "@use 'styles/vars' as v;\n\n.box {\n  color: v.$brand;\n  &:hover { color: black; }\n}\n",
       'src/styles/_vars.scss': '$brand: rgb(10, 120, 30);\n',
-      'src/extra.sass': '.box\n  text-decoration: underline\n',
+      'src/extra.sass': '.box\n  text-decoration: underline\n  cursor: url("/icons.svg#i"), auto\n',
+      'public/icons.svg': '<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"/>\n',
       'src/card.module.scss': '$w: 700;\n.card { font-weight: $w; }\n',
       'src/style.less': "@import 'styles/size';\n@import 'styles/bg';\n.box { padding: @pad; }\n",
       'src/styles/size.less': '@pad: 16px;\n',
@@ -266,6 +267,7 @@ test.describe.serial('Sass and Less', () => {
     expect(out.css).toContain('text-decoration:underline')
     expect(out.css).toContain('letter-spacing:2px')
     expect(out.css).toContain('word-spacing:3px') // the Less file's plain-CSS import
+    expect(out.css).toMatch(/cursor:url\("?\/icons\.svg#i"?\),auto/) // a public/ file: as written (copied to dist/)
     expect(out.css).toMatch(/background-image:url\("?\/assets\/dot-[\w-]+\.svg"?\)/)
     expect(out.css).toContain('#mod{text-transform:uppercase}')
     expect(out.css).toMatch(/#mod\{outline:2px solid rgb\(7,8,9\);background-image:url\("?\/assets\/k-[\w-]+\.svg"?\)\}/) // the package's .scss, through PostCSS

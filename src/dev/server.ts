@@ -481,7 +481,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
             }
             if (!target) {
               const pub = join(root, 'public', clean)
-              if (clean.startsWith('/') && vfs.isFile(pub)) return { path: clean, external: true }
+              if (clean.startsWith('/') && vfs.isFile(pub)) return { path: a.path, external: true } // keeps `?query` / `#fragment`
               return { path: a.path, external: true }
             }
             if (a.kind === 'import-rule') return cssDeps.add(target), { path: target, namespace: 'cresslet-entry' }
@@ -611,6 +611,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
         if (STYLE_RE.test(spec)) {
           const file = resolveModule(fs, spec, root, { ...BROWSER_OPTS, conditions: ['style', ...BROWSER_OPTS.conditions] })
           if (!file) return new Response('', { headers: JS })
+          if (has('raw')) return new Response(`export default ${JSON.stringify(vfs.readText(file))}`, { headers: JS })
           return new Response(has('import') ? await cssModule(file, true) : await cssModule(file, false, true), { headers: has('import') ? JS : { 'content-type': 'text/css', ...NO_CACHE } })
         }
         const r = await deps.get(spec)

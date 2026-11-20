@@ -468,7 +468,7 @@ describe('dev server CSS processing', () => {
         }
         // as Less rewrites an imported file's url(): relative to the entry, without ./
         // and its plain-CSS imports: `@import "./parts/reset.css"` from an imported file comes out as `parts/reset.css`
-        if (r.file.endsWith('.less') && !r.file.includes('module')) return { css: '@import "parts/reset.css";\n.l { background: url("img/dot.svg"); mask: url("img/dot.svg#m") }', deps: [], dirs: [], warnings: [], tailwind: [] }
+        if (r.file.endsWith('.less') && !r.file.includes('module')) return { css: '@import "parts/reset.css";\n.l { background: url("img/dot.svg"); mask: url("img/dot.svg#m"); cursor: url("/icons.svg#i"), auto }', deps: [], dirs: [], warnings: [], tailwind: [] }
         return { css: `.${r.file.split('/').pop()!.replace(/\W/g, '_')} { x: 1 }`, deps: [], dirs: [], warnings: [], tailwind: [] }
       },
     }
@@ -485,6 +485,7 @@ describe('dev server CSS processing', () => {
         'src/c.less': '@import "nested/x";',
         'src/img/dot.svg': '<svg xmlns="http://www.w3.org/2000/svg"/>',
         'src/parts/reset.css': '.reset { r: 1 }',
+        'public/icons.svg': '<svg xmlns="http://www.w3.org/2000/svg"/>',
       },
       { css: backend },
     )
@@ -498,6 +499,8 @@ describe('dev server CSS processing', () => {
     expect(less).toContain('url(/src/img/dot.svg)') // url(img/dot.svg): relative first
     expect(less).toContain('.reset {') // @import "parts/reset.css": relative first, inlined
     expect(less).toContain('url(/src/img/dot.svg#m)') // its fragment kept
+    expect(less).toContain('url(/icons.svg#i)') // a public/ file: as written
+    expect(await s.get('/@modules/kit/kit.scss?raw&import')).toBe('export default ".k {}"') // ?raw: the source
     const linked = await s.res('/src/style.sass')
     expect(linked.type).toContain('text/css')
     expect(linked.text).toContain('.style_sass')

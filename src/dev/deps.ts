@@ -261,7 +261,7 @@ export async function scanImports(vfs: VFS, root: string, entries: string[], opt
         if (/^(https?:|data:|\/\/|\/@)/.test(a.path)) return { path: a.path, external: true }
         const local = opts.resolveLocal(a.path, a.importer)
         if (local === null) {
-          if (!/\.(css|scss|sass|less)$/.test(a.path)) found.add(a.path.split('?')[0])
+          if (!/\.(css|scss|sass|less)$/.test(a.path.split('?')[0])) found.add(a.path.split('?')[0])
           return { path: a.path, external: true }
         }
         if (!/\.(m?[jt]sx?|cjs|cts|mts)$/.test(local)) return { path: local, external: true }

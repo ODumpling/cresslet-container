@@ -173,7 +173,7 @@ pnpm demo        # http://localhost:4400 (+ preview origin http://127.0.0.1:4401
 
 ## Roadmap
 
-VFS persistence (IndexedDB/OPFS snapshots; the npm cache already persists), `import.meta.hot` API + non-React HMR, lockfile-driven installs + workspaces, Sass/Less, real Node via WASM for big CLIs, per-preview origins.
+VFS persistence (IndexedDB/OPFS snapshots; the npm cache already persists), `import.meta.hot` API + non-React HMR, lockfile-driven installs + workspaces, real Node via WASM for big CLIs, per-preview origins.
 
 ## License
 
