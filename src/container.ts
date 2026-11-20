@@ -16,6 +16,7 @@ import { basename, dirname, join, normalize, resolve } from './path'
 import { acceptHello, BROADCAST, BROADCAST_CLOSE, newestWorker, PROC_SPAWN, WORKER_SPAWN, RELAY_ERROR, RELAY_INIT, RELAY_READY, relayErrorText, relayUrl, THIRD_PARTY_HINT, toOrigin, WORKER_SCRIPT } from './relay-protocol'
 import { localChannel, relayChannel, relayWorker, type NodeChannel, type ProjectWorker } from './node/channel'
 import { DEFAULT_BROTLI_WASM_URL } from './node/brotli'
+import { clearSnapshot, persistKey, VfsPersistence, type PersistOptions, type Persistence } from './persist'
 
 const VIRTUAL_BIN_DIRS = new Set(['/usr/local/bin', '/usr/bin', '/bin'])
 
@@ -53,6 +54,12 @@ export interface BootOptions {
    * Tailwind v4, Sass and Less themselves still compile (the installed packages' own code still runs).
    */
   cssPlugins?: boolean
+  /**
+   * Persist the workdir across reloads: snapshots (without `node_modules`, which `npm install` restores from the npm
+   * cache) go to OPFS, else IndexedDB, and `boot` restores the latest one before it resolves (see `c.persistence`).
+   * Default off. `true` uses key 'default'; give each project its own `key`.
+   */
+  persist?: boolean | PersistOptions
 }
 
 export interface ContainerEvents {
@@ -113,6 +120,9 @@ export class Container {
   readonly previewOrigin: string | null
   /** Whether CSS processing runs project code (`boot({ cssPlugins })`). */
   readonly cssPlugins: boolean
+  /** Workdir snapshots (`boot({ persist })`), else null. */
+  readonly persistence: Persistence | null
+  private persist: VfsPersistence | null = null
   private relayPort: MessagePort | null = null
   /** Whether the relay connected at boot (previews, and `node`, run on the preview origin). */
   private relayBooted = false
@@ -159,11 +169,17 @@ export class Container {
     })
     this.cleanups.push(() => w.close())
     this.fs = this.makeFs()
+    if (opts.persist) {
+      const p = (this.persist = new VfsPersistence(vfs, this.workdir, opts.persist === true ? {} : opts.persist, (message) => this.emit('error', { message })))
+      this.cleanups.push(() => p.close())
+    }
+    this.persistence = this.persist
   }
 
   /** Boot a container. Registers the preview service worker (unless disabled). */
   static async boot(opts: BootOptions = {}): Promise<Container> {
     const c = new Container(opts)
+    await c.persist?.start()
     if (opts.serviceWorkerUrl === false) return c
     if (!c.previewOrigin) await c.connectServiceWorker(opts.serviceWorkerUrl ?? '/cresslet-sw.js')
     else
@@ -172,6 +188,11 @@ export class Container {
         throw e
       })
     return c
+  }
+
+  /** Delete a persisted workdir snapshot (`boot({ persist: { key } })`) without booting a container. */
+  static clearPersisted(key?: string): Promise<void> {
+    return clearSnapshot(persistKey(key))
   }
 
   // ---------------- events ----------------
@@ -601,4 +622,5 @@ async function fetchSource(href: string): Promise<string> {
   return r.text()
 }
 
+export type { PersistOptions, Persistence }
 export type { FileSystemTree, ContainerProcess, SpawnOptions, Command, CommandContext, DevServerOptions, DevServerHandle, BuildOptions, Dirent, Stats }

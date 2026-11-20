@@ -16,6 +16,8 @@ export type {
   Dirent,
   Stats,
   PreviewChannel,
+  PersistOptions,
+  Persistence,
 } from './container'
 export type { PortHandler } from './ports'
 export type { ProjectWorker } from './node/channel'

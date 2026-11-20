@@ -9,6 +9,7 @@ import { type DevServerHandle, type DevServerOptions } from './dev/server';
 import { type BuildOptions } from './build/build';
 import { type CssBackend } from './css/pipeline';
 import { type NodeChannel, type ProjectWorker } from './node/channel';
+import { type PersistOptions, type Persistence } from './persist';
 export interface BootOptions {
     /** Service worker URL served by the host at its origin root. Default '/cresslet-sw.js'. `false` disables previews. */
     serviceWorkerUrl?: string | false;
@@ -45,6 +46,12 @@ export interface BootOptions {
      * Tailwind v4, Sass and Less themselves still compile (the installed packages' own code still runs).
      */
     cssPlugins?: boolean;
+    /**
+     * Persist the workdir across reloads: snapshots (without `node_modules`, which `npm install` restores from the npm
+     * cache) go to OPFS, else IndexedDB, and `boot` restores the latest one before it resolves (see `c.persistence`).
+     * Default off. `true` uses key 'default'; give each project its own `key`.
+     */
+    persist?: boolean | PersistOptions;
 }
 export interface ContainerEvents {
     'server-ready': (port: number, url: string) => void;
@@ -115,6 +122,9 @@ export declare class Container {
     readonly previewOrigin: string | null;
     /** Whether CSS processing runs project code (`boot({ cssPlugins })`). */
     readonly cssPlugins: boolean;
+    /** Workdir snapshots (`boot({ persist })`), else null. */
+    readonly persistence: Persistence | null;
+    private persist;
     private relayPort;
     /** Whether the relay connected at boot (previews, and `node`, run on the preview origin). */
     private relayBooted;
@@ -132,6 +142,8 @@ export declare class Container {
     private constructor();
     /** Boot a container. Registers the preview service worker (unless disabled). */
     static boot(opts?: BootOptions): Promise<Container>;
+    /** Delete a persisted workdir snapshot (`boot({ persist: { key } })`) without booting a container. */
+    static clearPersisted(key?: string): Promise<void>;
     on<E extends keyof ContainerEvents>(event: E, fn: ContainerEvents[E]): () => void;
     private emit;
     /** Resolve a path against the workdir. */
@@ -207,4 +219,5 @@ export declare class Container {
     private connectServiceWorker;
     teardown(): void;
 }
+export type { PersistOptions, Persistence };
 export type { FileSystemTree, ContainerProcess, SpawnOptions, Command, CommandContext, DevServerOptions, DevServerHandle, BuildOptions, Dirent, Stats };
