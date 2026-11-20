@@ -52,7 +52,7 @@ await c.bundle(esbuildOptions)                   // { outputFiles: [{ path, text
 c.teardown()
 ```
 
-Extras (not in the original contract): `c.vfs` (sync FS), `c.ports`, `c.exec`, `c.which`, `c.path`, `boot({ serviceWorkerUrl: false })`, `boot({ npmCache: false })` (no persistent npm cache), `boot({ npmCache: { maxBytes } })` (npm cache size cap), `spawn(..., { terminal: true })` (CRLF output), `c.previewOrigin` (separate preview origin or `null`), `c.previewChannel(name)` (what the dev server notifies previews through), `c.cssWorker()` (the [CSS worker](#css-postcss--tailwind) dev servers and builds share), `boot({ cssPlugins: false })` (stylesheet processing loads no project plugins or configs, see [CSS](#css-postcss--tailwind)), `await c.projectWorker(url, { name? })` (a module Web Worker for project code, e.g. an app's server handler: on the [preview origin](#separate-preview-origin) when there is one, else `new Worker(url, { type: 'module' })`).
+Extras (not in the original contract): `c.vfs` (sync FS), `c.ports`, `c.exec`, `c.which`, `c.path`, `boot({ serviceWorkerUrl: false })`, `boot({ npmCache: false })` (no persistent npm cache), `boot({ npmCache: { maxBytes } })` (npm cache size cap), `spawn(..., { terminal: true })` (CRLF output), `c.previewOrigin` (separate preview origin or `null`), `c.previewChannel(name)` (what the dev server notifies previews through), `c.cssWorker()` (the [CSS worker](#css-postcss--tailwind) dev servers and builds share), `boot({ cssPlugins: false })` (stylesheet processing loads no project plugins or configs, see [CSS](#css-postcss--tailwind)), `await c.projectWorker(url, { name? })` (a module Web Worker for project code, e.g. an app's server handler: on the [preview origin](#separate-preview-origin) when there is one, else `new Worker(url, { type: 'module' })`), `c.upgradeWebSocket(req, { protocol? })` (accept a preview's WebSocket, see [WebSockets](#websockets)).
 
 Notes:
 - Relative paths resolve against `workdir`.
@@ -83,6 +83,25 @@ await Container.clearPersisted(projectId) // delete a snapshot without booting (
 Preview URL: `${origin}/__cresslet__/<instanceId>/<port>/`. The SW forwards requests to the owning page (MessageChannel, streamed bodies) and adds `COEP: require-corp` + `CORP: same-origin`.
 
 Root-relative paths keep working: the SW injects a one-line script into preview HTML that `history.replaceState`s the prefix away (apps and routers see `/`), and attributes later requests to the preview by the document's client id (persisted in Cache Storage across SW restarts). Full navigations inside a preview (links, reloads) are matched by the frame's current URL; live reload navigates through the prefixed URL so it works in every browser.
+
+### WebSockets
+
+Service workers can't see WebSocket connections, so the SW also injects a small `WebSocket` replacement into preview HTML: a socket to the preview's own host (`ws:`/`wss:`, any path, absolute or relative) goes to the container through the SW (and the relay with a `previewOrigin`). Sockets to other hosts use the browser's `WebSocket`.
+
+It reaches the port's handler (dev server `middleware` included) as a `GET` with `Upgrade: websocket`, `Connection`, `Sec-WebSocket-Version`, `Origin` and the offered `Sec-WebSocket-Protocol` in `req.headers` (`Request` drops those, so `req.headers` is replaced on that request; copy them as pairs, e.g. `[...req.headers]`, to forward them). To accept it, call `c.upgradeWebSocket(req)` on that same `req` object (not a clone) and return its `response`; anything else the handler returns (or throws) refuses it, and the preview gets `error` and `close` (1006) as from a failed connection. `{ protocol }` selects one of the offered subprotocols; as in browsers, a socket that offers some fails unless one is selected. Only the offered subprotocols come from the preview: the container makes the other headers itself (`Origin` is the preview origin).
+
+```js
+c.createDevServer({
+  middleware(req) {
+    if (req.headers.get('upgrade') !== 'websocket') return
+    const { socket, response } = c.upgradeWebSocket(req)
+    projectWorker.postMessage({ type: 'socket', url: req.url }, [socket]) // e.g. to the app's server (WebSocketPair)
+    return response
+  },
+})
+```
+
+`socket` is a `MessagePort`, the server end of the preview's socket: messages are `{ type: 'message', data: string | ArrayBuffer }` and `{ type: 'close', code?, reason? }`, both ways (whoever sends `close` is done with the port; whoever gets it closes the port). It can be transferred (to a project worker, through the relay): data then flows between the preview and that worker directly, not through this page. Messages sent before the preview has it are queued. They come straight from the preview (untrusted, like its requests): check `type` and `data` before using them. When the preview's page goes away (reload, navigation, live reload) its open sockets send `close` with 1001, as browsers do. If the handler refuses after all, or the preview gives up first (it waits 30 s, like a request; closed or navigated away), the preview sends `close` on its end: whoever has `socket` by then gets it. Once the preview has given up, `upgradeWebSocket` throws: tell whatever already accepted the socket (e.g. the app's `WebSocketPair` end in a worker). Firefox can lose that `close` if the page navigates away during the handover (after `upgradeWebSocket`, before whoever holds `socket` starts listening on it). Neither end notices the other going away without a `close` (a crashed preview, a terminated worker, a reloaded relay): send `close` on `socket` before stopping its worker, so clients can reconnect. Only window `WebSocket`s are routed (not ones opened in a preview's workers); `bufferedAmount` is always 0 and no extensions are negotiated. `node` http servers don't get `upgrade` events (no `net` sockets), so they refuse them.
 
 ### Separate preview origin
 

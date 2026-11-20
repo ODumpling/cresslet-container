@@ -1,6 +1,6 @@
 import { VFS, type Dirent, type Stats } from './vfs';
 import { type FileSystemTree } from './tree';
-import { PortTable, type PortHandler } from './ports';
+import { PortTable, type PortHandler, type WebSocketUpgrade } from './ports';
 import { type Command, type CommandContext, type ContainerProcess, type SpawnOptions } from './process';
 import { type Registry } from './npm/registry';
 import { type ResolveFs } from './resolve';
@@ -169,6 +169,15 @@ export declare class Container {
         url: string;
         close(): void;
     };
+    /**
+     * Accept a WebSocket a preview opened to its own host (`new WebSocket(...)` there is routed to this container's port
+     * handlers, dev server `middleware` included, as a GET with `Upgrade: websocket`). Call it on the request the handler
+     * got and return `response` from the handler; any other response refuses the socket. `protocol` must be one the
+     * preview offered (`Sec-WebSocket-Protocol`). Throws for any other request. See `WebSocketUpgrade.socket` for the port.
+     */
+    upgradeWebSocket(req: Request, opts?: {
+        protocol?: string;
+    }): WebSocketUpgrade;
     createDevServer(opts?: DevServerOptions): Promise<DevServerHandle>;
     build(opts?: BuildOptions): Promise<{
         files: string[];

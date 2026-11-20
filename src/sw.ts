@@ -3,6 +3,7 @@
 // mapped back to their preview via the requesting client id (remembered per document, persisted in Cache
 // Storage so SW restarts keep working), falling back to the Referer.
 /// <reference lib="webworker" />
+import { websocketHeaders } from './ports'
 import { injectStrip, isolate, isRelayClient, isReserved, PREFIX, receiveResponse, XORIGIN_HEADERS } from './sw-lib'
 declare const self: ServiceWorkerGlobalScope
 
@@ -86,6 +87,12 @@ self.addEventListener('message', (e) => {
   const d = e.data
   const src = e.source && 'id' in e.source ? (e.source as Client) : null
   if (d?.type === 'cresslet-ping') e.ports[0]?.postMessage({ type: 'cresslet-pong' })
+  if (d?.type === 'cresslet-ws') {
+    if (src && e.ports.length === 2) return void (e as ExtendableMessageEvent).waitUntil(openSocket(src, d, e.ports[0], e.ports[1]))
+    e.ports[0]?.postMessage({ type: 'refused' }) // malformed: fail now rather than at the preview's deadline
+    for (const p of e.ports) p.close()
+    return
+  }
   if (!src || typeof d?.instanceId !== 'string' || !ownerCandidate(src)) return
   if (d.type === 'cresslet-register') owners.set(d.instanceId, src.id)
   else if (d.type === 'cresslet-unregister' && (!XORIGIN || owners.get(d.instanceId) === src.id)) owners.delete(d.instanceId)
@@ -212,4 +219,31 @@ async function forward(req: Request, t: Target, path: string): Promise<Response>
   req.headers.forEach((v, k) => headers.push([k, v]))
   client.postMessage({ type: 'cresslet-request', instanceId: t.instanceId, port: t.port, path, method: req.method, headers, body }, body ? [ch.port2, body] : [ch.port2])
   return receiveResponse(ch.port1, { method: req.method, headers: (raw) => isolate(raw, { xorigin: XORIGIN, prefix: prefixOf(t) }), errorHeaders: XORIGIN ? XORIGIN_HEADERS : {} })
+}
+
+/**
+ * A preview's `new WebSocket()` to its own host (preview-ws.js): forward it to the owning page like a request
+ * (`websocket: true`), with the handshake port as the reply port and the server end of the socket. The page answers on
+ * the reply port directly. Refused (anything but `open`) when it can't be attributed to a running preview.
+ */
+async function openSocket(src: Client, d: { url?: unknown; protocols?: unknown }, port: MessagePort, socket: MessagePort): Promise<void> {
+  const refuse = () => (port.postMessage({ type: 'refused' }), port.close(), socket.close())
+  let u: URL
+  try {
+    u = new URL(String(d.url))
+  } catch {
+    return refuse()
+  }
+  if (u.host !== location.host || (u.protocol !== 'ws:' && u.protocol !== 'wss:')) return refuse()
+  await restoring
+  const direct = parse(u.pathname)
+  const t = direct ?? clientMap.get(src.id)
+  const client = t && (await findOwner(t.instanceId))
+  if (!t || !client) return refuse()
+  const protocols = Array.isArray(d.protocols) ? d.protocols.filter((p): p is string => typeof p === 'string') : []
+  const path = (direct ? direct.rest : u.pathname) + u.search
+  client.postMessage(
+    { type: 'cresslet-request', instanceId: t.instanceId, port: t.port, path, method: 'GET', headers: websocketHeaders(protocols, location.origin), body: null, websocket: true },
+    [port, socket],
+  )
 }

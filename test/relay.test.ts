@@ -70,6 +70,10 @@ describe('relay: forwarded messages', () => {
     expect(isSwToPage({ type: 'cresslet-who', instanceId: 'a' }, [port])).toBe(true)
     expect(isSwToPage({ type: 'cresslet-request', instanceId: 'a' }, [port])).toBe(true)
     expect(isSwToPage({ type: 'cresslet-request', instanceId: 'a' }, [])).toBe(false)
+    // a preview WebSocket also carries its socket's server end
+    expect(isSwToPage({ type: 'cresslet-request', instanceId: 'a', websocket: true }, [port, port])).toBe(true)
+    expect(isSwToPage({ type: 'cresslet-request', instanceId: 'a', websocket: true }, [port])).toBe(false)
+    expect(isSwToPage({ type: 'cresslet-request', instanceId: 'a' }, [port, port])).toBe(false)
     expect(isSwToPage({ type: 'cresslet-pong' }, [port])).toBe(false)
     expect(isSwToPage('cresslet-who', [port])).toBe(false)
   })

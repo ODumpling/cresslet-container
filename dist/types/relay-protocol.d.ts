@@ -42,7 +42,7 @@ export declare function isPageToSw(d: unknown): d is {
     type: string;
     instanceId: string;
 };
-/** Relay side: a SW -> page message worth forwarding (always carries exactly one reply port). */
+/** Relay side: a SW -> page message worth forwarding (one reply port; a WebSocket request also carries its socket). */
 export declare function isSwToPage(d: unknown, ports: readonly unknown[]): boolean;
 /** Relay side: the node worker script to run processes with. */
 export declare function isWorkerScript(d: unknown): d is {
