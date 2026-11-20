@@ -77,6 +77,27 @@ for (const backend of ['opfs', 'indexeddb'] as const) {
   })
 }
 
+test('a snapshot saved to IndexedDB (no OPFS writes then) is restored once OPFS is in use', async ({ browser, browserName }) => {
+  test.skip(browserName === 'webkit', "Playwright's WebKit has no OPFS")
+  const ctx = await browser.newContext()
+  const page = await ctx.newPage()
+  await page.addInitScript(() => {
+    if (sessionStorage.noOpfs) delete (FileSystemFileHandle.prototype as { createWritable?: unknown }).createWritable
+  })
+  await page.goto('/demo/blank.html')
+  await page.evaluate(() => (sessionStorage.noOpfs = '1'))
+  await page.reload()
+  expect(await boot(page, { key: 'up' })).toMatchObject({ backend: 'indexeddb', restored: false })
+  await page.evaluate(async () => {
+    const { c } = window as unknown as Win
+    await c.fs.writeFile('src/App.tsx', 'saved in idb')
+    await c.persistence!.flush()
+    sessionStorage.removeItem('noOpfs')
+  })
+  await page.reload()
+  expect(await boot(page, { key: 'up' })).toMatchObject({ backend: 'opfs', restored: true, app: 'saved in idb' })
+})
+
 test('flush() on demand, teardown writes pending changes, Container.clearPersisted() without booting', async ({ browser }) => {
   const page = await (await browser.newContext()).newPage()
   await page.goto('/demo/blank.html')

@@ -60,7 +60,7 @@ export function encodeSnapshot(vfs: VFS, dir: string): Uint8Array {
       }
     }
   }
-  walk(dir, '')
+  if (vfs.isDir(dir)) walk(dir, '') // a removed workdir is an empty one
   const header = new TextEncoder().encode(JSON.stringify({ v: 1, entries }))
   let size = 8 + header.byteLength
   for (const c of chunks) size += c.byteLength
@@ -86,8 +86,12 @@ export function restoreSnapshot(vfs: VFS, dir: string, bytes: Uint8Array): void 
   // validate everything before touching the VFS
   let off = 8 + len
   const files: Uint8Array[] = []
-  for (const [rel, type, , extra] of header.entries) {
+  const links: string[] = []
+  for (const [rel, type, mtime, extra] of header.entries) {
     if (typeof rel !== 'string' || !rel || rel.split('/').some((s) => !s || s === '.' || s === '..')) throw new Error(`bad path in VFS snapshot: ${rel}`)
+    // the encoder never descends into symlinks: an entry under one would be written through it
+    if (typeof mtime !== 'number' || links.some((l) => rel.startsWith(l + '/'))) throw new Error(`bad entry in VFS snapshot: ${rel}`)
+    if (type === 'l') links.push(rel)
     if (type === 'f') {
       const n = extra as number
       if (!Number.isInteger(n) || n < 0 || off + n > bytes.byteLength) throw new Error('truncated VFS snapshot')
@@ -123,6 +127,8 @@ export interface SnapshotStore {
   read(key: string): Promise<Uint8Array | null>
   write(key: string, bytes: Uint8Array): Promise<void>
   delete(key: string): Promise<void>
+  /** Release the connection (stores opened for one operation). */
+  close(): void
 }
 
 const OPFS_DIR = 'cresslet-vfs'
@@ -130,13 +136,16 @@ const OPFS_DIR = 'cresslet-vfs'
 const opfsName = (key: string) => `${encodeURIComponent(key)}.snap`
 const isNotFound = (e: unknown) => (e as { name?: string })?.name === 'NotFoundError'
 
-/** OPFS store, or null where OPFS (with writable streams on this thread) is unavailable. */
-export async function opfsStore(): Promise<SnapshotStore | null> {
+/**
+ * OPFS store, or null where OPFS (with writable streams on this thread) is unavailable. `create: false`: null too
+ * when nothing was ever stored there.
+ */
+export async function opfsStore(create = true): Promise<SnapshotStore | null> {
   try {
     if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) return null
     if (typeof FileSystemFileHandle === 'undefined' || typeof FileSystemFileHandle.prototype.createWritable !== 'function') return null
     const root = await navigator.storage.getDirectory()
-    const dir = await root.getDirectoryHandle(OPFS_DIR, { create: true })
+    const dir = await root.getDirectoryHandle(OPFS_DIR, { create })
     return {
       backend: 'opfs',
       async read(key) {
@@ -164,9 +173,10 @@ export async function opfsStore(): Promise<SnapshotStore | null> {
           if (!isNotFound(e)) throw e
         })
       },
+      close() {},
     }
   } catch {
-    return null // e.g. SecurityError in some private modes
+    return null // e.g. SecurityError in some private modes; NotFoundError without `create`
   }
 }
 
@@ -174,16 +184,26 @@ const IDB_NAME = 'cresslet-vfs'
 const IDB_STORE = 'snapshots'
 const OPEN_TIMEOUT = 3000
 
-/** IndexedDB store, or null where IndexedDB is unavailable. */
-export async function idbStore(): Promise<SnapshotStore | null> {
+/** IndexedDB store, or null where IndexedDB is unavailable. `create: false`: null too when the database doesn't exist. */
+export async function idbStore(create = true): Promise<SnapshotStore | null> {
   const db = await new Promise<IDBDatabase | null>((resolve) => {
-    const timer = setTimeout(() => resolve(null), OPEN_TIMEOUT)
-    const done = (db: IDBDatabase | null) => (clearTimeout(timer), resolve(db))
+    let settled = false
+    const done = (db: IDBDatabase | null) => {
+      settled = true
+      clearTimeout(timer)
+      resolve(db)
+    }
+    const timer = setTimeout(() => done(null), OPEN_TIMEOUT)
     try {
       if (typeof indexedDB === 'undefined') return done(null)
       const req = indexedDB.open(IDB_NAME, 1)
-      req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE)
+      req.onupgradeneeded = (e) => {
+        // aborting the version change leaves no database behind
+        if (!create && e.oldVersion === 0) req.transaction!.abort()
+        else req.result.createObjectStore(IDB_STORE)
+      }
       req.onsuccess = () => {
+        if (settled) return req.result.close() // opened after the timeout: unused
         req.result.onversionchange = () => req.result.close()
         done(req.result)
       }
@@ -209,6 +229,7 @@ export async function idbStore(): Promise<SnapshotStore | null> {
     },
     write: (key, bytes) => run('readwrite', (s) => s.put(bytes, key)),
     delete: (key) => run('readwrite', (s) => s.delete(key)),
+    close: () => db.close(),
   }
 }
 
@@ -217,10 +238,28 @@ export async function pickStore(): Promise<SnapshotStore | null> {
   return (await opfsStore()) ?? (await idbStore())
 }
 
-/** Delete a key's snapshot from every backend (the one in use may differ from the one that wrote it). */
-export async function clearSnapshot(key: string): Promise<void> {
-  const stores = (await Promise.all([opfsStore(), idbStore()])).filter((s): s is SnapshotStore => !!s)
-  await Promise.all(stores.map((s) => s.delete(key)))
+/** Read a snapshot IndexedDB holds without creating the database (written while OPFS wasn't usable). */
+async function readIdbFallback(key: string): Promise<Uint8Array | null> {
+  const s = await idbStore(false)
+  try {
+    return (await s?.read(key)) ?? null
+  } finally {
+    s?.close()
+  }
+}
+
+/**
+ * Delete a key's snapshot from every backend (one in use may differ from the one that wrote it), and from `inUse`.
+ * Creates no storage.
+ */
+export async function clearSnapshot(key: string, inUse?: SnapshotStore | null): Promise<void> {
+  // not the backend in use a second time: two concurrent OPFS removeEntry() calls on one file conflict
+  const others = await Promise.all([inUse?.backend === 'opfs' ? null : opfsStore(false), inUse?.backend === 'indexeddb' ? null : idbStore(false)])
+  try {
+    await Promise.all([inUse?.delete(key), ...others.map((s) => s?.delete(key))])
+  } finally {
+    for (const s of others) s?.close()
+  }
 }
 
 export function persistKey(key: unknown = DEFAULT_KEY): string {
@@ -236,10 +275,15 @@ export class VfsPersistence implements Persistence {
   private readonly debounceMs: number
   private readonly maxWrites: number
   private store: SnapshotStore | null = null
+  /** Changes not in the stored snapshot (nor in the write in progress). A failed write adds its changes back. */
   private pending = 0
+  /** Bumped by clear(): a write that fails after it doesn't bring its (cleared) changes back. */
+  private gen = 0
   private timer: ReturnType<typeof setTimeout> | null = null
-  /** The write (or delete) in progress, if any; operations run one after another. */
+  /** The last write or delete queued; they run one after another. */
   private queue: Promise<void> = Promise.resolve()
+  /** A write waiting for the one in progress. It serializes the workdir when it starts, so later changes join it. */
+  private queued: Promise<void> | null = null
   private stops: (() => void)[] = []
   private closed = false
 
@@ -247,9 +291,10 @@ export class VfsPersistence implements Persistence {
     private readonly vfs: VFS,
     private readonly dir: string,
     opts: PersistOptions,
-    /** Reports a snapshot that failed to store outside `flush()` (debounced writes, teardown). */
+    /** Reports a snapshot that failed to store outside `flush()` (debounced and page-hide writes). */
     private readonly onError: (message: string) => void,
     private readonly getStore: () => Promise<SnapshotStore | null> = pickStore,
+    private readonly readFallback: (key: string) => Promise<Uint8Array | null> = readIdbFallback,
   ) {
     this.key = persistKey(opts.key)
     this.debounceMs = opts.debounceMs ?? DEFAULT_DEBOUNCE
@@ -264,7 +309,9 @@ export class VfsPersistence implements Persistence {
     this.backend = this.store?.backend ?? null
     if (!this.store || this.closed) return
     try {
-      const bytes = await this.store.read(this.key)
+      let bytes = await this.store.read(this.key)
+      // saved to IndexedDB while OPFS wasn't usable (e.g. before a browser update): the next save moves it to OPFS
+      if (!bytes && this.store.backend === 'opfs') bytes = await this.readFallback(this.key)
       if (bytes) {
         restoreSnapshot(this.vfs, this.dir, bytes)
         this.restored = true
@@ -288,10 +335,14 @@ export class VfsPersistence implements Persistence {
 
   private changed(): void {
     this.pending++
-    if (this.timer) clearTimeout(this.timer)
-    this.timer = null
+    this.cancelTimer()
     if (this.pending >= this.maxWrites) this.flushQuietly()
     else this.timer = setTimeout(() => this.flushQuietly(), this.debounceMs)
+  }
+
+  private cancelTimer(): void {
+    if (this.timer) clearTimeout(this.timer)
+    this.timer = null
   }
 
   private flushQuietly(): void {
@@ -299,36 +350,51 @@ export class VfsPersistence implements Persistence {
   }
 
   flush(): Promise<void> {
-    if (this.timer) clearTimeout(this.timer)
-    this.timer = null
+    this.cancelTimer()
     const store = this.store
-    if (!store || !this.pending) return this.queue.catch(() => {})
+    if (!store) return Promise.resolve()
+    // nothing new: wait for the write in progress; if it failed, its changes are pending again: retry them
+    if (!this.pending) return this.queue.catch(() => {}).then(() => (this.pending ? this.flush() : undefined))
+    if (!this.queued) {
+      const p = this.queue.catch(() => {}).then(() => {
+        this.queued = null
+        return this.write(store)
+      })
+      this.queued = this.queue = p
+    }
+    return this.queued
+  }
+
+  private async write(store: SnapshotStore): Promise<void> {
+    const n = this.pending
+    const gen = this.gen
+    if (!n) return // cleared meanwhile
     this.pending = 0
-    // serialize now (the state flush() was called on), store after the write in progress
-    const bytes = encodeSnapshot(this.vfs, this.dir)
-    return this.enqueue(() => store.write(this.key, bytes))
+    try {
+      await store.write(this.key, encodeSnapshot(this.vfs, this.dir))
+    } catch (e) {
+      if (gen === this.gen) this.pending += n // the next change, flush() or teardown retries
+      throw e
+    }
   }
 
   clear(): Promise<void> {
-    if (this.timer) clearTimeout(this.timer)
-    this.timer = null
+    this.cancelTimer()
     this.pending = 0
-    // every backend: a snapshot written where another was in use (e.g. before OPFS was available) must go too
-    return this.enqueue(async () => void (await Promise.all([this.store?.delete(this.key), clearSnapshot(this.key)])))
-  }
-
-  private enqueue(op: () => Promise<void>): Promise<void> {
-    const p = this.queue.catch(() => {}).then(op)
+    this.gen++
+    const store = this.store
+    const p = this.queue.catch(() => {}).then(() => clearSnapshot(this.key, store))
     this.queue = p
     return p
   }
 
-  /** Stop watching; write pending changes (best effort). */
+  /** Stop watching; write pending changes (best effort: teardown can't wait for it). */
   close(): void {
     if (this.closed) return
     this.closed = true
     for (const s of this.stops.splice(0)) s()
-    if (this.pending) this.flushQuietly()
-    else if (this.timer) clearTimeout(this.timer)
+    this.cancelTimer()
+    // the container's listeners are gone by the time this fails: warn instead
+    if (this.pending) this.flush().catch((e) => console.warn(`[cresslet] VFS snapshot '${this.key}' not saved on teardown:`, e))
   }
 }

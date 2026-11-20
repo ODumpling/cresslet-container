@@ -29,44 +29,59 @@ export interface SnapshotStore {
     read(key: string): Promise<Uint8Array | null>;
     write(key: string, bytes: Uint8Array): Promise<void>;
     delete(key: string): Promise<void>;
+    /** Release the connection (stores opened for one operation). */
+    close(): void;
 }
-/** OPFS store, or null where OPFS (with writable streams on this thread) is unavailable. */
-export declare function opfsStore(): Promise<SnapshotStore | null>;
-/** IndexedDB store, or null where IndexedDB is unavailable. */
-export declare function idbStore(): Promise<SnapshotStore | null>;
+/**
+ * OPFS store, or null where OPFS (with writable streams on this thread) is unavailable. `create: false`: null too
+ * when nothing was ever stored there.
+ */
+export declare function opfsStore(create?: boolean): Promise<SnapshotStore | null>;
+/** IndexedDB store, or null where IndexedDB is unavailable. `create: false`: null too when the database doesn't exist. */
+export declare function idbStore(create?: boolean): Promise<SnapshotStore | null>;
 /** The store snapshots go to: OPFS, else IndexedDB, else null. */
 export declare function pickStore(): Promise<SnapshotStore | null>;
-/** Delete a key's snapshot from every backend (the one in use may differ from the one that wrote it). */
-export declare function clearSnapshot(key: string): Promise<void>;
+/**
+ * Delete a key's snapshot from every backend (one in use may differ from the one that wrote it), and from `inUse`.
+ * Creates no storage.
+ */
+export declare function clearSnapshot(key: string, inUse?: SnapshotStore | null): Promise<void>;
 export declare function persistKey(key?: unknown): string;
 export declare class VfsPersistence implements Persistence {
     private readonly vfs;
     private readonly dir;
-    /** Reports a snapshot that failed to store outside `flush()` (debounced writes, teardown). */
+    /** Reports a snapshot that failed to store outside `flush()` (debounced and page-hide writes). */
     private readonly onError;
     private readonly getStore;
+    private readonly readFallback;
     readonly key: string;
     backend: 'opfs' | 'indexeddb' | null;
     restored: boolean;
     private readonly debounceMs;
     private readonly maxWrites;
     private store;
+    /** Changes not in the stored snapshot (nor in the write in progress). A failed write adds its changes back. */
     private pending;
+    /** Bumped by clear(): a write that fails after it doesn't bring its (cleared) changes back. */
+    private gen;
     private timer;
-    /** The write (or delete) in progress, if any; operations run one after another. */
+    /** The last write or delete queued; they run one after another. */
     private queue;
+    /** A write waiting for the one in progress. It serializes the workdir when it starts, so later changes join it. */
+    private queued;
     private stops;
     private closed;
     constructor(vfs: VFS, dir: string, opts: PersistOptions, 
-    /** Reports a snapshot that failed to store outside `flush()` (debounced writes, teardown). */
-    onError: (message: string) => void, getStore?: () => Promise<SnapshotStore | null>);
+    /** Reports a snapshot that failed to store outside `flush()` (debounced and page-hide writes). */
+    onError: (message: string) => void, getStore?: () => Promise<SnapshotStore | null>, readFallback?: (key: string) => Promise<Uint8Array | null>);
     /** Pick the store, restore the workdir from its snapshot, then start watching for changes. */
     start(): Promise<void>;
     private changed;
+    private cancelTimer;
     private flushQuietly;
     flush(): Promise<void>;
+    private write;
     clear(): Promise<void>;
-    private enqueue;
-    /** Stop watching; write pending changes (best effort). */
+    /** Stop watching; write pending changes (best effort: teardown can't wait for it). */
     close(): void;
 }
