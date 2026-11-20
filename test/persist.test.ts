@@ -179,6 +179,13 @@ describe('VfsPersistence', () => {
       restoreSnapshot(back, W, store.data.get('default')!)
       expect(back.readText(`${W}/${file}`)).toBe('v2')
     }
+    fs.symlink(`${W}/a.txt`, '/file-link')
+    await p.flush()
+    fs.writeFile('/file-link', 'v3')
+    await p.flush()
+    const viaFile = new VFS()
+    restoreSnapshot(viaFile, W, store.data.get('default')!)
+    expect(viaFile.readText(`${W}/a.txt`)).toBe('v3')
     fs.rm(`${W}/node_modules/pkg/new.js`)
     await p.flush()
     const back = new VFS()

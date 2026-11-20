@@ -365,16 +365,17 @@ export class VfsPersistence implements Persistence {
     // from the root: removing or renaming an ancestor (`rm -rf /home`) changes the workdir too
     const base = this.dir === '/' ? '' : this.dir
     const counts = (abs: string) => abs.startsWith(base + '/') && !isNodeModules(abs.slice(base.length + 1))
-    const w = this.vfs.watch('/', { recursive: true }, (_e, rel) => {
+    const w = this.vfs.watch('/', { recursive: true }, (event, rel) => {
       const abs = '/' + rel
       if ((base + '/').startsWith(abs + '/') || counts(abs)) return this.changed()
-      // written through a symlink into the workdir (`node_modules/pkg -> ../packages/pkg`, a link elsewhere)?
+      // through a symlink into the workdir (`node_modules/pkg -> ../packages/pkg`, a link elsewhere)? A linked
+      // directory on the way (writes, new files, removals), or a write through a link to a file
       try {
-        if (this.vfs.exists(abs) && counts(this.vfs.realpath(abs))) return this.changed()
         const dir = dirname(abs)
-        if (this.vfs.isDir(dir) && counts(join(this.vfs.realpath(dir), basename(abs)))) this.changed()
+        if (this.vfs.isDir(dir) && counts(join(this.vfs.realpath(dir), basename(abs)))) return this.changed()
+        if (event === 'change' && this.vfs.lstat(abs).isSymbolicLink() && counts(this.vfs.realpath(abs))) this.changed()
       } catch {
-        /* a symlink loop (ELOOP): not a path into the workdir */
+        /* any resolution error (a symlink loop, ...): not a path into the workdir */
       }
     })
     this.stops.push(() => w.close())
