@@ -162,7 +162,7 @@ export class Container {
       close: (port, url) => this.emit('port', port, 'close', url),
     }, previewOrigin ?? undefined)
     const vfs = this.vfs
-    this.resolveFs = { isFile: (p) => vfs.isFile(p), isDir: (p) => vfs.isDir(p), readText: (p) => vfs.tryReadText(p) }
+    this.resolveFs = { isFile: (p) => vfs.isFile(p), isDir: (p) => vfs.isDir(p), readText: (p) => vfs.tryReadText(p), realpath: (p) => vfs.realpath(p) }
     for (const d of ['/tmp', '/home', '/usr/local/bin', this.workdir]) vfs.mkdir(d, { recursive: true })
     const w = vfs.watch('/', { recursive: true }, (_e, f) => {
       if (f.endsWith('package.json')) clearPackageCache(this.resolveFs)
@@ -326,7 +326,7 @@ export class Container {
 
   private runFile(file: string, ctx: CommandContext): Promise<number> {
     const head = this.vfs.readText(file).slice(0, 512)
-    const shim = /\/\/ cresslet-bin -> (.+)\n/.exec(head)
+    const shim = /^#!\/usr\/bin\/env node\n\/\/ cresslet-bin -> (.+)\n/.exec(head) // only an npm .bin shim's own header line
     if (shim) return COMMANDS.node({ ...ctx, args: [resolve(dirname(file), shim[1]), ...ctx.args] })
     const shebang = head.startsWith('#!') ? head.slice(2, head.indexOf('\n')) : ''
     if (/\b(sh|bash|jsh|zsh)\b/.test(shebang)) return COMMANDS.jsh({ ...ctx, args: [file, ...ctx.args] })

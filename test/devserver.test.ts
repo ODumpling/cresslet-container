@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { VFS } from '../src/vfs'
 import { join } from '../src/path'
+import { clearPackageCache } from '../src/resolve'
 
 // Dev server HMR decisions in node: native esbuild stands in for esbuild-wasm, a fake container captures the handler,
 // and a BroadcastChannel listener records what the page would be told.
@@ -33,11 +34,14 @@ afterEach(() => {
 
 type Msg = { type: string; updates?: { kind: string; url: string }[] }
 const noCss = { restart() {}, process: async () => { throw new Error('no CSS worker in this test') } }
-async function devServer(files: Record<string, string>, o: { deps?: Record<string, string>; css?: CssBackend } = {}) {
+async function devServer(files: Record<string, string>, o: { deps?: Record<string, string>; css?: CssBackend; root?: string; links?: Record<string, string> } = {}) {
   const vfs = new VFS()
   const write = (p: string, s: string) => vfs.writeFile(join(ROOT, p), s, { mkdirp: true })
   write('package.json', JSON.stringify({ dependencies: { react: '*', 'react-dom': '*', ...o.deps } }))
   for (const [p, s] of Object.entries(files)) write(p, s)
+  // as the container: package.json reads are cached until one changes
+  const resolveFs = { isFile: (p: string) => vfs.isFile(p), isDir: (p: string) => vfs.isDir(p), readText: (p: string) => vfs.tryReadText(p), realpath: (p: string) => vfs.realpath(p) }
+  const pj = vfs.watch('/', { recursive: true }, (_e, f) => void (f.endsWith('package.json') && clearPackageCache(resolveFs)))
   let handler!: (r: Request) => Promise<Response>
   const id = `t${++n}`
   const c = {
@@ -45,16 +49,17 @@ async function devServer(files: Record<string, string>, o: { deps?: Record<strin
     vfs,
     instanceId: id,
     esbuildWasmUrl: '',
-    resolveFs: { isFile: (p: string) => vfs.isFile(p), isDir: (p: string) => vfs.isDir(p), readText: (p: string) => vfs.tryReadText(p) },
+    resolveFs,
     previewChannel: (name: string) => new BroadcastChannel(name),
     cssWorker: () => o.css ?? noCss,
     ports: { free: () => 5173, open: (_p: number, h: typeof handler) => ((handler = h), 'http://localhost/'), close() {} },
   }
-  const server = await createDevServer(c as never, {})
+  for (const [p, t] of Object.entries(o.links ?? {})) (vfs.mkdir(join(ROOT, p, '..'), { recursive: true }), vfs.symlink(t, join(ROOT, p)))
+  const server = await createDevServer(c as never, o.root ? { root: o.root } : {})
   const msgs: Msg[] = []
   const bc = new BroadcastChannel(`cresslet:${id}:5173`)
   bc.onmessage = (e) => void msgs.push(e.data)
-  servers.push(server, bc)
+  servers.push(server, bc, pj)
   const get = async (path: string) => (await handler(new Request('http://localhost' + path))).text()
   const res = async (path: string) => {
     const r = await handler(new Request('http://localhost' + path))
@@ -732,6 +737,151 @@ describe('dev server CSS processing', () => {
     s.rm('src/styles')
     await s.quiet()
     expect(await s.get('/@cresslet/last-error')).toBe('')
+  })
+
+  it('an edit in a workspace package linked into node_modules rebuilds the deps and reloads', async () => {
+    const s = await devServer({ 'index.html': '<script type="module" src="/main.js"></script>', 'main.js': "import greet from 'greet'\nconsole.log(greet)\n", 'packages/greet/package.json': '{"name":"greet","main":"index.js"}', 'packages/greet/index.js': "module.exports = 'v1'\n" }, { deps: { greet: '*' } })
+    s.vfs.mkdir(join(ROOT, 'node_modules'), { recursive: true })
+    s.vfs.symlink('../packages/greet', join(ROOT, 'node_modules/greet'))
+    await new Promise((r) => setTimeout(r, 600)) // the node_modules change settles (400 ms debounce)
+    const main = await s.get('/main.js')
+    const dep = /from\s*"([^"]*greet[^"]*)"/.exec(main)?.[1]
+    expect(dep, main).toBeTruthy()
+    expect(await s.get(dep!)).toContain('v1')
+    s.write('packages/greet/index.js', "module.exports = 'v2'\n")
+    expect(upd(await s.next())).toBe('reload')
+    const dep2 = /from\s*"([^"]*greet[^"]*)"/.exec(await s.get('/main.js'))![1]
+    const code = await s.get(dep2)
+    expect(code).toContain('v2')
+    expect(code).not.toContain('v1')
+  })
+
+  it('fixing a syntax error in a linked workspace that broke the dep bundle rebuilds it', async () => {
+    const s = await devServer({ 'index.html': '<script type="module" src="/main.js"></script>', 'main.js': "import greet from 'greet'\nconsole.log(greet)\n", 'packages/greet/package.json': '{"name":"greet","main":"index.js"}', 'packages/greet/index.js': 'module.exports = (\n' }, { deps: { greet: '*' }, links: { 'node_modules/greet': '../packages/greet' } })
+    const dep = () => s.get('/main.js').then((m) => /from\s*"([^"]*greet[^"]*)"/.exec(m)![1])
+    expect(await s.get(await dep())).toMatch(/Pre-bundling dependencies failed/)
+    s.write('packages/greet/index.js', "module.exports = 'fixed'\n")
+    expect(upd(await s.next())).toBe('reload')
+    expect(await s.get(await dep())).toContain('fixed')
+  })
+
+  it('a stylesheet `@import`ed by a linked workspace\'s CSS rebuilds the deps when edited', async () => {
+    const s = await devServer(
+      { 'index.html': '<script type="module" src="/main.js"></script>', 'main.js': "import 'lib'\n", 'packages/lib/package.json': '{"name":"lib","main":"index.js"}', 'packages/lib/index.js': "import './styles.css'\n", 'packages/lib/styles.css': '@import "./tokens.css";\n.a { color: var(--c) }\n', 'packages/lib/tokens.css': ':root { --c: red }\n' },
+      { deps: { lib: '*' }, links: { 'node_modules/lib': '../packages/lib' } },
+    )
+    const dep = () => s.get('/main.js').then((m) => /["']([^"']*@modules\/lib[^"']*)["']/.exec(m)![1])
+    expect(await s.get(await dep())).toContain('red')
+    s.write('packages/lib/tokens.css', ':root { --c: blue }\n')
+    expect(upd(await s.next())).toBe('reload')
+    expect(await s.get(await dep())).toContain('blue')
+  })
+
+  it('a Sass partial used by a linked workspace\'s stylesheet rebuilds the deps when edited', async () => {
+    let vfsRef: VFS | null = null
+    const tokens = ROOT + '/packages/lib/_tokens.scss'
+    const css: CssBackend = { restart() {}, process: async (r) => ({ css: `.t { color: ${vfsRef!.readText(tokens).trim()} }`, deps: [tokens], dirs: [], warnings: [], tailwind: [] }) }
+    const s = await devServer(
+      { 'index.html': '<script type="module" src="/main.js"></script>', 'main.js': "import 'lib'\n", 'packages/lib/package.json': '{"name":"lib","main":"index.js"}', 'packages/lib/index.js': "import './theme.scss'\n", 'packages/lib/theme.scss': "@use 'tokens';\n", 'packages/lib/_tokens.scss': 'red' },
+      { deps: { lib: '*', sass: '*' }, links: { 'node_modules/lib': '../packages/lib' }, css },
+    )
+    vfsRef = s.vfs
+    const dep = () => s.get('/main.js').then((m) => /["']([^"']*@modules\/lib[^"']*)["']/.exec(m)![1])
+    expect(await s.get(await dep())).toContain('red')
+    s.write('packages/lib/_tokens.scss', 'blue')
+    expect(upd(await s.next())).toBe('reload')
+    expect(await s.get(await dep())).toContain('blue')
+  })
+
+  it('a linked workspace\'s package.json pointing at another entry rebuilds the deps', async () => {
+    const s = await devServer({ 'index.html': '<script type="module" src="/main.js"></script>', 'main.js': "import lib from 'lib'\nconsole.log(lib)\n", 'packages/lib/package.json': '{"name":"lib","main":"a.js"}', 'packages/lib/a.js': "module.exports = 'from a'\n", 'packages/lib/b.js': "module.exports = 'from b'\n" }, { deps: { lib: '*' }, links: { 'node_modules/lib': '../packages/lib' } })
+    const dep = () => s.get('/main.js').then((m) => /from\s*"([^"]*lib[^"]*)"/.exec(m)![1])
+    expect(await s.get(await dep())).toContain('from a')
+    s.write('packages/lib/package.json', '{"name":"lib","exports":"./b.js"}')
+    expect(upd(await s.next())).toBe('reload')
+    expect(await s.get(await dep())).toContain('from b')
+  })
+
+  it('a linked workspace whose entry isn\'t built yet: building it rebuilds the deps', async () => {
+    const s = await devServer({ 'index.html': '<script type="module" src="/main.js"></script>', 'main.js': "import lib from 'lib'\nconsole.log(lib)\n", 'packages/lib/package.json': '{"name":"lib","main":"dist/index.js"}' }, { deps: { lib: '*' }, links: { 'node_modules/lib': '../packages/lib' } })
+    const dep = () => s.get('/main.js').then((m) => /from\s*"([^"]*lib[^"]*)"/.exec(m)?.[1])
+    const first = await dep()
+    if (first) expect(await s.get(first)).toMatch(/Failed to resolve|failed/)
+    s.write('packages/lib/dist/index.js', "module.exports = 'built'\n")
+    expect(upd(await s.next())).toBe('reload')
+    expect(await s.get((await dep())!)).toContain('built')
+  })
+
+  it('a linked workspace\'s own source modules keep hot updates (only files the page doesn\'t load as source rebuild deps)', async () => {
+    const s = await devServer(
+      { 'index.html': '<script type="module" src="/packages/app/main.ts"></script>', 'packages/app/package.json': '{"name":"app"}', 'packages/app/main.ts': "import App from './App'\n", 'packages/app/App.tsx': comp('App', 'return API_URL', "import { API_URL } from './constants.js'"), 'packages/app/constants.js': "export const API_URL = '/a'\n" },
+      { links: { 'node_modules/app': '../packages/app' } },
+    )
+    for (const p of ['/packages/app/main.ts', '/packages/app/App.tsx', '/packages/app/constants.js']) await s.get(p)
+    s.write('packages/app/constants.js', "export const API_URL = '/b'\n")
+    expect(upd(await s.next())).toEqual(['/packages/app/App.tsx'])
+    expect(await s.quiet()).toEqual([]) // no deps rebuild + reload after it
+  })
+
+  it('a dev server run in a package of a monorepo rebuilds deps on an install at the monorepo root', async () => {
+    const s = await devServer(
+      { 'packages/app/index.html': '<script type="module" src="/main.js"></script>', 'packages/app/main.js': "import ms from 'ms'\nconsole.log(ms)\n", 'node_modules/ms/package.json': '{"name":"ms","main":"index.js"}', 'node_modules/ms/index.js': "module.exports = 'v1'\n" },
+      { deps: { ms: '*' }, root: join(ROOT, 'packages/app') },
+    )
+    const dep = () => s.get('/main.js').then((m) => /from\s*"([^"]*ms[^"]*)"/.exec(m)![1])
+    expect(await s.get(await dep())).toContain('v1')
+    s.write('node_modules/ms/index.js', "module.exports = 'v2'\n")
+    expect(upd(await s.next())).toBe('reload')
+    expect(await s.get(await dep())).toContain('v2')
+  })
+
+  it('a dev server run in a workspace rebuilds deps when a file a sibling imports from outside both changes', async () => {
+    const s = await devServer(
+      { 'packages/app/index.html': '<script type="module" src="/main.js"></script>', 'packages/app/main.js': "import shared from 'shared'\nconsole.log(shared)\n", 'packages/shared/package.json': '{"name":"shared","main":"index.js"}', 'packages/shared/index.js': "module.exports = require('../common.js')\n", 'packages/common.js': "module.exports = 'v1'\n" },
+      { deps: { shared: '*' }, root: join(ROOT, 'packages/app'), links: { 'node_modules/shared': '../packages/shared' } },
+    )
+    const dep = () => s.get('/main.js').then((m) => /from\s*"([^"]*shared[^"]*)"/.exec(m)![1])
+    expect(await s.get(await dep())).toContain('v1')
+    s.write('packages/common.js', "module.exports = 'v2'\n")
+    expect(upd(await s.next())).toBe('reload')
+    expect(await s.get(await dep())).toContain('v2')
+  })
+
+  it('a dev server run in a workspace hot-updates a sibling workspace\'s stylesheet it imports by name', async () => {
+    const s = await devServer(
+      { 'packages/app/index.html': '<script type="module" src="/main.js"></script>', 'packages/app/main.js': "import '@acme/ui/styles.css'\n", 'packages/ui/package.json': '{"name":"@acme/ui"}', 'packages/ui/styles.css': '.a { color: red }\n' },
+      { root: join(ROOT, 'packages/app'), links: { 'node_modules/@acme/ui': '../../packages/ui' } },
+    )
+    const main = await s.get('/main.js')
+    const url = /["']([^"']*styles\.css[^"']*)["']/.exec(main)![1]
+    expect(await s.get(url)).toContain('red')
+    s.write('packages/ui/styles.css', '.a { color: blue }\n')
+    expect(upd(await s.next())).toBe('reload')
+    expect(await s.get(url)).toContain('blue')
+  })
+
+  it('a dev server run in a linked workspace ignores writes to files outside the dep bundle (dist/, notes)', async () => {
+    const s = await devServer(
+      { 'packages/app/package.json': '{"name":"app"}', 'packages/app/index.html': '<script type="module" src="/main.js"></script>', 'packages/app/main.js': "import ms from 'ms'\nconsole.log(ms)\n", 'node_modules/ms/package.json': '{"name":"ms","main":"index.js"}', 'node_modules/ms/index.js': 'module.exports = 1\n' },
+      { deps: { ms: '*' }, root: join(ROOT, 'packages/app'), links: { 'node_modules/app': '../packages/app' } },
+    )
+    const dep = /from\s*"([^"]*ms[^"]*)"/.exec(await s.get('/main.js'))![1]
+    await s.get(dep)
+    s.write('packages/app/dist/out.js', 'x')
+    s.write('packages/app/notes.md', 'x')
+    expect([...(await s.quiet()), ...(await s.quiet()), ...(await s.quiet())]).toEqual([]) // past the deps debounce
+  })
+
+  it('a dev server run in a workspace rebuilds deps when a sibling workspace (outside its root) changes', async () => {
+    const s = await devServer(
+      { 'packages/app/index.html': '<script type="module" src="/main.js"></script>', 'packages/app/main.js': "import shared from 'shared'\nconsole.log(shared)\n", 'packages/shared/package.json': '{"name":"shared","main":"index.js"}', 'packages/shared/index.js': "module.exports = 'v1'\n" },
+      { deps: { shared: '*' }, root: join(ROOT, 'packages/app'), links: { 'node_modules/shared': '../packages/shared' } },
+    )
+    const dep = () => s.get('/main.js').then((m) => /from\s*"([^"]*shared[^"]*)"/.exec(m)![1])
+    expect(await s.get(await dep())).toContain('v1')
+    s.write('packages/shared/index.js', "module.exports = 'v2'\n")
+    expect(upd(await s.next())).toBe('reload')
+    expect(await s.get(await dep())).toContain('v2')
   })
 
   it('closing the dev server releases its CSS worker state', async () => {

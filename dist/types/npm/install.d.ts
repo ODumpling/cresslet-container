@@ -8,6 +8,8 @@ export interface InstallOptions {
     remove?: string[];
     dev?: boolean;
     exact?: boolean;
+    /** `npm ci`: the lockfile must exist and match package.json; node_modules is removed first. */
+    ci?: boolean;
     out: Writer;
     signal?: AbortSignal;
 }
@@ -33,8 +35,11 @@ export declare function install(vfs: VFS, registry: Registry, o: InstallOptions)
     removed: number;
     warnings: string[];
 }>;
-/** Map of 'node_modules/a[/node_modules/b]' -> version for everything currently installed. */
-export declare function listInstalled(vfs: VFS, cwd: string): Map<string, string>;
+/**
+ * Map of 'node_modules/a[/node_modules/b]' -> 'name@version' for everything installed under each root ('' = the project,
+ * else a workspace dir); symlinks map to `link:<target>` and aren't descended into.
+ */
+export declare function listInstalled(vfs: VFS, cwd: string, roots?: string[]): Map<string, string>;
 export declare function binEntries(name: string, bin: Manifest['bin']): [string, string][];
 type Manifest = Placement['manifest'];
 export {};

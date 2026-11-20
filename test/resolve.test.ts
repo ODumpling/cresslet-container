@@ -46,3 +46,18 @@ describe('module resolution', () => {
     expect(matchExports([{ worker: './w.js' }, './f.js'], '.', ['default'])).toBe('./f.js')
   })
 })
+
+describe('linked packages', () => {
+  it('resolve to their real path (as node does), so their relative imports work', () => {
+    const fs = new VFS()
+    fs.writeFile('/p/packages/a/package.json', JSON.stringify({ name: 'a', main: 'index.js' }), { mkdirp: true })
+    fs.writeFile('/p/packages/a/index.js', "require('../shared.js')")
+    fs.mkdir('/p/node_modules', { recursive: true })
+    fs.symlink('../packages/a', '/p/node_modules/a')
+    const rfs = { isFile: (p: string) => fs.isFile(p), isDir: (p: string) => fs.isDir(p), readText: (p: string) => fs.tryReadText(p) }
+    expect(resolveModule({ ...rfs, realpath: (p) => fs.realpath(p) }, 'a', '/p', NODE_OPTS)).toBe('/p/packages/a/index.js')
+    expect(resolveModule(rfs, 'a', '/p', NODE_OPTS)).toBe('/p/node_modules/a/index.js') // without realpath: the link path
+    // a file named through the link (`node node_modules/a/index.js`) resolves to its real path too
+    expect(resolveModule({ ...rfs, realpath: (p) => fs.realpath(p) }, './node_modules/a/index.js', '/p', NODE_OPTS)).toBe('/p/packages/a/index.js')
+  })
+})

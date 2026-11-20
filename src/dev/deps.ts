@@ -33,12 +33,16 @@ export class DepOptimizer {
   /** Called when already-served modules became stale (page must reload). */
   onStale?: () => void
   private lastServed = 0
+  /** Real paths of the files the last successful build read. */
+  private inputs = new Set<string>()
+  /** The last build had errors (a package's entry missing, say): files it couldn't know of may fix it. */
+  failed = false
 
   constructor(
     private vfs: VFS,
     private fs: ResolveFs,
     private root: string,
-    private opts: { wasmURL?: string; define: Record<string, string>; conditions?: string[]; preprocess?: (file: string, text: string) => Promise<string> },
+    private opts: { wasmURL?: string; define: Record<string, string>; conditions?: string[]; preprocess?: (file: string, text: string) => Promise<{ css: string; deps?: string[] }> },
   ) {}
 
   has(spec: string): boolean {
@@ -50,6 +54,19 @@ export class DepOptimizer {
     let changed = false
     for (const s of specs) if (!this.specs.has(s)) (this.specs.add(s), (changed = true))
     if (changed) this.schedule()
+  }
+
+  private real(p: string): string {
+    try {
+      return this.vfs.realpath(p)
+    } catch {
+      return p
+    }
+  }
+
+  /** Whether `file` (a real path) went into the dependency bundle. */
+  bundles(file: string): boolean {
+    return this.inputs.has(file)
   }
 
   invalidate(): void {
@@ -134,6 +151,7 @@ export class DepOptimizer {
       }
     }
     const result: DepsResult = { id, entries: new Map(), chunks: new Map(), errors }
+    this.failed = errors.size > 0
     if (!entryPoints.length) return result
     const depPlugin: Plugin = {
       name: 'cresslet-deps',
@@ -146,7 +164,9 @@ export class DepOptimizer {
           let text = new TextDecoder().decode(vfsRead(a.path))
           if (!a.path.endsWith('.css')) {
             if (!preprocess) throw new Error(`${a.path}: no Sass/Less compiler here`)
-            text = await preprocess(a.path, text)
+            const r = await preprocess(a.path, text)
+            text = r.css
+            for (const d of r.deps ?? []) cssInputs.add(d) // Sass/Less partials it read
           }
           // relative url()s point at the package's files: served from the root (`/node_modules/...`) or `/@fs`
           const urlOf = (p: string) => (p.startsWith(root + '/') ? p.slice(root.length) : `/@fs${p}`)
@@ -154,6 +174,7 @@ export class DepOptimizer {
             stdin: { contents: text, loader: 'css', resolveDir: dirname(a.path), sourcefile: a.path },
             bundle: true,
             write: false,
+            metafile: true,
             logLevel: 'silent',
             plugins: [
               {
@@ -174,6 +195,8 @@ export class DepOptimizer {
               },
             ],
           })
+          // the stylesheets it inlined count as the bundle's inputs too (editing an `@import`ed one rebuilds)
+          for (const k of Object.keys(out.metafile?.inputs ?? {})) if (k.startsWith('cresslet-dep-css:')) cssInputs.add(k.slice('cresslet-dep-css:'.length))
           const css = out.outputFiles[0]?.text ?? ''
           return {
             contents: `const s=document.createElement('style');s.setAttribute('data-cresslet-dep',${JSON.stringify(a.path)});s.textContent=${JSON.stringify(css)};document.head.appendChild(s);`,
@@ -183,6 +206,7 @@ export class DepOptimizer {
       },
     }
     const vfsRead = (p: string) => this.vfs.readFile(p)
+    const cssInputs = new Set<string>()
     const preprocess = this.opts.preprocess
     const vfs = this.vfs
     const root = this.root
@@ -204,6 +228,15 @@ export class DepOptimizer {
         vfsPlugin: vopts,
         logLevel: 'silent',
       })
+      // what the bundle was built from, by real path (a linked workspace's files are reached through node_modules)
+      this.inputs = new Set(
+        [
+          ...Object.keys(out.metafile?.inputs ?? {})
+            .filter((k) => k.startsWith('cresslet-vfs:'))
+            .map((k) => k.slice('cresslet-vfs:'.length).replace(/\?.*$/, '')),
+          ...cssInputs,
+        ].map((p) => this.real(p)),
+      )
       const byOut = new Map(entryPoints.map((e) => [`/@modules/${e.out}.js`, e.out]))
       for (const f of out.outputFiles) {
         const spec = byOut.get(f.path)
@@ -211,10 +244,16 @@ export class DepOptimizer {
         else if (f.path.endsWith('.js')) result.chunks.set(f.path.slice(f.path.lastIndexOf('/') + 1), f.text)
       }
     } catch (e) {
+      // files the errors point at count as inputs too, so fixing one rebuilds
+      for (const err of (e as { errors?: { location?: { file?: string } | null }[] }).errors ?? []) {
+        const f = err.location?.file?.replace(/^cresslet-vfs:/, '').replace(/\?.*$/, '')
+        if (f?.startsWith('/')) this.inputs.add(this.real(f))
+      }
       const { formatErrors } = await import('../esbuild')
       const msg = `Pre-bundling dependencies failed:\n${formatErrors(e)}`
       for (const ep of entryPoints) errors.set(ep.out, msg)
     }
+    this.failed = errors.size > 0
     return result
   }
 

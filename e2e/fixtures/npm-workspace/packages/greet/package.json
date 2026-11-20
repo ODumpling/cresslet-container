@@ -1,0 +1,1 @@
+{"name":"greet","version":"1.0.0","main":"index.js","scripts":{"check":"semver 1.2.3 -r ^1"},"dependencies":{"is-number":"^6.0.0","ms":"^1.0.0"},"bin":{"greet-cli":"cli.js"}}

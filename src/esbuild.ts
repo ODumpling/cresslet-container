@@ -84,7 +84,7 @@ export interface VfsPluginOptions {
 /** Resolve + load everything from the VFS. */
 export function vfsPlugin(vfs: VFS, opts: VfsPluginOptions = {}): Plugin {
   const ropts = opts.resolve ?? BROWSER_OPTS
-  const fsAdapter = { isFile: (p: string) => vfs.isFile(p), isDir: (p: string) => vfs.isDir(p), readText: (p: string) => vfs.tryReadText(p) }
+  const fsAdapter = { isFile: (p: string) => vfs.isFile(p), isDir: (p: string) => vfs.isDir(p), readText: (p: string) => vfs.tryReadText(p), realpath: (p: string) => vfs.realpath(p) }
   return {
     name: 'cresslet-vfs',
     setup(build) {

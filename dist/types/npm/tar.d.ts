@@ -13,4 +13,5 @@ export declare function gzip(data: Uint8Array): Promise<Uint8Array>;
 export declare function tar(files: {
     path: string;
     data: string | Uint8Array;
+    linkname?: string;
 }[]): Uint8Array;

@@ -2,6 +2,8 @@ export interface ResolveFs {
     isFile(p: string): boolean;
     isDir(p: string): boolean;
     readText(p: string): string | null;
+    /** Real path (symlinks resolved): linked packages (workspaces) then resolve their imports from where they are. */
+    realpath?(p: string): string;
 }
 export interface ResolveOptions {
     conditions: string[];

@@ -10,6 +10,17 @@ describe('tar', () => {
     expect(entries[2].data.length).toBe(1500)
   })
 
+  it('rejects a corrupt entry size instead of looping (negative) or reading past the end', () => {
+    const enc = new TextEncoder()
+    const bad = (size: string) => {
+      const t = tar([{ path: 'package/a.js', data: 'x' }])
+      t.set(enc.encode(size.padEnd(11, ' ') + '\0'), 124)
+      return t
+    }
+    expect(() => untar(bad('-1000'), 1)).toThrow(/invalid tar archive/)
+    expect(() => untar(bad('77777777'), 1)).toThrow(/invalid tar archive/)
+  })
+
   it('honours pax path headers and skips traversal', () => {
     const enc = new TextEncoder()
     const long = 'package/' + 'd/'.repeat(60) + 'file.js'

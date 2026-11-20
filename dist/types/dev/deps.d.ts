@@ -22,15 +22,25 @@ export declare class DepOptimizer {
     /** Called when already-served modules became stale (page must reload). */
     onStale?: () => void;
     private lastServed;
+    /** Real paths of the files the last successful build read. */
+    private inputs;
+    /** The last build had errors (a package's entry missing, say): files it couldn't know of may fix it. */
+    failed: boolean;
     constructor(vfs: VFS, fs: ResolveFs, root: string, opts: {
         wasmURL?: string;
         define: Record<string, string>;
         conditions?: string[];
-        preprocess?: (file: string, text: string) => Promise<string>;
+        preprocess?: (file: string, text: string) => Promise<{
+            css: string;
+            deps?: string[];
+        }>;
     });
     has(spec: string): boolean;
     /** Add specs (e.g. from the initial scan) without serving. */
     add(specs: Iterable<string>): void;
+    private real;
+    /** Whether `file` (a real path) went into the dependency bundle. */
+    bundles(file: string): boolean;
     invalidate(): void;
     get(spec: string): Promise<{
         code: string;

@@ -46,7 +46,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   let cfg: ProjectConfig = readProjectConfig(vfs, root)
   let env = loadEnv(vfs, root, 'development')
   let defines = { ...envDefines(env), 'process.env.NODE_ENV': '"development"' }
-  const deps = new DepOptimizer(vfs, fs, root, { wasmURL: c.esbuildWasmUrl, define: { 'process.env.NODE_ENV': '"development"' }, preprocess: async (f, text) => (await cssPipe.process(f, text)).css })
+  const deps = new DepOptimizer(vfs, fs, root, { wasmURL: c.esbuildWasmUrl, define: { 'process.env.NODE_ENV': '"development"' }, preprocess: async (f, text) => cssPipe.process(f, text) })
   deps.onStale = () => scheduleReload('dependencies re-optimized')
   /**
    * Transformed scripts, with what the graph needs to re-learn them after a full reload resets it. Valid only for the
@@ -87,6 +87,8 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   const unresolved = new Set<string>()
   /** Files served as-is (e.g. a runtime `fetch('/data.json')`): outside the module graph, but the page uses them. */
   const served = new Set<string>()
+  /** Stylesheets served as packages' (`import 'ui/styles.css'`, outside the CSS graph): a linked package's edit reloads. */
+  const packageCss = new Set<string>()
   let reloadTimer: ReturnType<typeof setTimeout> | null = null
   let depsTimer: ReturnType<typeof setTimeout> | null = null
   let flushTimer: ReturnType<typeof setTimeout> | null = null
@@ -177,20 +179,81 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     }
     post({ type: 'update', updates: [...updates.values()].map((u) => ({ kind: u.kind, url: toUrl(u.file) + (u.kind === 'css' ? '?import' : ''), t })) })
   }
+  // deps changed (npm install, a linked workspace's bundled file): rebuild lazily, then reload once things settle
+  const depsChanged = () => {
+    if (depsTimer) clearTimeout(depsTimer)
+    depsTimer = setTimeout(() => {
+      depsTimer = null
+      refreshLinks() // after an install settles, not per file it writes
+      deps.invalidate()
+      transformCache.clear()
+      cssPipe.reset() // plugins may have changed
+      scheduleReload('node_modules changed')
+    }, 400)
+  }
+  /**
+   * Packages linked into node_modules (workspaces) are bundled as deps when imported by name: an edit to a file that
+   * went into that bundle (and isn't also a source module on the page) rebuilds it. Linked dirs outside the root (in
+   * the root's or an ancestor's node_modules: sibling workspaces of a dev server run in one) get watchers of their own.
+   */
+  let linkWatchers: { close(): void }[] = []
+  let linkedDirs: string[] = []
+  const onLinked = (abs: string) => {
+    if (graph.nodes.has(abs)) return
+    // after a failed build, any file appearing in a linked package (a sibling's built `dist/index.js`) may fix it;
+    // a linked package's package.json (its exports/main) changes what resolves
+    const linkedFile = linkedDirs.some((d) => abs.startsWith(d + '/'))
+    if (deps.bundles(abs) || (linkedFile && (deps.failed || abs.endsWith('/package.json')))) depsChanged()
+  }
+  /** A change outside the root (a sibling workspace): a module or file the page loaded from there hot-updates. */
+  const onOutside = (abs: string) => {
+    if (packageCss.has(abs)) return void scheduleReload(abs)
+    if (graph.nodes.has(abs) || served.has(abs)) return void scheduleHmr(abs)
+    onLinked(abs)
+  }
+  const refreshLinks = () => {
+    const found = new Set<string>()
+    for (let d = root; ; d = dirname(d)) {
+      const nm = join(d, 'node_modules')
+      const names = vfs.isDir(nm) ? vfs.readdir(nm).flatMap((n) => (n.startsWith('@') && vfs.isDir(join(nm, n)) && !vfs.lstat(join(nm, n)).isSymbolicLink() ? vfs.readdir(join(nm, n)).map((s) => `${n}/${s}`) : [n])) : []
+      for (const n of names) {
+        try {
+          if (!vfs.lstat(join(nm, n)).isSymbolicLink()) continue
+          const real = vfs.realpath(join(nm, n))
+          if (!real.includes('/node_modules/') && vfs.isDir(real)) found.add(real)
+        } catch {
+          /* dangling link */
+        }
+      }
+      if (d === '/' || dirname(d) === d) break
+    }
+    linkedDirs = [...found]
+    for (const w of linkWatchers) w.close()
+    linkWatchers = [...found].filter((d) => d !== root && !d.startsWith(root + '/') && !root.startsWith(d + '/')).map((d) => vfs.watch(d, { recursive: true }, (_ev, f) => onOutside(join(d, f))))
+  }
+  refreshLinks()
+  // an install at an enclosing project's root (a monorepo, with the dev server in one of its packages) changes the
+  // hoisted deps this one bundles: its node_modules, created later or not, rebuilds them too
+  const ancestorWatchers: { close(): void }[] = []
+  for (let d = dirname(root); d !== root && d !== '/' && dirname(d) !== d; d = dirname(d)) {
+    if (!vfs.isFile(join(d, 'package.json'))) continue
+    ancestorWatchers.push(
+      vfs.watch(d, { recursive: true }, (_ev, f) => {
+        if (f === 'node_modules' || f.startsWith('node_modules/')) return depsChanged()
+        // a file outside the root that went into the bundle (a sibling workspace's `../shared.js`)
+        const abs = join(d, f)
+        if (!abs.startsWith(root + '/')) onOutside(abs)
+      }),
+    )
+  }
   const watcher = vfs.watch(root, { recursive: true }, (_ev, file) => {
     if (file.startsWith('node_modules/') || file === 'node_modules') {
-      // deps changed (npm install): rebuild lazily, then reload once things settle
-      if (depsTimer) clearTimeout(depsTimer)
-      depsTimer = setTimeout(() => {
-        depsTimer = null
-        deps.invalidate()
-        transformCache.clear()
-        cssPipe.reset() // plugins may have changed
-        scheduleReload('node_modules changed')
-      }, 400)
+      depsChanged()
       return
     }
     const abs = join(root, file)
+    onLinked(abs) // and on: it may be a source module too, or a stylesheet's Tailwind content
+    if (packageCss.has(abs)) scheduleReload(abs) // a linked package's stylesheet the page imported by name
     changes.push({ seq: ++changeSeq, file: abs })
     if (changes.length > 2000) changes.splice(0, changes.length - 1000)
     if (!vfs.isFile(abs)) {
@@ -611,6 +674,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
         if (STYLE_RE.test(spec)) {
           const file = resolveModule(fs, spec, root, { ...BROWSER_OPTS, conditions: ['style', ...BROWSER_OPTS.conditions] })
           if (!file) return new Response('', { headers: JS })
+          packageCss.add(file)
           if (has('raw')) return new Response(`export default ${JSON.stringify(vfs.readText(file))}`, { headers: JS })
           return new Response(has('import') ? await cssModule(file, true) : await cssModule(file, false, true), { headers: has('import') ? JS : { 'content-type': 'text/css', ...NO_CACHE } })
         }
@@ -682,6 +746,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       for (const t of [reloadTimer, depsTimer, flushTimer]) if (t) clearTimeout(t)
       cssPipe.release()
       watcher.close()
+      for (const w of [...linkWatchers, ...ancestorWatchers]) w.close()
       bc.close()
       c.ports.close(port)
     },

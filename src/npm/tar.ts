@@ -35,7 +35,7 @@ function parsePax(data: Uint8Array): Record<string, string> {
     const sp = text.indexOf(' ', i)
     if (sp < 0) break
     const len = parseInt(text.slice(i, sp), 10)
-    if (!len) break
+    if (!(len > 0)) break // (a negative or NaN length would never advance)
     const rec = text.slice(sp + 1, i + len - 1)
     const eq = rec.indexOf('=')
     if (eq > 0) out[rec.slice(0, eq)] = rec.slice(eq + 1)
@@ -57,6 +57,8 @@ export function untar(buf: Uint8Array, strip = 0): TarEntry[] {
     const size = octal(h, 124, 12)
     const flag = String.fromCharCode(h[156] || 48)
     const dataStart = off + 512
+    // a corrupt size (negative, NaN, past the end) would loop forever or read garbage
+    if (!Number.isSafeInteger(size) || size < 0 || dataStart + size > buf.length) throw new Error('invalid tar archive (bad entry size)')
     const data = buf.subarray(dataStart, dataStart + size)
     off = dataStart + Math.ceil(size / 512) * 512
     if (flag === 'x') {
@@ -103,7 +105,7 @@ export async function gzip(data: Uint8Array): Promise<Uint8Array> {
 }
 
 /** Build a tar archive (used by tests and `npm pack`-style helpers). */
-export function tar(files: { path: string; data: string | Uint8Array }[]): Uint8Array {
+export function tar(files: { path: string; data: string | Uint8Array; linkname?: string }[]): Uint8Array {
   const enc = new TextEncoder()
   const chunks: Uint8Array[] = []
   for (const f of files) {
@@ -116,7 +118,8 @@ export function tar(files: { path: string; data: string | Uint8Array }[]): Uint8
     h.set(enc.encode(data.length.toString(8).padStart(11, '0') + '\0'), 124)
     h.set(enc.encode('00000000000\0'), 136)
     h.set(enc.encode('        '), 148)
-    h[156] = 48
+    h[156] = f.linkname ? 50 : 48 // '2' symlink, '0' file
+    if (f.linkname) h.set(enc.encode(f.linkname.slice(0, 100)), 157)
     h.set(enc.encode('ustar\0' + '00'), 257)
     let sum = 0
     for (const b of h) sum += b
