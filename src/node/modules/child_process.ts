@@ -189,8 +189,8 @@ export class ChildProcess extends EventEmitter {
     const ended = outs.map((s) => new Promise<void>((r) => (s.readableEnded || s.destroyed ? r() : (s.once('end', r), s.once('close', r)))))
     for (const s of outs) {
       s.push(null)
-      if (!s._readableState?.readableListening) s.resume()
-      else s.read(0) // emits 'end' if nothing is left buffered
+      // after this task's 'exit' handlers (which may drop a 'readable' listener); resume() leaves 'readable' readers paused
+      queueMicrotask(() => s.resume())
     }
     Promise.all(ended).then(() =>
       nativeSetTimeout(() => {
