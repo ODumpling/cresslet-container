@@ -131,7 +131,7 @@ function rebaseUrls(css, fromDir, toDir) {
       if (css[j] === '"' || css[j] === "'") {
         q = css[j]
         const e = skipString(css, j)
-        ref = css.slice(j + 1, e - 1).replace(/\\(.)/g, '$1')
+        ref = unescapeCss(css.slice(j + 1, e - 1))
         end = e
         while (end < n && /\s/.test(css[end])) end++
         if (css[end] !== ')') {
@@ -141,8 +141,9 @@ function rebaseUrls(css, fromDir, toDir) {
       } else {
         q = ''
         end = j
-        while (end < n && css[end] !== ')' && !/[\s"'(]/.test(css[end])) end++
-        ref = css.slice(j, end).replace(/\\(.)/g, '$1')
+        while (end < n && css[end] !== ')' && !/[\s"'(]/.test(css[end])) end += css[end] === '\\' ? escapeLength(css, end) : 1
+        end = Math.min(end, n)
+        ref = unescapeCss(css.slice(j, end))
         let k = end
         while (k < n && /\s/.test(css[k])) k++
         if (css[k] !== ')') {
@@ -161,6 +162,23 @@ function rebaseUrls(css, fromDir, toDir) {
     } else i++
   }
   return out + css.slice(last)
+}
+
+/** A CSS string/url token's value: `\\` + 1-6 hex digits (+ one whitespace) is a code point, `\\` + newline nothing. */
+function unescapeCss(s) {
+  return s.replace(/\\(?:([0-9a-f]{1,6})(?:\r\n|[ \t\r\n\f])?|(\r\n|[\n\r\f])|([\s\S]))/gi, (_, hex, nl, ch) => {
+    if (hex) {
+      const cp = parseInt(hex, 16)
+      return cp === 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff) ? '\ufffd' : String.fromCodePoint(cp)
+    }
+    return nl ? '' : ch
+  })
+}
+
+/** Length of the escape at `css[i]` (a backslash): hex digits and their one whitespace, or one character. */
+function escapeLength(css, i) {
+  const m = /^\\(?:[0-9a-f]{1,6}(?:\r\n|[ \t\r\n\f])?|[\s\S])/i.exec(css.slice(i, i + 9))
+  return m ? m[0].length : 1
 }
 
 function skipString(css, i) {
@@ -183,10 +201,10 @@ function dropProjectModules(root) {
 }
 
 /** Paths a failed relative `@import` / `@plugin` / `@config` might be created at. */
-function attempted(id, base, exts) {
+function attempted(id, base, exts, index) {
   if (!id.startsWith('.') && !id.startsWith('/')) return []
   const p = path.resolve(base, id)
-  return path.extname(p) ? [p] : [p, ...exts.map((e) => p + e)]
+  return [p, ...(path.extname(p) ? [] : exts.map((e) => p + e)), ...(index ? [path.join(p, index)] : [])]
 }
 
 function stale(deps) {
@@ -236,7 +254,7 @@ async function tailwind(req, css, from, out) {
           try {
             p = resolveStylesheet(id, base)
           } catch (err) {
-            for (const a of attempted(id, base, ['.css'])) record(a)
+            for (const a of attempted(id, base, ['.css'], 'index.css')) record(a)
             throw err
           }
           record(p)
@@ -269,6 +287,9 @@ async function tailwind(req, css, from, out) {
   return e.compiler.build([...candidatesOf(req)])
 }
 
+/** Thrown by the Tailwind plugin of a discovery request: the rest of the chain never sees its (empty) output. */
+const DISCOVERED = Symbol('discovered')
+
 /** Stand-in for `@tailwindcss/postcss` (which needs native oxide + lightningcss): same plugin, our compiler. */
 function tailwindPostcss() {
   return {
@@ -278,7 +299,9 @@ function tailwindPostcss() {
       const from = result.opts.from
       const css = root.toString()
       if (!ctx || !TAILWIND_RE.test(css)) return
-      const parsed = postcss.parse(await tailwind(ctx.req, css, from, ctx.out), { from })
+      const built = await tailwind(ctx.req, css, from, ctx.out)
+      if (ctx.req.discover) throw DISCOVERED
+      const parsed = postcss.parse(built, { from })
       root.removeAll()
       root.append(parsed.nodes)
     },
@@ -348,9 +371,14 @@ function plugins(config, root) {
  * -> { css, deps: abs paths the output depends on, dirs: content directories (PostCSS `dir-dependency`),
  *      tailwind: [{ sources, root }] (one per Tailwind v4 compile), warnings }
  */
+let lastEnv = null
 async function handle(req) {
-  // plugins and configs see the request's mode (a production build: NODE_ENV=production)
-  process.env.NODE_ENV = req.env || 'development'
+  // plugins and configs see the request's mode (a production build: NODE_ENV=production); packages that read it when
+  // loaded are loaded again when it changes (compilers/configs already built keep their instances)
+  const env = req.env || 'development'
+  if (lastEnv !== null && lastEnv !== env) for (const k of Object.keys(require.cache)) if (k !== __filename) delete require.cache[k]
+  lastEnv = env
+  process.env.NODE_ENV = env
   const out = { deps: new Set(), dirs: new Set(), tailwind: [], warnings: [] }
   try {
     candidatesOf(req) // record the delta first: it was sent once, whatever happens to this request
@@ -363,7 +391,13 @@ async function handle(req) {
         throw new Error(`${path.basename(req.postcssConfig)} found, but the \`postcss\` package is not installed (npm install -D postcss)`)
       }
       const { plugins: list } = loadConfig(req.postcssConfig, req.root, req.env || 'development', !!req.tailwind)
-      const res = await postcss(list).process(req.css, { from: req.file, to: req.file, map: false, cresslet: { req, out } })
+      let res
+      try {
+        res = await postcss(list).process(req.css, { from: req.file, to: req.file, map: false, cresslet: { req, out } })
+      } catch (e) {
+        if (e !== DISCOVERED) throw e
+        return { css: '', deps: [...out.deps], dirs: [], tailwind: out.tailwind, warnings: [] }
+      }
       css = res.css
       for (const m of res.messages) {
         if (m.type === 'dependency' && m.file) out.deps.add(m.file)

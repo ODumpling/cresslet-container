@@ -193,7 +193,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     const abs = join(root, file)
     changes.push({ seq: ++changeSeq, file: abs })
     if (changes.length > 2000) changes.splice(0, changes.length - 1000)
-    if (!vfs.isFile(abs)) cssErrors.delete(abs)
+    if (!vfs.isFile(abs)) for (const k of cssErrors.keys()) if (k === abs || k.startsWith(abs + '/')) cssErrors.delete(k) // a file, or a directory removed with it
     // Tailwind: every changed source updates the candidates (before any full-reload return, whether or not a Tailwind
     // stylesheet is on the page yet: the reloaded / next request must see them); contentCss picks what to re-serve
     const grown = cssPipe.mode.tailwind ? cssPipe.update(abs) : []
@@ -426,7 +426,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
           const stale = cssStale(abs, cssDeps, uses, seq, rev)
           if (stale && attempt < 2 && page === pageGen) continue
           // keep a node, with what it read (incl. missing imports/configs), so fixing or creating those hot-updates it
-          if (tracked && !isModule) publishCss(abs, cssDeps, graph.nodes.get(abs)?.accept ?? accept, uses, gen, page)
+          if (tracked) publishCss(abs, cssDeps, isModule ? null : (graph.nodes.get(abs)?.accept ?? accept), uses, gen, page)
           if (link && tracked && fresh(abs, gen, page)) {
             // a stylesheet can't report its own error: tell the overlay (and keep it for a client that isn't up yet)
             const msg = formatErrors(e)

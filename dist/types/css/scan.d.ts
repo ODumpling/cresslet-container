@@ -29,10 +29,7 @@ export declare class CandidateScanner {
     private excludes;
     private files;
     readonly candidates: Set<string>;
-    /** Bumped when a changed file brings new candidates after the scan (a build that read the old set is stale). */
-    revision: number;
     private scan;
-    private done;
     constructor(vfs: VFS, root: string, rules?: SourceRules);
     /** Every candidate in every source file (scans once, lazily, yielding between slices of a large tree). */
     all(): Promise<string[]>;

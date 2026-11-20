@@ -603,6 +603,37 @@ describe('dev server CSS processing', () => {
     expect(await s.get('/src/index.css?import&t=2')).toContain('.ok')
   })
 
+  it('a failed CSS Module keeps what it tried to read: creating the missing @import updates its importer', async () => {
+    const ROOT_ = '/__cresslet_test__/p'
+    let exists = false
+    const backend: CssBackend = {
+      restart() {},
+      async process() {
+        if (!exists) throw Object.assign(new Error("Can't resolve './missing.css'"), { deps: [ROOT_ + '/src/missing.css'] })
+        return { css: '.ok{}', deps: [ROOT_ + '/src/missing.css'], dirs: [], warnings: [], tailwind: [] }
+      },
+    }
+    const s = await devServer({ 'src/main.ts': "import App from './App'\n", 'src/App.tsx': comp('App', 'return s.ok', "import s from './a.module.css'"), 'src/a.module.css': '@import "./missing.css";\n.ok { color: red }\n', 'postcss.config.js': 'module.exports = {}' }, { css: backend })
+    await s.get('/src/main.ts')
+    await s.get('/src/App.tsx')
+    expect(await s.get('/src/a.module.css?import')).toContain("Can't resolve")
+    exists = true
+    s.write('src/missing.css', '.m{}')
+    expect(upd(await s.next())).not.toEqual([])
+  })
+
+  it('<link> CSS errors are cleared when a directory holding the stylesheet is deleted', async () => {
+    const tw = fakeTailwind()
+    const s = await devServer({ ...files, 'index.html': '<link rel="stylesheet" href="/src/styles/index.css">', 'src/styles/index.css': '/* BROKEN */\n', 'postcss.config.js': 'module.exports = {}' }, { css: tw.backend })
+    const e = s.next()
+    await s.get('/src/styles/index.css')
+    expect(await e).toMatchObject({ type: 'error' })
+    expect(await s.get('/@cresslet/last-error')).toContain('boom')
+    s.rm('src/styles')
+    await s.quiet()
+    expect(await s.get('/@cresslet/last-error')).toBe('')
+  })
+
   it('closing the dev server releases its CSS worker state', async () => {
     const tw = fakeTailwind()
     const released: string[] = []

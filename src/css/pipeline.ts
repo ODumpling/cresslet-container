@@ -44,8 +44,11 @@ export interface CssResult {
   tailwind: SourceRules
   warnings: string[]
 }
-/** A failed request: what the compile had read (or tried to) before it failed, so changing/creating those retries it. */
-export type CssError = Error & { deps?: string[]; dirs?: string[] }
+/**
+ * A failed request: what the compile had read (or tried to) before it failed, so changing/creating those retries it.
+ * `restarted`: a restart (config/plugins changed) cut it off; the caller sends it again with its current mode.
+ */
+export type CssError = Error & { deps?: string[]; dirs?: string[]; restarted?: boolean }
 /** Where requests run: the node worker in the container; in-process in tests. */
 export interface CssBackend {
   process(req: CssRequest): Promise<CssResult>
@@ -93,6 +96,7 @@ export class CssPipeline {
   /** Bumped whenever a scanner gains candidates (a build that read the old ones is stale). */
   revision = 0
   private plugins: boolean
+  private released = false
 
   constructor(
     private c: Pick<Container, 'vfs' | 'cssWorker'> & { cssPlugins?: boolean },
@@ -118,6 +122,7 @@ export class CssPipeline {
 
   /** Free this pipeline's worker-side state. */
   release(): void {
+    this.released = true
     this.c.cssWorker().release?.(this.session)
   }
 
@@ -138,24 +143,38 @@ export class CssPipeline {
     let known = this.rules.get(file)
     if (known && known.css !== css) known = undefined
     let r!: CssResult
-    for (let attempt = 0; attempt < 4; attempt++) {
+    for (let attempt = 0, restarts = 0; attempt < 4; attempt++) {
       // the stylesheet's source rules come first (a discovery request when they aren't known for this text), so its
       // first build already has the candidates of exactly its sources
+      if (restarts && !this.needs(css)) return { css, deps: [], dirs: [], scanner: null } // the new mode doesn't process it
       const scanner = this.mode.tailwind && known?.key != null ? this.scannerFor(known.key, known.rules) : null
       const discover = this.mode.tailwind && !known
-      r = await this.c.cssWorker().process({
-        root: this.root,
-        file,
-        css,
-        candidates: scanner ? await scanner.all() : [],
-        candidateSet: scanner ? `${this.session}:${scanner.id}` : undefined,
-        session: this.session,
-        discover,
-        postcssConfig: this.mode.postcssConfig,
-        env: this.env,
-        tailwind: this.mode.tailwind,
-        plugins: this.plugins,
-      })
+      const candidates = scanner ? await scanner.all() : []
+      // closed meanwhile (dev server closed, build done): nothing may recreate its worker-side state
+      if (this.released) throw new Error('CSS pipeline closed')
+      try {
+        r = await this.c.cssWorker().process({
+          root: this.root,
+          file,
+          css,
+          candidates,
+          candidateSet: scanner ? `${this.session}:${scanner.id}` : undefined,
+          session: this.session,
+          discover,
+          postcssConfig: this.mode.postcssConfig,
+          env: this.env,
+          tailwind: this.mode.tailwind,
+          plugins: this.plugins,
+        })
+      } catch (e) {
+        // cut off by a reset: again with the mode (config path) and rules as they are now
+        if (!(e as CssError).restarted || this.released || ++restarts > 3) throw e
+        known = this.rules.get(file)
+        if (known && known.css !== css) known = undefined
+        attempt--
+        continue
+      }
+      if (this.released) throw new Error('CSS pipeline closed')
       const key = r.tailwind.length ? rulesKey(r.tailwind) : null
       const done = discover ? key === null : key === (known?.key ?? null) || !this.mode.tailwind
       this.rules.set(file, (known = { css, key, rules: r.tailwind }))
@@ -209,8 +228,9 @@ function containerSpawn(c: Container): CssWorkerSpawn {
 }
 
 /**
- * The container's CSS worker: one `node` process, started on first use, JSON lines over stdin/stdout. Each request
- * has a timeout (the worker is recycled); requests a restart supersedes are retried once on the new worker; candidate
+ * The container's CSS worker: one `node` process, started on first use, JSON lines over stdin/stdout. It handles
+ * requests in order; the one it is on has a timeout (the worker is recycled, the others are retried once on a new
+ * one). A restart rejects pending requests as `restarted` (the pipeline sends them again with its new mode). Candidate
  * sets go over as deltas (per worker instance: a new worker gets the whole set).
  */
 export function nodeCssBackend(c: Container, o: { timeoutMs?: number; spawn?: CssWorkerSpawn } = {}): CssBackend & { close(): void } {
@@ -244,6 +264,7 @@ export function nodeCssBackend(c: Container, o: { timeoutMs?: number; spawn?: Cs
           if (!job) continue
           me.pending.delete(m.id)
           clearTimeout(job.timer)
+          arm(me)
           if (m.ok) job.resolve(m)
           else job.reject(Object.assign(new Error(m.error), { deps: m.deps ?? [], dirs: m.dirs ?? [] }))
         }
@@ -273,33 +294,42 @@ export function nodeCssBackend(c: Container, o: { timeoutMs?: number; spawn?: Cs
       else candidates = candidates.slice(from)
       me.sent.set(set, job.req.candidates.length)
     }
+    me.w.write(JSON.stringify({ id, ...job.req, candidates, candidatesReset: reset || undefined }) + '\n')
+    arm(me)
+  }
+
+  /** The worker handles requests in order: the timeout runs for the one it is on (the oldest pending), not the queue. */
+  const arm = (me: Proc) => {
+    const first = me.pending.entries().next()
+    if (first.done || first.value[1].timer) return
+    const [id, job] = first.value
     job.timer = setTimeout(() => {
       if (me.pending.get(id) !== job) return
       me.pending.delete(id)
       job.reject(new Error(`CSS worker timed out after ${Math.round(timeoutMs / 1000)}s processing ${job.req.file} (a PostCSS plugin or Tailwind plugin/config that never finishes?); the worker was restarted`))
-      recycle(me)
+      recycle(me, 'retry')
     }, timeoutMs)
-    me.w.write(JSON.stringify({ id, ...job.req, candidates, candidatesReset: reset || undefined }) + '\n')
   }
 
-  /** Stop a worker; its other requests are retried once on a new one (a request already retried fails). */
-  const recycle = (me: Proc, retry = true) => {
+  /** Stop a worker. Its pending requests: retried once on a new one (a timeout), or rejected (a restart, close). */
+  const recycle = (me: Proc, then: 'retry' | 'restarted' | 'closed') => {
     if (proc === me) proc = null
     me.w.kill()
     const jobs = [...me.pending.values()]
     me.pending.clear()
     for (const j of jobs) {
       clearTimeout(j.timer)
-      if (retry && !j.retried && !closed) {
+      j.timer = undefined
+      if (then === 'retry' && !j.retried && !closed) {
         j.retried = true
         send(j)
-      } else j.reject(new Error('CSS worker restarted'))
+      } else j.reject(Object.assign(new Error('CSS worker restarted'), { restarted: then === 'restarted' }))
     }
   }
 
   return {
     process: (req) => new Promise<CssResult>((resolve, reject) => send({ req, resolve, reject, retried: false })),
-    restart: () => void (proc && recycle(proc)),
+    restart: () => void (proc && recycle(proc, 'restarted')),
     release(session) {
       if (!proc) return
       for (const k of proc.sent.keys()) if (k.startsWith(session + ':')) proc.sent.delete(k)
@@ -307,7 +337,7 @@ export function nodeCssBackend(c: Container, o: { timeoutMs?: number; spawn?: Cs
     },
     close() {
       closed = true
-      if (proc) recycle(proc, false)
+      if (proc) recycle(proc, 'closed')
     },
   }
 }

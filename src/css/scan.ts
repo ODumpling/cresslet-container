@@ -71,9 +71,20 @@ export function globToRegExp(glob: string): RegExp {
   return new RegExp('^' + re + '$')
 }
 
+/** No trailing slash (`source("./src/")`): scope prefixes are matched as `dir + '/'`. */
+const trimDir = (p: string) => p.replace(/(?<=.)\/+$/, '')
+/** isFile/isDir that treat errors (a symlink loop: ELOOP) as neither. */
+const kind = (vfs: VFS, p: string): 'file' | 'dir' | null => {
+  try {
+    return vfs.isFile(p) ? 'file' : vfs.isDir(p) ? 'dir' : null
+  } catch {
+    return null
+  }
+}
+
 /** Glob-free leading directory of `base/pattern`, plus a matcher (null: everything under it). */
 function compileSource(base: string, pattern: string): { dir: string; match: RegExp | null } {
-  const abs = normalize(pattern.startsWith('/') ? pattern : join(base, pattern))
+  const abs = trimDir(normalize(pattern.startsWith('/') ? pattern : join(base, pattern)))
   const segs = abs.split('/')
   const k = segs.findIndex((s) => /[*?{]/.test(s))
   if (k < 0) return { dir: abs, match: null }
@@ -99,10 +110,7 @@ export class CandidateScanner {
   private excludes: RegExp[] = []
   private files = new Map<string, Set<string>>()
   readonly candidates = new Set<string>()
-  /** Bumped when a changed file brings new candidates after the scan (a build that read the old set is stale). */
-  revision = 0
   private scan: Promise<void> | null = null
-  private done = false
 
   constructor(
     private vfs: VFS,
@@ -116,7 +124,7 @@ export class CandidateScanner {
     for (const r of rules) {
       if (r.root === null) scope({ dir: this.root, match: null, auto: true }, 'auto:' + this.root)
       else if (r.root !== 'none') {
-        const dir = normalize(join(r.root.base, r.root.pattern))
+        const dir = trimDir(normalize(join(r.root.base, r.root.pattern)))
         scope({ dir, match: null, auto: true }, 'auto:' + dir)
       }
       for (const s of r.sources) {
@@ -146,9 +154,7 @@ export class CandidateScanner {
       this.files.delete(file)
       return false
     }
-    const grew = this.extract(file, text)
-    if (grew && this.done) this.revision++
-    return grew
+    return this.extract(file, text)
   }
 
   private read(file: string): string | null {
@@ -195,8 +201,9 @@ export class CandidateScanner {
       // the same tree) or above the scope is not followed
       const seen = new Set<string>()
       const stack: { path: string; real: string; top: boolean }[] = []
-      if (this.vfs.isFile(s.dir)) this.visitFile(s, s.dir)
-      else if (this.vfs.isDir(s.dir)) stack.push({ path: s.dir, real: scopeReal, top: true })
+      const k = kind(this.vfs, s.dir)
+      if (k === 'file') this.visitFile(s, s.dir)
+      else if (k === 'dir') stack.push({ path: s.dir, real: scopeReal, top: true })
       while (stack.length) {
         const d = stack.pop()!
         if (seen.has(d.real)) continue
@@ -211,9 +218,9 @@ export class CandidateScanner {
           const p = d.path === '/' ? '/' + e.name : d.path + '/' + e.name
           let dir = e.isDirectory()
           if (e.isSymbolicLink()) {
-            if (this.vfs.isFile(p)) dir = false
-            else if (this.vfs.isDir(p)) dir = true
-            else continue // dangling
+            const k = kind(this.vfs, p)
+            if (!k) continue // dangling, or a loop
+            dir = k === 'dir'
           }
           if (dir) {
             if (s.auto && (SKIP_ANY_DIRS.has(e.name) || e.name.startsWith('.') || (d.top && SKIP_ROOT_DIRS.has(e.name)))) continue
@@ -235,7 +242,6 @@ export class CandidateScanner {
         }
       }
     }
-    this.done = true
   }
 
   private visitFile(s: Scope, p: string): void {

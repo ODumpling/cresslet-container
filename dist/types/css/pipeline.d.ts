@@ -35,10 +35,14 @@ export interface CssResult {
     tailwind: SourceRules;
     warnings: string[];
 }
-/** A failed request: what the compile had read (or tried to) before it failed, so changing/creating those retries it. */
+/**
+ * A failed request: what the compile had read (or tried to) before it failed, so changing/creating those retries it.
+ * `restarted`: a restart (config/plugins changed) cut it off; the caller sends it again with its current mode.
+ */
 export type CssError = Error & {
     deps?: string[];
     dirs?: string[];
+    restarted?: boolean;
 };
 /** Where requests run: the node worker in the container; in-process in tests. */
 export interface CssBackend {
@@ -74,6 +78,7 @@ export declare class CssPipeline {
     /** Bumped whenever a scanner gains candidates (a build that read the old ones is stale). */
     revision: number;
     private plugins;
+    private released;
     constructor(c: Pick<Container, 'vfs' | 'cssWorker'> & {
         cssPlugins?: boolean;
     }, root: string, env: CssRequest['env']);
@@ -99,8 +104,9 @@ export type CssWorkerSpawn = (io: {
     stderr(s: string): void;
 }) => CssWorkerProcess;
 /**
- * The container's CSS worker: one `node` process, started on first use, JSON lines over stdin/stdout. Each request
- * has a timeout (the worker is recycled); requests a restart supersedes are retried once on the new worker; candidate
+ * The container's CSS worker: one `node` process, started on first use, JSON lines over stdin/stdout. It handles
+ * requests in order; the one it is on has a timeout (the worker is recycled, the others are retried once on a new
+ * one). A restart rejects pending requests as `restarted` (the pipeline sends them again with its new mode). Candidate
  * sets go over as deltas (per worker instance: a new worker gets the whole set).
  */
 export declare function nodeCssBackend(c: Container, o?: {
