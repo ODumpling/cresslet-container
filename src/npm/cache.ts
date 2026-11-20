@@ -1,6 +1,8 @@
 // Persistent npm cache (IndexedDB): tarballs keyed by integrity (else URL), packuments keyed by registry|name with
 // a fetch timestamp. Every operation degrades to a miss / no-op when IndexedDB is unavailable or failing
 // (private mode, blocked storage, quota), so installs never fail because of the cache.
+// Size cap: a `meta` store records each entry's size and last use (write or read hit) plus a running total; a write
+// that takes the total over `maxBytes` evicts least-recently-used entries (either store) in the same transaction.
 
 export interface PackageCache {
   get<T = unknown>(store: CacheStore, key: string): Promise<T | undefined>
@@ -11,7 +13,16 @@ export interface PackageCache {
 export type CacheStore = 'tarballs' | 'packuments'
 
 const DB_NAME = 'cresslet-npm'
+/** v2 adds the `meta` store (sizes + last use for LRU eviction). */
+const DB_VERSION = 2
 const STORES: CacheStore[] = ['tarballs', 'packuments']
+const META = 'meta'
+/** `meta` record holding the summed size of all entries. Entry ids are `store:key`, so it can't collide. */
+const TOTAL = '#total'
+/** Default cap on the cache's (approximate) total size. */
+export const DEFAULT_MAX_BYTES = 256 * 1024 * 1024
+/** Read hits refresh their entry's last use in one batched write this long after the first of them. */
+export const TOUCH_DELAY = 500
 const OPEN_TIMEOUT = 3000
 /** Bound for one IndexedDB transaction (and for flushing pending writes): past it a get is a miss, a put/delete a no-op. */
 export const OP_TIMEOUT = 2000
@@ -30,8 +41,46 @@ export class MemoryCache implements PackageCache {
   }
 }
 
+interface MetaEntry {
+  id: string
+  store: CacheStore
+  key: string
+  size: number
+  used: number
+}
+interface MetaTotal {
+  id: typeof TOTAL
+  bytes: number
+}
+
+const metaId = (store: CacheStore, key: string) => `${store}:${key}`
+
+/** Approximate stored size of a value: bytes for binary data, else its JSON length. */
+export function sizeOf(value: unknown): number {
+  if (ArrayBuffer.isView(value)) return value.byteLength
+  if (value instanceof ArrayBuffer) return value.byteLength
+  try {
+    return JSON.stringify(value)?.length ?? 0
+  } catch {
+    return 0
+  }
+}
+
+export interface IdbCacheOptions {
+  /** Cap on the cache's total size; least-recently-used entries are evicted past it. Default DEFAULT_MAX_BYTES. */
+  maxBytes?: number
+}
+
 export class IdbCache implements PackageCache {
+  readonly maxBytes: number
   private db: Promise<IDBDatabase | null> | null = null
+  /** Read hits not yet written back: meta id → time of the hit. */
+  private touched = new Map<string, number>()
+  private touchTimer: ReturnType<typeof setTimeout> | null = null
+
+  constructor(opts: IdbCacheOptions = {}) {
+    this.maxBytes = checkMaxBytes(opts.maxBytes ?? DEFAULT_MAX_BYTES)
+  }
 
   private open(): Promise<IDBDatabase | null> {
     if (this.db) return this.db
@@ -48,9 +97,15 @@ export class IdbCache implements PackageCache {
       const drop = () => void (this.db === p && (this.db = null)) // reopen on next use
       try {
         if (typeof indexedDB === 'undefined') return done(null)
-        const req = indexedDB.open(DB_NAME, 1)
-        req.onupgradeneeded = () => {
-          for (const s of STORES) if (!req.result.objectStoreNames.contains(s)) req.result.createObjectStore(s)
+        const req = indexedDB.open(DB_NAME, DB_VERSION)
+        req.onupgradeneeded = (e) => {
+          const db = req.result
+          for (const s of STORES) {
+            if (!db.objectStoreNames.contains(s)) db.createObjectStore(s)
+            // v1 entries have no size / last-use record, so eviction could never see them: start over
+            else if (e.oldVersion < 2) req.transaction!.objectStore(s).clear()
+          }
+          if (!db.objectStoreNames.contains(META)) db.createObjectStore(META, { keyPath: 'id' }).createIndex('used', 'used')
         }
         req.onsuccess = () => {
           const db = req.result
@@ -72,7 +127,8 @@ export class IdbCache implements PackageCache {
     return p
   }
 
-  private async tx<T>(store: CacheStore, mode: IDBTransactionMode, fn: (s: IDBObjectStore) => IDBRequest): Promise<T | undefined> {
+  /** Runs `fn` in one transaction; resolves to its result getter's value once committed, or undefined on failure / timeout. */
+  private async tx<T>(stores: string[], mode: IDBTransactionMode, fn: (t: IDBTransaction) => () => T): Promise<T | undefined> {
     const db = await this.open()
     if (!db) return undefined
     return new Promise<T | undefined>((resolve) => {
@@ -86,9 +142,9 @@ export class IdbCache implements PackageCache {
         } catch {}
       }, OP_TIMEOUT)
       try {
-        t = db.transaction(store, mode)
-        const req = fn(t.objectStore(store))
-        t.oncomplete = () => done(req.result as T)
+        t = db.transaction(stores, mode)
+        const result = fn(t)
+        t.oncomplete = () => done(result())
         t.onerror = t.onabort = () => done(undefined)
       } catch {
         done(undefined)
@@ -96,15 +152,98 @@ export class IdbCache implements PackageCache {
     })
   }
 
-  get<T>(store: CacheStore, key: string) {
-    return this.tx<T>(store, 'readonly', (s) => s.get(key))
+  async get<T>(store: CacheStore, key: string): Promise<T | undefined> {
+    const v = await this.tx<T>([store], 'readonly', (t) => {
+      const req = t.objectStore(store).get(key)
+      return () => req.result as T
+    })
+    if (v !== undefined) this.touch(metaId(store, key))
+    return v
   }
-  async put(store: CacheStore, key: string, value: unknown) {
-    await this.tx(store, 'readwrite', (s) => s.put(value, key))
+
+  async put(store: CacheStore, key: string, value: unknown): Promise<void> {
+    const size = sizeOf(value)
+    if (!(size <= this.maxBytes)) return void (await this.delete(store, key)) // could never fit; drop any older copy
+    const id = metaId(store, key)
+    await this.tx([...STORES, META], 'readwrite', (t) => {
+      const meta = t.objectStore(META)
+      // requests run in order: `old` is read before the new record replaces it
+      const old = meta.get(id)
+      t.objectStore(store).put(value, key)
+      meta.put({ id, store, key, size, used: Date.now() } satisfies MetaEntry)
+      const total = meta.get(TOTAL)
+      total.onsuccess = () => {
+        let bytes = Math.max(0, ((total.result as MetaTotal | undefined)?.bytes ?? 0) - ((old.result as MetaEntry | undefined)?.size ?? 0)) + size
+        const save = () => meta.put({ id: TOTAL, bytes } satisfies MetaTotal)
+        if (bytes <= this.maxBytes) return save()
+        const cur = meta.index('used').openCursor() // oldest first
+        cur.onsuccess = () => {
+          const c = cur.result
+          // ran out of other entries: only the new one is left (also repairs a total that drifted high)
+          if (!c) return (bytes = size), save()
+          const e = c.value as MetaEntry
+          if (e.id !== id) {
+            t.objectStore(e.store).delete(e.key)
+            c.delete()
+            bytes -= e.size
+          }
+          if (bytes <= this.maxBytes) return save()
+          c.continue()
+        }
+      }
+      return () => undefined
+    })
   }
-  async delete(store: CacheStore, key: string) {
-    await this.tx(store, 'readwrite', (s) => s.delete(key))
+
+  async delete(store: CacheStore, key: string): Promise<void> {
+    const id = metaId(store, key)
+    this.touched.delete(id)
+    await this.tx([store, META], 'readwrite', (t) => {
+      const meta = t.objectStore(META)
+      t.objectStore(store).delete(key)
+      const old = meta.get(id)
+      const total = meta.get(TOTAL)
+      total.onsuccess = () => {
+        const size = (old.result as MetaEntry | undefined)?.size
+        if (size === undefined) return
+        meta.delete(id)
+        meta.put({ id: TOTAL, bytes: Math.max(0, ((total.result as MetaTotal | undefined)?.bytes ?? 0) - size) } satisfies MetaTotal)
+      }
+      return () => undefined
+    })
   }
+
+  /** Records a read hit as a use; hits are written back in batches so reads stay read-only transactions. */
+  private touch(id: string): void {
+    this.touched.set(id, Date.now())
+    this.touchTimer ??= setTimeout(() => void this.flushTouches(), TOUCH_DELAY)
+  }
+
+  /** Writes pending read hits' last-use times (entries evicted or deleted meanwhile are skipped). */
+  async flushTouches(): Promise<void> {
+    if (this.touchTimer) clearTimeout(this.touchTimer)
+    this.touchTimer = null
+    if (!this.touched.size) return
+    const hits = [...this.touched]
+    this.touched.clear()
+    await this.tx([META], 'readwrite', (t) => {
+      const meta = t.objectStore(META)
+      for (const [id, used] of hits) {
+        const req = meta.get(id)
+        req.onsuccess = () => {
+          const e = req.result as MetaEntry | undefined
+          if (e && e.used < used) meta.put({ ...e, used })
+        }
+      }
+      return () => undefined
+    })
+  }
+}
+
+/** A cap must be a positive number of bytes (`Infinity` for none). */
+export function checkMaxBytes(n: unknown): number {
+  if (typeof n !== 'number' || !(n > 0)) throw new TypeError(`npm cache maxBytes must be a positive number, got ${JSON.stringify(n) ?? String(n)}`)
+  return n
 }
 
 const ALGOS = { sha512: 'SHA-512', sha384: 'SHA-384', sha256: 'SHA-256', sha1: 'SHA-1' } as const
@@ -142,6 +281,10 @@ export function tarballKey(url: string, integrity?: string): string {
   return canVerify(d) && d.algo !== 'sha1' ? d.token : url
 }
 
-let shared: IdbCache | null = null
-/** One IndexedDB connection per page, shared by all containers. */
-export const sharedIdbCache = (): IdbCache => (shared ??= new IdbCache())
+const shared = new Map<number, IdbCache>()
+/** One IndexedDB connection per page and cap, shared by all containers using that cap. */
+export function sharedIdbCache(maxBytes = DEFAULT_MAX_BYTES): IdbCache {
+  let c = shared.get(maxBytes)
+  if (!c) shared.set(maxBytes, (c = new IdbCache({ maxBytes })))
+  return c
+}

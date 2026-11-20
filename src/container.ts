@@ -6,7 +6,7 @@ import { createProcess, EMPTY_STDIN, type Command, type CommandContext, type Con
 import { builtins } from './shell/builtins'
 import { COMMANDS } from './commands'
 import { dropLegacyCache, HttpRegistry, type Registry } from './npm/registry'
-import { sharedIdbCache } from './npm/cache'
+import { checkMaxBytes, DEFAULT_MAX_BYTES, sharedIdbCache } from './npm/cache'
 import { clearPackageCache, isBare, type ResolveFs } from './resolve'
 import { bundleVfs, DEFAULT_WASM_URL, type BuildOptions as EsbuildOptions, type OutputFile } from './esbuild'
 import { createDevServer, type DevServerHandle, type DevServerOptions } from './dev/server'
@@ -25,8 +25,12 @@ export interface BootOptions {
   registry?: string
   /** Project directory. Default '/home/project'. */
   workdir?: string
-  /** Persist npm tarballs + packuments in IndexedDB across reloads. Default true; silently off if IndexedDB is unavailable. */
-  npmCache?: boolean
+  /**
+   * Persist npm tarballs + packuments in IndexedDB across reloads. Default true; silently off if IndexedDB is unavailable.
+   * `{ maxBytes }` caps its total size (default 256 MiB, `Infinity` for no cap): past it, least-recently-used entries
+   * are evicted.
+   */
+  npmCache?: boolean | { maxBytes?: number }
   /**
    * Serve previews from this origin (e.g. 'https://preview.example.com') instead of the host page's, so preview code
    * can't read the host's storage. The container frames `${previewOrigin}/cresslet-relay.html`, which registers
@@ -116,7 +120,9 @@ export class Container {
 
   private constructor(opts: BootOptions) {
     this.workdir = normalize(opts.workdir ?? '/home/project')
-    this.registry = new HttpRegistry(opts.registry ?? 'https://registry.npmjs.org', { cache: opts.npmCache === false ? null : sharedIdbCache() })
+    const npmCache = opts.npmCache ?? true
+    const cache = npmCache === false ? null : sharedIdbCache(npmCache === true ? DEFAULT_MAX_BYTES : checkMaxBytes(npmCache.maxBytes ?? DEFAULT_MAX_BYTES))
+    this.registry = new HttpRegistry(opts.registry ?? 'https://registry.npmjs.org', { cache })
     dropLegacyCache()
     this.esbuildWasmUrl = opts.esbuildWasmUrl ?? DEFAULT_WASM_URL
     this.cssPlugins = opts.cssPlugins !== false
