@@ -293,6 +293,20 @@ export function persistKey(key: unknown = DEFAULT_KEY): string {
 }
 
 // ---------------- scheduler ----------------
+/** Instances with a store, until teardown has released it (its last save may still be queued). */
+const live = new Set<VfsPersistence>()
+
+/**
+ * `Container.clearPersisted(key)`: through the containers on this page using `key`, so the delete runs after a save
+ * they still have queued (e.g. right after teardown) instead of being undone by it.
+ */
+export async function clearPersisted(key: string): Promise<void> {
+  const users = [...live].filter((p) => p.key === key)
+  if (!users.length) return clearSnapshot(key)
+  // all at once: each drops its pending changes now, and deletes after what it has queued
+  await Promise.all(users.map((p) => p.clear()))
+}
+
 export class VfsPersistence implements Persistence {
   readonly key: string
   backend: 'opfs' | 'indexeddb' | null = null
@@ -338,6 +352,7 @@ export class VfsPersistence implements Persistence {
     this.store = await this.getStore()
     this.backend = this.store?.backend ?? null
     if (!this.store || this.closed) return
+    live.add(this)
     const other = await this.getOther(this.store.backend).catch(() => null)
     try {
       // the other backend may hold a copy saved while this one wasn't usable (OPFS before a browser update, or
@@ -486,6 +501,7 @@ export class VfsPersistence implements Persistence {
         if (q !== this.queue) return closeWhenIdle()
         this.store?.close()
         this.store = null
+        live.delete(this)
       })
     }
     closeWhenIdle()

@@ -51,6 +51,11 @@ export declare function otherStore(inUse: SnapshotStore['backend']): Promise<Sna
  */
 export declare function clearSnapshot(key: string, inUse?: SnapshotStore | null): Promise<void>;
 export declare function persistKey(key?: unknown): string;
+/**
+ * `Container.clearPersisted(key)`: through the containers on this page using `key`, so the delete runs after a save
+ * they still have queued (e.g. right after teardown) instead of being undone by it.
+ */
+export declare function clearPersisted(key: string): Promise<void>;
 export declare class VfsPersistence implements Persistence {
     private readonly vfs;
     /** Reports a snapshot that failed to store outside `flush()` (debounced and page-hide writes). */

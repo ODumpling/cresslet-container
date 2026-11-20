@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { IDBFactory } from 'fake-indexeddb'
 import { VFS } from '../src/vfs'
-import { encodeSnapshot, idbStore, restoreSnapshot, VfsPersistence, type SnapshotStore } from '../src/persist'
+import { clearPersisted, encodeSnapshot, idbStore, restoreSnapshot, VfsPersistence, type SnapshotStore } from '../src/persist'
 
 const W = '/home/project'
 
@@ -110,13 +110,18 @@ describe('snapshot codec', () => {
 })
 
 describe('VfsPersistence', () => {
-  afterEach(() => vi.useRealTimers())
+  const started: VfsPersistence[] = []
+  afterEach(() => {
+    vi.useRealTimers()
+    for (const p of started.splice(0)) p.close() // unregisters them (clearPersisted goes through live instances)
+  })
 
   async function setup(opts = {}, store: SnapshotStore = new MemoryStore(), other: SnapshotStore | null = new MemoryStore('indexeddb'), dir = W) {
     const fs = new VFS()
     fs.mkdir(W, { recursive: true })
     const errors: string[] = []
     const p = new VfsPersistence(fs, dir, opts, (m) => errors.push(m), async () => store, async () => other)
+    started.push(p)
     await p.start()
     return { fs, p, store, errors }
   }
@@ -458,6 +463,23 @@ describe('VfsPersistence', () => {
     } finally {
       vi.unstubAllGlobals()
     }
+  })
+
+  it('the static clear waits for a save still queued at teardown', async () => {
+    const store = new MemoryStore()
+    const { fs, p } = await setup({ debounceMs: 60_000 }, store)
+    const gate = deferred()
+    store.gate = gate.p
+    fs.writeFile(`${W}/a`, '1')
+    void p.flush().catch(() => {}) // in flight
+    await new Promise((r) => setTimeout(r))
+    fs.writeFile(`${W}/a`, '2') // queued by teardown
+    p.close()
+    const cleared = clearPersisted('default')
+    gate.open()
+    await cleared
+    await new Promise((r) => setTimeout(r, 10))
+    expect(store.data.has('default')).toBe(false)
   })
 
   it('validates options', () => {

@@ -16,7 +16,7 @@ import { basename, dirname, join, normalize, resolve } from './path'
 import { acceptHello, BROADCAST, BROADCAST_CLOSE, newestWorker, PROC_SPAWN, WORKER_SPAWN, RELAY_ERROR, RELAY_INIT, RELAY_READY, relayErrorText, relayUrl, THIRD_PARTY_HINT, toOrigin, WORKER_SCRIPT } from './relay-protocol'
 import { localChannel, relayChannel, relayWorker, type NodeChannel, type ProjectWorker } from './node/channel'
 import { DEFAULT_BROTLI_WASM_URL } from './node/brotli'
-import { clearSnapshot, persistKey, VfsPersistence, type PersistOptions, type Persistence } from './persist'
+import { clearPersisted, persistKey, VfsPersistence, type PersistOptions, type Persistence } from './persist'
 
 const VIRTUAL_BIN_DIRS = new Set(['/usr/local/bin', '/usr/bin', '/bin'])
 
@@ -192,7 +192,7 @@ export class Container {
 
   /** Delete a persisted workdir snapshot (`boot({ persist: { key } })`) without booting a container. */
   static clearPersisted(key?: string): Promise<void> {
-    return clearSnapshot(persistKey(key))
+    return clearPersisted(persistKey(key))
   }
 
   // ---------------- events ----------------
