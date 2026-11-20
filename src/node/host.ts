@@ -259,6 +259,7 @@ export async function runNode(ctx: CommandContext, entry: string, args: string[]
     const onAbort = () => {
       // Ctrl+C, or child_process kill(signal), which aborts with the signal's name as the reason
       const reason: unknown = ctx.signal.reason
+      if (reason === 'SIGKILL') return finish(137) // not catchable
       post({ type: 'signal', name: typeof reason === 'string' && /^SIG[A-Z0-9]+$/.test(reason) ? reason : 'SIGINT' })
       // give the process a moment to clean up, then hard-kill
       setTimeout(() => finish(130), 150)

@@ -7,7 +7,7 @@ import { EventEmitter } from 'events'
 import { Readable, Writable } from 'readable-stream'
 import { StringDecoder } from 'string_decoder'
 import { resolve as resolvePath } from '../../path'
-import { nativeSetTimeout, post, ref, syncCall } from '../rpc'
+import { nativeClearTimeout, nativeSetTimeout, post, ref, syncCall } from '../rpc'
 import type { ChildEvent, ChildSpec, ChildStdio, ChildSyncResult } from '../protocol'
 import { unsupportedFn } from './misc'
 
@@ -77,6 +77,7 @@ function normArgs(a: unknown[]): { args: unknown[]; opts: Options; cb?: (...r: u
 }
 
 const SIGNALS: Record<number, string> = { 1: 'SIGHUP', 2: 'SIGINT', 9: 'SIGKILL', 15: 'SIGTERM' }
+const sigName = (s: unknown) => (typeof s === 'number' ? (SIGNALS[s] ?? 'SIGTERM') : typeof s === 'string' && s ? s : 'SIGTERM')
 const children = new Map<number, ChildProcess>()
 let nextId = 0
 
@@ -134,7 +135,8 @@ export class ChildProcess extends EventEmitter {
 
   kill(signal: string | number = 'SIGTERM'): boolean {
     if (this.ended || this.exitCode !== null || this.signalCode !== null) return false
-    post({ type: 'child-kill', id: this.id, signal: typeof signal === 'number' ? (SIGNALS[signal] ?? 'SIGTERM') : String(signal) })
+    if (signal === 0) return true // only checks that it's alive
+    post({ type: 'child-kill', id: this.id, signal: sigName(signal) })
     this.killed = true
     return true
   }
@@ -175,17 +177,23 @@ export class ChildProcess extends EventEmitter {
     }
   }
 
-  /** End stdio, then 'close' once stdout and stderr have ended (as in Node, output nobody reads is discarded). */
+  /**
+   * End stdio, then 'close' once flowing or piped stdout/stderr have delivered their output. As in Node, output nobody
+   * reads is discarded, and a stream paused by its reader doesn't hold 'close' back.
+   */
   private close(code: number | null, signal: string | null): void {
     this.ended = true
     children.delete(this.id)
     this.stdin?.destroy()
     const outs = [this.stdout, this.stderr].filter((s): s is Readable => !!s)
-    const ended = outs.map((s) => new Promise<void>((r) => (s.readableEnded || s.destroyed ? r() : (s.once('end', r), s.once('close', r)))))
     for (const s of outs) {
       s.push(null)
       if (s.readableFlowing === null) s.resume()
     }
+    const piped = (s: Readable) => (s._readableState?.pipes?.length ?? 0) > 0
+    const ended = outs
+      .filter((s) => s.readableFlowing || piped(s))
+      .map((s) => new Promise<void>((r) => (s.readableEnded || s.destroyed ? r() : (s.once('end', r), s.once('close', r)))))
     Promise.all(ended).then(() =>
       nativeSetTimeout(() => {
         this.emit('close', code, signal)
@@ -209,10 +217,10 @@ function start(file: unknown, args: unknown[], opts: Options): ChildProcess {
   if (streams[0]) (streams[0] as unknown as Readable).pipe(cp.stdin!)
   if (streams[1]) cp.stdout!.pipe(streams[1] as unknown as Writable)
   if (streams[2]) cp.stderr!.pipe(streams[2] as unknown as Writable)
-  const killSignal = typeof opts.killSignal === 'string' ? opts.killSignal : 'SIGTERM'
+  const killSignal = sigName(opts.killSignal)
   if (typeof opts.timeout === 'number' && opts.timeout > 0) {
     const t = nativeSetTimeout(() => cp.kill(killSignal), opts.timeout)
-    cp.once('close', () => clearTimeout(t))
+    cp.once('close', () => nativeClearTimeout(t))
   }
   const signal = opts.signal
   if (signal) {

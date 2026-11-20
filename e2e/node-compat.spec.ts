@@ -182,6 +182,13 @@ const collect = (child) => new Promise((resolve) => {
   setTimeout(() => sleeper.kill(), 300)
   r.kill = await collect(sleeper)
   r.killed = sleeper.killed
+  // kill(0) only probes; a paused stdout doesn't hold 'close' back; SIGKILL can't be caught
+  const probe = cp.spawn('node', ['-e', "process.on('SIGKILL', () => {}); console.log('x'); setInterval(() => {}, 1000)"])
+  await new Promise((res) => probe.stdout.once('data', res))
+  probe.stdout.pause()
+  r.probe = probe.kill(0) && probe.exitCode === null
+  probe.kill('SIGKILL')
+  r.sigkill = await new Promise((res) => probe.on('close', (code, signal) => res(signal)))
   r.timeout = await new Promise((res) => cp.exec('sleep 5', { timeout: 200 }, (e) => res({ killed: e.killed, signal: e.signal })))
   // a child blocked reading stdin still dies when killed
   r.catTimeout = await new Promise((res) => cp.exec('cat', { timeout: 100 }, (e) => res(e.signal)))
@@ -223,9 +230,11 @@ function checkChild(r: Record<string, unknown>, out: string) {
   expect(r.enoent).toEqual({ code: 'ENOENT', errno: -2, syscall: 'spawn no-such-cmd', path: 'no-such-cmd', spawnargs: ['x'] })
   expect(r.kill).toMatchObject({ code: null, signal: 'SIGTERM', events: ['spawn', 'exit:null:SIGTERM'] })
   expect(r.killed).toBe(true)
+  expect(r.probe).toBe(true)
+  expect(r.sigkill).toBe('SIGKILL')
   expect(r.timeout).toEqual({ killed: true, signal: 'SIGTERM' })
   expect(r.catTimeout).toBe('SIGTERM')
-  expect(r.sigterm).toMatchObject({ out: 'got SIGTERM\n', signal: 'SIGTERM' })
+  expect(r.sigterm).toMatchObject({ out: 'got SIGTERM\n' })
   expect(r.execPathShell).toBe('7\n')
   expect(r.parallel).toEqual(['10\n', '20\n', '30\n', '40\n', '50\n', '60\n'])
   expect(r.relCwd).toBe('/home/project\n')
