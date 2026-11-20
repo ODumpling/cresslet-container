@@ -135,4 +135,3 @@ export async function injectStrip(res: Response): Promise<Response> {
   headers.delete('content-length')
   return new Response(body, { status: res.status, statusText: res.statusText, headers })
 }
-
