@@ -3,7 +3,7 @@
 // mapped back to their preview via the requesting client id (remembered per document, persisted in Cache
 // Storage so SW restarts keep working), falling back to the Referer.
 /// <reference lib="webworker" />
-import { isolate, isRelayClient, PREFIX, receiveResponse, RESERVED, XORIGIN_HEADERS } from './sw-lib'
+import { isolate, isRelayClient, isReserved, PREFIX, receiveResponse, XORIGIN_HEADERS } from './sw-lib'
 declare const self: ServiceWorkerGlobalScope
 
 /** Registered by cresslet-relay.html on a separate preview origin: previews are embedded cross-origin by the host. */
@@ -94,7 +94,7 @@ self.addEventListener('message', (e) => {
 self.addEventListener('fetch', (e) => {
   const req = e.request
   const url = new URL(req.url)
-  if (url.origin !== location.origin || RESERVED.has(url.pathname)) return
+  if (url.origin !== location.origin || isReserved(url.pathname, XORIGIN)) return
   const direct = parse(url.pathname)
   if (direct) {
     if (req.mode === 'navigate' && e.resultingClientId) remember(e.resultingClientId, direct)

@@ -17,6 +17,8 @@ export interface SwRequest {
 }
 /** A well-formed `cresslet-request` (checked before anything is dispatched to a port handler). */
 export declare function isSwRequest(d: unknown): d is SwRequest;
+/** Reply to a request that failed validation: 400, then close the reply port (the SW would otherwise wait for its deadline). */
+export declare function rejectRequest(reply: MessagePort): void;
 export declare class PortTable {
     instanceId: string;
     private events;

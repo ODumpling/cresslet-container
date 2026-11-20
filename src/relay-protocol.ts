@@ -95,7 +95,8 @@ interface WorkerLike {
 
 /**
  * The worker to talk to after `register()`: a newer one installing/waiting (skipWaiting + claim make it take over) wins
- * over an older active one; otherwise the active one, or whatever `ready` brings.
+ * over an older active one (which is the fallback if the newer one turns redundant); otherwise the active one, or
+ * whatever `ready` brings.
  */
 export function newestWorker<W extends WorkerLike>(
   reg: { installing: W | null; waiting: W | null; active: W | null },
@@ -106,7 +107,11 @@ export function newestWorker<W extends WorkerLike>(
   return new Promise((resolve, reject) => {
     const check = () => {
       if (w.state === 'activated') resolve(w)
-      else if (w.state === 'redundant') reject(new Error('service worker became redundant'))
+      else if (w.state === 'redundant') {
+        const a = reg.active
+        if (a && a !== w && a.state !== 'redundant') resolve(a)
+        else reject(new Error('service worker became redundant'))
+      }
       else return
       w.removeEventListener('statechange', check)
     }

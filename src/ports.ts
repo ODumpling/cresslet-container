@@ -26,7 +26,7 @@ export interface SwRequest {
   body: ArrayBuffer | null
 }
 
-const METHOD = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,32}$/
+const METHOD = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/
 
 /** A well-formed `cresslet-request` (checked before anything is dispatched to a port handler). */
 export function isSwRequest(d: unknown): d is SwRequest {
@@ -48,6 +48,15 @@ export function isSwRequest(d: unknown): d is SwRequest {
     m.headers.every((h) => Array.isArray(h) && h.length === 2 && typeof h[0] === 'string' && typeof h[1] === 'string') &&
     (m.body === null || m.body === undefined || m.body instanceof ArrayBuffer)
   )
+}
+
+/** Reply to a request that failed validation: 400, then close the reply port (the SW would otherwise wait for its deadline). */
+export function rejectRequest(reply: MessagePort): void {
+  const body = new TextEncoder().encode('Cresslet: malformed preview request')
+  reply.postMessage({ type: 'head', status: 400, statusText: 'Bad Request', headers: [['content-type', 'text/plain']] })
+  reply.postMessage({ type: 'chunk', data: body }, [body.buffer])
+  reply.postMessage({ type: 'end' })
+  reply.close()
 }
 
 export class PortTable {

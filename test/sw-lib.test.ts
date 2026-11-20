@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { isolate, isRelayClient, receiveResponse, RESERVED, XORIGIN_HEADERS } from '../src/sw-lib'
-import { isSwRequest, PortTable, type SwRequest } from '../src/ports'
+import { isolate, isRelayClient, isReserved, receiveResponse, RESERVED, XORIGIN_HEADERS } from '../src/sw-lib'
+import { isSwRequest, PortTable, rejectRequest, type SwRequest } from '../src/ports'
 
 const P = 'https://preview.example.net'
 
@@ -16,6 +16,13 @@ describe('sw: relay clients', () => {
   })
   it('reserves the relay assets for the network', () => {
     expect([...RESERVED].sort()).toEqual(['/cresslet-relay.html', '/cresslet-relay.js', '/cresslet-sw.js'])
+  })
+  it('bypasses the relay assets only on a preview origin (same-origin previews may have files named like them)', () => {
+    for (const p of RESERVED) {
+      expect(isReserved(p, true)).toBe(true)
+      expect(isReserved(p, false)).toBe(false)
+    }
+    expect(isReserved('/src/main.tsx', true)).toBe(false)
   })
 })
 
@@ -85,6 +92,46 @@ describe('sw: receiveResponse', () => {
     ch.port2.close()
   })
 
+  it('205 Reset Content gets a null body', async () => {
+    const ch = new MessageChannel()
+    const closes = closed(ch.port1)
+    const res = receiveResponse(ch.port1, opts())
+    ch.port2.postMessage({ type: 'head', status: 205, statusText: 'Reset Content', headers: [] })
+    ch.port2.postMessage({ type: 'end' })
+    const r = await res
+    expect(r.status).toBe(205)
+    expect(r.body).toBeNull()
+    await new Promise((f) => setTimeout(f, 20))
+    expect(closes()).toBe(1)
+    ch.port2.close()
+  })
+
+  it('a malformed head resolves a 502, cancels and closes the port', async () => {
+    for (const head of [
+      { status: 200, statusText: 'OK', headers: [['bad name', 'x']] },
+      { status: 200, statusText: 'OK', headers: [['a', 'b\r\nc']] },
+      { status: 200, statusText: 'O\r\nK', headers: [] },
+      { status: 200.5, statusText: 'OK', headers: [] },
+      { status: 700, statusText: 'OK', headers: [] },
+      { status: '200', statusText: 'OK', headers: [] },
+    ]) {
+      const ch = new MessageChannel()
+      const closes = closed(ch.port1)
+      const seen: unknown[] = []
+      ch.port2.onmessage = (e) => seen.push(e.data)
+      const res = receiveResponse(ch.port1, opts(5000))
+      ch.port2.postMessage({ type: 'head', ...head })
+      const r = await Promise.race([res, new Promise<'pending'>((f) => setTimeout(() => f('pending'), 200))])
+      expect(r, JSON.stringify(head)).not.toBe('pending')
+      expect((r as Response).status, JSON.stringify(head)).toBe(502)
+      expect((r as Response).headers.get('cross-origin-resource-policy')).toBe('cross-origin')
+      expect(closes(), JSON.stringify(head)).toBe(1)
+      await new Promise((f) => setTimeout(f, 20))
+      expect(seen).toEqual([{ type: 'cancel' }])
+      ch.port2.close()
+    }
+  })
+
   it('cancelling the body tells the page and closes the port', async () => {
     const ch = new MessageChannel()
     const closes = closed(ch.port1)
@@ -106,6 +153,7 @@ describe('ports: isSwRequest', () => {
   it('accepts a well-formed request', () => {
     expect(isSwRequest(req())).toBe(true)
     expect(isSwRequest(req({ method: 'POST', body: new ArrayBuffer(2), headers: [['a', 'b']] }))).toBe(true)
+    expect(isSwRequest(req({ method: 'X'.repeat(64) }))).toBe(true) // no length cap: any token is a valid method
   })
   it('rejects malformed fields', () => {
     for (const bad of [
@@ -126,6 +174,17 @@ describe('ports: isSwRequest', () => {
     ])
       expect(isSwRequest(req(bad as never)), JSON.stringify(bad)).toBe(false)
     expect(isSwRequest(null)).toBe(false)
+  })
+})
+
+describe('ports: rejectRequest', () => {
+  it('answers a 400 head + end and closes the reply port', () => {
+    const sent: { type: string; status?: number }[] = []
+    let closes = 0
+    rejectRequest({ postMessage: (m: { type: string }) => sent.push(m), close: () => void closes++ } as unknown as MessagePort)
+    expect(sent.map((m) => m.type)).toEqual(['head', 'chunk', 'end'])
+    expect(sent[0].status).toBe(400)
+    expect(closes).toBe(1)
   })
 })
 

@@ -53,7 +53,8 @@ interface WorkerLike {
 }
 /**
  * The worker to talk to after `register()`: a newer one installing/waiting (skipWaiting + claim make it take over) wins
- * over an older active one; otherwise the active one, or whatever `ready` brings.
+ * over an older active one (which is the fallback if the newer one turns redundant); otherwise the active one, or
+ * whatever `ready` brings.
  */
 export declare function newestWorker<W extends WorkerLike>(reg: {
     installing: W | null;

@@ -132,7 +132,11 @@ export declare class Container {
     bundle(options: BundleOptions): Promise<BundleResult>;
     /** Create a runtime worker shipped next to this module (dist/node-worker.js). */
     createWorker(_name: 'node-worker.js'): Worker;
-    /** A message the SW posts to the page that owns an instance (directly, or forwarded by the relay). */
+    /**
+     * A message the SW posts to the page that owns an instance (directly, or forwarded by the relay). `exclusive`: the
+     * channel is this container's own (the relay port), so every request on it is ours to answer, if only with a 400;
+     * on the page's shared SW channel, requests for other instance ids belong to other containers in this page.
+     */
     private onSwMessage;
     /**
      * Channel for notifying this container's previews (used by the dev server). A BroadcastChannel on the page's origin,

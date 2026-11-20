@@ -5,6 +5,8 @@ export const PREFIX = '/__cresslet__/'
 export const RELAY_PATH = '/cresslet-relay.html'
 /** Always served by the network, never by a preview: keeps the host's `frame-ancestors` header on the relay. */
 export const RESERVED = new Set([RELAY_PATH, '/cresslet-relay.js', '/cresslet-sw.js'])
+/** Requests the SW leaves to the network: the relay assets, only on a preview origin (same-origin previews may serve files named like them). */
+export const isReserved = (pathname: string, xorigin: boolean): boolean => xorigin && RESERVED.has(pathname)
 /** How long a forwarded request may wait for the owning page's response head. */
 export const HEAD_DEADLINE = 30_000
 
@@ -34,6 +36,9 @@ export function isolate(headers: [string, string][], o: { xorigin: boolean; pref
   if (loc && loc.startsWith('/') && !loc.startsWith('//') && !loc.startsWith(PREFIX)) h.set('location', o.prefix + loc)
   return h
 }
+
+/** Statuses a Response can't have a body for (101/103 are outside the forwarded 200-599 range). */
+const NULL_BODY = new Set([204, 205, 304])
 
 export interface ReceiveOptions {
   method: string
@@ -82,10 +87,18 @@ export function receiveResponse(port: MessagePort, o: ReceiveOptions): Promise<R
       if (m.type === 'head' && !headed) {
         headed = true
         clearTimeout(timer)
-        const status = typeof m.status === 'number' && m.status >= 200 && m.status <= 599 ? m.status : 200
-        const nullBody = status === 204 || status === 304 || o.method === 'HEAD'
-        const raw = Array.isArray(m.headers) ? m.headers : []
-        resolve(new Response(nullBody ? null : stream, { status, statusText: typeof m.statusText === 'string' ? m.statusText : '', headers: o.headers(raw) }))
+        const status = m.status
+        try {
+          if (!Number.isInteger(status) || status < 200 || status > 599) throw new RangeError(`bad status ${status}`)
+          const nullBody = NULL_BODY.has(status) || o.method === 'HEAD'
+          const raw = Array.isArray(m.headers) ? m.headers : []
+          resolve(new Response(nullBody ? null : stream, { status, statusText: typeof m.statusText === 'string' ? m.statusText : '', headers: o.headers(raw) }))
+        } catch {
+          // bad header pair, CR/LF in statusText, bad status...: never leave the request pending
+          port.postMessage({ type: 'cancel' })
+          finish()
+          resolve(plain(502, 'Cresslet preview sent a malformed response head'))
+        }
       } else if (m.type === 'chunk' && headed) {
         try {
           ctrl?.enqueue(new Uint8Array(m.data.buffer ?? m.data))

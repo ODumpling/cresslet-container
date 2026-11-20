@@ -147,6 +147,36 @@ describe('relay: newestWorker', () => {
     next.set('redundant')
     await expect(got).rejects.toThrow(/redundant/)
   })
+  it('falls back to the older active worker when the new one becomes redundant', async () => {
+    const next = new FakeWorker('new', 'installing')
+    const got = newestWorker({ installing: next, waiting: null, active: new FakeWorker('old', 'activated') }, ready)
+    next.set('redundant')
+    expect((await got).name).toBe('old')
+  })
+})
+
+describe('Container.boot() on the host origin', () => {
+  afterEach(() => vi.unstubAllGlobals())
+  it('uses the active worker and does not wait for a newer one stuck in waiting', async () => {
+    const posted: unknown[] = []
+    const active = { state: 'activated', postMessage: (m: unknown) => posted.push(m) }
+    const waiting = Object.assign(new FakeWorker('custom update', 'installed'), { postMessage() {} })
+    const sw = {
+      addEventListener() {},
+      removeEventListener() {},
+      startMessages() {},
+      register: async () => ({ installing: null, waiting, active }),
+      ready: new Promise(() => {}),
+    }
+    vi.stubGlobal('navigator', { serviceWorker: sw })
+    const c = await Promise.race([
+      Container.boot({ serviceWorkerUrl: '/custom-sw.js', npmCache: false }),
+      new Promise<'hung'>((r) => setTimeout(() => r('hung'), 200)),
+    ])
+    expect(c).not.toBe('hung')
+    expect(posted).toEqual([{ type: 'cresslet-register', instanceId: (c as Container).instanceId }])
+    ;(c as Container).teardown()
+  })
 })
 
 describe('Container.boot({ previewOrigin })', () => {
@@ -211,6 +241,28 @@ describe('Container.boot({ previewOrigin })', () => {
     await new Promise((r) => setTimeout(r, 20))
     expect(errors).toEqual([])
     expect(got).toEqual([{ type: 'cresslet-register', instanceId: c.instanceId }])
+    c.teardown()
+    relayPort.close()
+  })
+
+  it('answers malformed (or misaddressed) requests from the relay with a 400 and closes the reply port', async () => {
+    let relayPort!: MessagePort
+    fakePage((port) => {
+      relayPort = port
+      port.postMessage({ type: 'cresslet-relay-ready' })
+    })
+    const c = await Container.boot({ previewOrigin: PREVIEW, npmCache: false })
+    const good = { type: 'cresslet-request', instanceId: c.instanceId, port: 5173, path: '/', method: 'GET', headers: [], body: null }
+    for (const bad of [{ path: 'x' }, { headers: [['a']] }, { port: 0 }, { instanceId: 'someone-else' }, { instanceId: 1 }]) {
+      const ch = new MessageChannel()
+      const got: { type: string; status?: number }[] = []
+      const ended = new Promise<void>((r) => (ch.port1.onmessage = (e) => (got.push(e.data), e.data.type === 'end' && r())))
+      relayPort.postMessage({ ...good, ...bad }, [ch.port2])
+      const res = await Promise.race([ended.then(() => 'ok'), new Promise((r) => setTimeout(() => r('timeout'), 500))])
+      expect(res, JSON.stringify(bad)).toBe('ok')
+      expect(got[0]).toMatchObject({ type: 'head', status: 400 })
+      ch.port1.close()
+    }
     c.teardown()
     relayPort.close()
   })

@@ -1,7 +1,7 @@
 // Container: public entry point. Owns the VFS, port table, command registry and the SW bridge.
 import { VFS, type Dirent, type Stats } from './vfs'
 import { exportTree, globToRegExp, mountTree, type FileSystemTree } from './tree'
-import { isSwRequest, PortTable, type PortHandler } from './ports'
+import { isSwRequest, PortTable, rejectRequest, type PortHandler } from './ports'
 import { createProcess, EMPTY_STDIN, type Command, type CommandContext, type ContainerProcess, type SpawnOptions } from './process'
 import { builtins } from './shell/builtins'
 import { COMMANDS } from './commands'
@@ -321,15 +321,21 @@ export class Container {
   }
 
   // ---------------- service worker bridge ----------------
-  /** A message the SW posts to the page that owns an instance (directly, or forwarded by the relay). */
-  private onSwMessage(m: unknown, ports: readonly MessagePort[]): void {
+  /**
+   * A message the SW posts to the page that owns an instance (directly, or forwarded by the relay). `exclusive`: the
+   * channel is this container's own (the relay port), so every request on it is ours to answer, if only with a 400;
+   * on the page's shared SW channel, requests for other instance ids belong to other containers in this page.
+   */
+  private onSwMessage(m: unknown, ports: readonly MessagePort[], exclusive = false): void {
     if (!m || typeof m !== 'object') return
     const d = m as { type?: unknown; instanceId?: unknown }
     if (d.type === 'cresslet-who' && ports[0]) {
       ports[0].postMessage({ owns: d.instanceId === this.instanceId })
       ports[0].close()
+    } else if (d.type === 'cresslet-request' && ports[0] && (exclusive || d.instanceId === this.instanceId)) {
+      if (isSwRequest(m) && m.instanceId === this.instanceId) void this.ports.answer(m, ports[0])
+      else rejectRequest(ports[0])
     }
-    else if (isSwRequest(m) && m.instanceId === this.instanceId && ports[0]) void this.ports.answer(m, ports[0])
   }
 
   /**
@@ -395,7 +401,7 @@ export class Container {
             if (ready) return
             if (!booted) fail(relayErrorText(m.message))
             else this.emit('error', { message: relayErrorText(m.message) })
-          } else this.onSwMessage(m, e.ports)
+          } else this.onSwMessage(m, e.ports, true)
         }
         frame.contentWindow!.postMessage({ type: RELAY_INIT }, origin, [ch.port2])
       }
@@ -425,7 +431,8 @@ export class Container {
     this.cleanups.push(() => sw.removeEventListener('message', onMessage))
     try {
       const reg = await sw.register(url, { scope: '/' })
-      const active = await newestWorker(reg, () => sw.ready)
+      // the active worker as before: a newer one stuck in waiting (e.g. a custom SW without skipWaiting) must not hang boot
+      const active = reg.active ?? (await newestWorker(reg, () => sw.ready))
       active.postMessage({ type: 'cresslet-register', instanceId: this.instanceId })
       this.cleanups.push(() => active.postMessage({ type: 'cresslet-unregister', instanceId: this.instanceId }))
     } catch (e) {
