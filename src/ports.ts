@@ -148,6 +148,8 @@ export class PortTable {
   }
 
   open(port: number, handler: PortHandler, owner = 'user'): string {
+    // per-preview origins: {port} 0 is the workers' origin, never a preview's (and the SW forwards ports 1-65535 only)
+    if (typeof this.previewOrigin === 'function' && (!Number.isInteger(port) || port < 1 || port > 65535)) throw new RangeError(`port ${port}: previews need a port from 1 to 65535`)
     const existed = this.ports.has(port)
     this.ports.set(port, { handler, owner })
     const u = this.url(port)

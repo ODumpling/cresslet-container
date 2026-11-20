@@ -560,16 +560,50 @@ describe('Container.boot({ previewOrigins })', () => {
     const events: unknown[] = []
     c.on('error', (e) => events.push(e))
     c.on('port', (p, ev) => events.push([p, ev]))
-    c.servePort(0, () => new Response('x'))
-    expect(events).toEqual([{ message: 'port 0: previews need a port from 1 to 65535' }])
+    expect(() => c.servePort(0, () => new Response('x'))).toThrow(RangeError)
+    expect(c.ports.has(0)).toBe(false)
     c.servePort(3000, () => new Response('A')).close()
     c.servePort(3000, () => new Response('A'))
     await tick()
     expect(page.frames).toHaveLength(2) // the workers relay and one for 3000, reused by the reopen
     release()
     await tick()
-    expect(events.slice(1)).toEqual([{ message: 'port 3000: preview relay: nope' }])
+    expect(events).toEqual([{ message: 'port 3000: preview relay: nope' }])
     c.teardown()
+  })
+
+  it('replaces a preview relay that broke after connecting (e.g. reloaded, then its SW failed) on the next open', async () => {
+    const relays: MessagePort[] = []
+    const page = fakePage((origin, port) => {
+      if (origin.includes('-3000.') && relays.push(port) === 2) return // the reload: still setting up
+      port.postMessage({ type: 'cresslet-relay-ready' })
+    })
+    const c = await Container.boot({ previewOrigins: TEMPLATE, npmCache: false })
+    const events: unknown[] = []
+    c.on('error', (e) => events.push(e))
+    c.on('server-ready', (p) => events.push(p))
+    const s = c.servePort(3000, () => new Response('A'))
+    await tick()
+    expect(events).toEqual([3000])
+    s.close()
+    // the relay reloads (hello again) and fails its setup this time
+    const hello = { origin: new URL(page.frames[1].src).origin, source: page.frames[1].contentWindow, data: { type: 'cresslet-relay-hello' } }
+    page.listeners.forEach((fn) => fn(hello))
+    await tick()
+    relays[1].postMessage({ type: 'cresslet-relay-error', message: 'registration failed' })
+    await tick()
+    c.servePort(3000, () => new Response('A'))
+    await tick()
+    expect(events.slice(1)).toEqual([{ message: 'preview relay: registration failed' }, { message: 'port 3000: preview relay: registration failed' }])
+    expect(page.frames[1].removed).toBe(1)
+    c.servePort(3000, () => new Response('A')) // same handler re-registered: no new open
+    c.ports.close(3000)
+    c.servePort(3000, () => new Response('A'))
+    await tick()
+    expect(page.frames).toHaveLength(3) // a new relay for 3000
+    expect(events.at(-1)).toBe(3000)
+    c.teardown()
+    relays.forEach((p) => p.close())
   })
 
   it('torn down mid-setup: asks the relay to drop its service worker and waits for it before removing the frame', async () => {
