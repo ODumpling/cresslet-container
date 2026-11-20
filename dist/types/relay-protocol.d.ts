@@ -9,6 +9,8 @@ export declare const PROC_SPAWN = "cresslet-proc-spawn";
 export declare const WORKER_SPAWN = "cresslet-worker-spawn";
 /** host -> relay: the container is going away; unregister this origin's service worker (per-preview origins only). */
 export declare const RELAY_DISPOSE = "cresslet-relay-dispose";
+/** relay -> host: done with RELAY_DISPOSE (the frame can go). */
+export declare const RELAY_DISPOSED = "cresslet-relay-disposed";
 /** SW -> owning page messages the relay forwards. */
 export declare const SW_TO_PAGE: Set<string>;
 /** Host -> SW messages the relay forwards. */
@@ -22,8 +24,9 @@ export declare function relayUrl(previewOrigin: string, hostOrigin: string, opts
 /** `boot({ previewOrigins })`: the origin for one preview port (`port` 0: where the container's workers run). */
 export declare function expandOriginTemplate(template: string, instanceId: string, port: number): string;
 /**
- * Check a `previewOrigins` template: once `{id}` and `{port}` are filled in, it must be a bare http(s) origin, and both
- * placeholders must change it (so every container and port gets an origin of its own). Returns the error, or null.
+ * Check a `previewOrigins` template: `{id}` and `{port}` once each in the host name, apart (something other than a
+ * letter or digit between them, e.g. `{id}-{port}`, so no two containers or ports share an origin: ids are letters and
+ * digits), and an http(s) origin with no path once they're filled in. Returns the error, or null.
  */
 export declare function originTemplateError(template: unknown): string | null;
 /**

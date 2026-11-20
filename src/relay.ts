@@ -16,6 +16,7 @@ import {
   isWorkerSpawn,
   newestWorker,
   RELAY_DISPOSE,
+  RELAY_DISPOSED,
   RELAY_ERROR,
   RELAY_HELLO,
   RELAY_READY,
@@ -89,7 +90,10 @@ function onHostMessage(ev: MessageEvent, reg: ServiceWorkerRegistration | null, 
     if (workerUrl) URL.revokeObjectURL(workerUrl)
     workerUrl = URL.createObjectURL(new Blob([d.source], { type: 'text/javascript' }))
   } else if (isPageToSw(d)) (reg?.active ?? active)?.postMessage({ type: d.type, instanceId: d.instanceId })
-  else if (d?.type === RELAY_DISPOSE) void reg?.unregister().catch(() => {})
+  else if (d?.type === RELAY_DISPOSE) {
+    const p = ev.target as MessagePort
+    void (reg ? reg.unregister().catch(() => {}) : Promise.resolve()).then(() => p.postMessage({ type: RELAY_DISPOSED }))
+  }
   else if (d?.type === BROADCAST && isChannelName(d.channel)) {
     let bc = channels.get(d.channel)
     if (!bc) channels.set(d.channel, (bc = new BroadcastChannel(d.channel)))

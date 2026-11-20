@@ -26,6 +26,8 @@ export const PROC_SPAWN = 'cresslet-proc-spawn'
 export const WORKER_SPAWN = 'cresslet-worker-spawn'
 /** host -> relay: the container is going away; unregister this origin's service worker (per-preview origins only). */
 export const RELAY_DISPOSE = 'cresslet-relay-dispose'
+/** relay -> host: done with RELAY_DISPOSE (the frame can go). */
+export const RELAY_DISPOSED = 'cresslet-relay-disposed'
 
 /** SW -> owning page messages the relay forwards. */
 export const SW_TO_PAGE = new Set(['cresslet-who', 'cresslet-request'])
@@ -57,26 +59,24 @@ export function expandOriginTemplate(template: string, instanceId: string, port:
 }
 
 /**
- * Check a `previewOrigins` template: once `{id}` and `{port}` are filled in, it must be a bare http(s) origin, and both
- * placeholders must change it (so every container and port gets an origin of its own). Returns the error, or null.
+ * Check a `previewOrigins` template: `{id}` and `{port}` once each in the host name, apart (something other than a
+ * letter or digit between them, e.g. `{id}-{port}`, so no two containers or ports share an origin: ids are letters and
+ * digits), and an http(s) origin with no path once they're filled in. Returns the error, or null.
  */
 export function originTemplateError(template: unknown): string | null {
   if (typeof template !== 'string') return 'must be a string'
-  if (!template.includes('{id}') || !template.includes('{port}')) return 'must contain {id} and {port}'
-  const at = (id: string, port: number) => {
-    try {
-      const u = new URL(expandOriginTemplate(template, id, port))
-      const bare = u.pathname === '/' && !u.search && !u.hash && !u.username && !u.password && !template.endsWith('#') && !template.endsWith('?')
-      return bare ? toOrigin(u.href) : null
-    } catch {
-      return null
-    }
+  const m = /^https?:\/\/([^/?#@:\\]+)(:\d{1,5})?\/?$/i.exec(template)
+  if (!m) return 'must be an http(s) origin (scheme, host name, optional port; no path)'
+  const host = m[1]
+  const once = (s: string) => host.split(s).length === 2
+  if (!once('{id}') || !once('{port}')) return 'must contain {id} and {port} once each, in the host name'
+  const i = host.indexOf('{id}')
+  const j = host.indexOf('{port}')
+  if (!/[^a-z0-9]/i.test(i < j ? host.slice(i + 4, j) : host.slice(j + 6, i))) return 'must separate {id} and {port} with something other than a letter or digit (e.g. {id}-{port})'
+  for (const [id, port] of [['a0', 1], ['zz9zz9zz', 65535], ['zz9zz9zz', 0]] as const) {
+    const s = expandOriginTemplate(template, id, port)
+    if (toOrigin(s) === null) return `must be an http(s) origin once {id} and {port} are filled in (${s} isn't)`
   }
-  const a = at('a0', 1)
-  const b = at('b1', 1)
-  const c = at('a0', 2)
-  if (!a || !b || !c || !at('zz9zz9zz', 65535) || !at('zz9zz9zz', 0)) return 'must be an http(s) origin (no path) once {id} and {port} are filled in'
-  if (a === b || a === c) return 'must put {id} and {port} in the origin (host or port)'
   return null
 }
 

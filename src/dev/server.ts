@@ -738,6 +738,8 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
   const fileResponse = (abs: string) => (served.add(abs), new Response(vfs.readFile(abs) as BodyInit, { headers: { 'content-type': mimeType(abs), ...NO_CACHE } }))
 
   const url = c.ports.open(port, handler, 'dev-server')
+  // with per-preview origins, `url` works once its origin's relay is up (as `server-ready` says)
+  await c.previewReady(port)
   return {
     url,
     port,

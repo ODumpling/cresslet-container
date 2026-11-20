@@ -41,8 +41,17 @@ async function twoPreviews(p: Page, opts: { previewOrigins?: string; previewOrig
       const both = new Promise<void>((resolve) =>
         c.on('server-ready', (port: number, url: string) => (ready.set(port, url), ready.size === 2 && resolve())),
       )
-      c.servePort(3000, () => new Response(a, { headers: { 'content-type': 'text/html' } }))
-      c.servePort(3001, () => new Response(b, { headers: { 'content-type': 'text/html' } }))
+      // each port also echoes WebSockets (as `<port>: <message>`) and logs the upgrades it gets
+      const upgrades: number[] = ((window as unknown as { upgrades: number[] }).upgrades = [])
+      const handler = (port: number, html: string) => (req: Request) => {
+        if (req.headers.get('upgrade') !== 'websocket') return new Response(html, { headers: { 'content-type': 'text/html' } })
+        upgrades.push(port)
+        const { socket, response } = c.upgradeWebSocket(req)
+        socket.onmessage = (e: MessageEvent) => e.data?.type === 'message' && socket.postMessage({ type: 'message', data: `${port}: ${e.data.data}` })
+        return response
+      }
+      c.servePort(3000, handler(3000, a))
+      c.servePort(3001, handler(3001, b))
       await both
       const load = (name: string, src: string) =>
         new Promise((resolve) => {
@@ -133,25 +142,32 @@ test.describe.serial('per-preview origins', () => {
     expect(await reach(b)).toEqual({ scriptable: [`${origin(3001)}/cresslet-relay.html`, `${origin(3001)}/`], blocked: 3 })
   })
 
-  test("a preview's own relay and service worker won't reach another port", async () => {
-    const got = await a.evaluate(
-      async ({ id, b }) => {
-        // through this origin's service worker and relay (which the preview can script): refused by the container
-        const viaRelay = await fetch(`/__cresslet__/${id}/3001/`)
-        const own = await fetch(`/__cresslet__/${id}/3000/`)
-        // and B's own origin is cross-origin to A (no CORS)
-        const direct = await fetch(b).then(
-          () => 'read',
-          (e: Error) => e.name,
-        )
-        return { viaRelay: [viaRelay.status, await viaRelay.text()], own: [own.status, await own.text()], direct }
-      },
-      { id, b: urls.b },
-    )
+  test("a preview's own relay and service worker won't reach another port (requests and WebSockets)", async () => {
+    const got = await a.evaluate(async (id) => {
+      // through this origin's service worker and relay (which the preview can script): refused by the container
+      const viaRelay = await fetch(`/__cresslet__/${id}/3001/`)
+      const own = await fetch(`/__cresslet__/${id}/3000/`)
+      const socket = (path: string) =>
+        new Promise<string>((resolve) => {
+          const ws = new WebSocket(`ws://${location.host}${path}`)
+          ws.onopen = () => ws.send('hi')
+          ws.onmessage = (e) => (resolve(`message ${e.data}`), ws.close())
+          ws.onclose = (e) => resolve(`closed ${e.code}`)
+        })
+      return {
+        viaRelay: [viaRelay.status, await viaRelay.text()],
+        own: [own.status, await own.text()],
+        ownSocket: await socket('/live'),
+        otherSocket: await socket(`/__cresslet__/${id}/3001/live`),
+      }
+    }, id)
     expect(got.viaRelay).toEqual([400, 'Cresslet: malformed preview request'])
     expect(got.own[0]).toBe(200)
     expect(got.own[1]).toContain('preview A')
-    expect(got.direct).toBe('TypeError')
+    expect(got.ownSocket).toBe('message 3000: hi')
+    expect(got.otherSocket).toMatch(/^closed /)
+    // port 3001's handler never saw A's socket
+    expect(await p.evaluate(() => (window as unknown as { upgrades: number[] }).upgrades)).toEqual([3000])
   })
 
   test('node runs on the workers origin, which no preview shares', async () => {

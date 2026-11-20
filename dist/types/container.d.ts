@@ -41,8 +41,9 @@ export interface BootOptions {
      */
     previewOrigin?: string;
     /**
-     * One origin per preview instead of one for all: a template with `{id}` (the container's `instanceId`) and `{port}`,
-     * e.g. 'https://{id}-{port}.preview.example.com', so previews can't script each other or read each other's storage.
+     * One origin per preview instead of one for all: a template with `{id}` (the container's `instanceId`) and `{port}`
+     * in the host name, apart (e.g. 'https://{id}-{port}.preview.example.com'), so previews can't script each other or
+     * read each other's storage.
      * Each port's preview gets its own relay frame and service worker on its origin (framed when the port opens;
      * `server-ready` / `port` fire once it's connected), which answers only that port. `node` processes and project
      * workers run on the `{port}` = 0 origin, which no preview shares. Not with `previewOrigin`.
@@ -145,6 +146,8 @@ export declare class Container {
     private previewRelays;
     /** `previewOrigins`: open ports whose `port` / `server-ready` were emitted (after their relay connected). */
     private announced;
+    /** `previewOrigins`: the latest opening of each port, until its relay connected (or failed). */
+    private opening;
     /** No service worker or relays (`serviceWorkerUrl: false`). */
     private previewsOff;
     /** The relay port the node worker script was last sent on. */
@@ -240,6 +243,12 @@ export declare class Container {
      * go nowhere.
      */
     previewChannel(name: string): PreviewChannel;
+    /**
+     * Settles once `port`'s preview URL works (with `previewOrigins`: its relay connected or failed, see `server-ready`);
+     * at once otherwise. Never rejects.
+     * @internal
+     */
+    previewReady(port: number): Promise<void>;
     /** `previewOrigins`: the relay on `port`'s preview origin, framed on first use and kept until teardown. */
     private previewRelay;
     /**

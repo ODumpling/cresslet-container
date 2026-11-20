@@ -388,7 +388,7 @@ describe('Container.boot({ previewOrigin })', () => {
 
 describe('previewOrigins templates', () => {
   it('accepts origins with {id} and {port} in the host (or port)', () => {
-    for (const t of ['https://{id}-{port}.preview.example.com', 'http://{id}-{port}.localhost:4402', 'https://{port}.{id}.preview.example/', 'http://{id}.localhost:{port}'])
+    for (const t of ['https://{id}-{port}.preview.example.com', 'http://{id}-{port}.localhost:4402', 'https://{port}.{id}.preview.example/', 'https://p-{id}--x{port}.example'])
       expect(originTemplateError(t), t).toBeNull()
     expect(expandOriginTemplate('https://{id}-{port}.preview.example.com', 'abc123', 5173)).toBe('https://abc123-5173.preview.example.com')
     expect(relayUrl('https://a-0.p.example', HOST, { sw: false })).toBe(`https://a-0.p.example/cresslet-relay.html?host=${encodeURIComponent(HOST)}&sw=0`)
@@ -404,6 +404,12 @@ describe('previewOrigins templates', () => {
       'https://{port}:x@{id}.preview.example.com',
       'ftp://{id}-{port}.preview.example.com',
       'https://{id}-{port}.preview.example.com/x',
+      'https://{id}{port}.preview.example.com', // abcdefg + 10 = abcdefg1 + 0
+      'https://{id}x{port}.preview.example.com',
+      'http://{id}.localhost:{port}', // the workers' origin would be on port 0
+      'https://{id}-{port}-{port}.preview.example.com',
+      'https://{id}-{port}.preview.example.com:99999',
+      'https://{id}-{port}.pre view.example.com',
     ])
       expect(originTemplateError(t), t).not.toBeNull()
     expect(originTemplateError(5)).not.toBeNull()
@@ -535,6 +541,51 @@ describe('Container.boot({ previewOrigins })', () => {
     expect(got.get(at(3000))!.slice(-2)).toEqual([{ type: 'cresslet-unregister', instanceId: c.instanceId }, { type: 'cresslet-relay-dispose' }])
     expect(got.get(at(0))!.map((m) => m.type)).not.toContain('cresslet-relay-dispose')
     ports.forEach((p) => p.close())
+  })
+
+  it('announces only the latest opening of a port, once, and never port 0 (the workers origin)', async () => {
+    let release!: () => void
+    const held = new Promise<void>((r) => (release = r))
+    const page = fakePage((origin, port) => {
+      if (origin.includes('-3000.')) void held.then(() => port.postMessage({ type: 'cresslet-relay-error', message: 'nope' }))
+      else port.postMessage({ type: 'cresslet-relay-ready' })
+    })
+    const c = await Container.boot({ previewOrigins: TEMPLATE, npmCache: false })
+    const events: unknown[] = []
+    c.on('error', (e) => events.push(e))
+    c.on('port', (p, ev) => events.push([p, ev]))
+    c.servePort(0, () => new Response('x'))
+    expect(events).toEqual([{ message: 'port 0: previews need a port from 1 to 65535' }])
+    c.servePort(3000, () => new Response('A')).close()
+    c.servePort(3000, () => new Response('A'))
+    await tick()
+    expect(page.frames).toHaveLength(2) // the workers relay and one for 3000, reused by the reopen
+    release()
+    await tick()
+    expect(events.slice(1)).toEqual([{ message: 'port 3000: preview relay: nope' }])
+    c.teardown()
+  })
+
+  it('torn down mid-setup: asks the relay to drop its service worker and waits for it before removing the frame', async () => {
+    const got: unknown[] = []
+    let relayPort!: MessagePort
+    const page = fakePage((origin, port) => {
+      if (origin.includes('-3000.')) {
+        relayPort = port
+        port.onmessage = (e) => got.push(e.data) // still registering: never ready
+      } else port.postMessage({ type: 'cresslet-relay-ready' })
+    })
+    const c = await Container.boot({ previewOrigins: TEMPLATE, npmCache: false })
+    c.servePort(3000, () => new Response('A'))
+    await tick()
+    c.teardown()
+    await tick()
+    expect(got).toEqual([{ type: 'cresslet-relay-dispose' }])
+    expect(page.frames[1].removed).toBe(0)
+    relayPort.postMessage({ type: 'cresslet-relay-disposed' })
+    await tick()
+    expect(page.frames[1].removed).toBe(1)
+    relayPort.close()
   })
 
   it('reports a preview relay that fails, without server-ready, and retries on the next open', async () => {

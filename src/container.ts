@@ -13,7 +13,7 @@ import { createDevServer, type DevServerHandle, type DevServerOptions } from './
 import { build, type BuildOptions } from './build/build'
 import { nodeCssBackend, type CssBackend } from './css/pipeline'
 import { basename, dirname, join, normalize, resolve } from './path'
-import { acceptHello, BROADCAST, BROADCAST_CLOSE, expandOriginTemplate, newestWorker, originTemplateError, PROC_SPAWN, WORKER_SPAWN, RELAY_DISPOSE, RELAY_ERROR, RELAY_INIT, RELAY_READY, relayErrorText, relayUrl, THIRD_PARTY_HINT, toOrigin, WORKER_SCRIPT } from './relay-protocol'
+import { acceptHello, BROADCAST, BROADCAST_CLOSE, expandOriginTemplate, newestWorker, originTemplateError, PROC_SPAWN, WORKER_SPAWN, RELAY_DISPOSE, RELAY_DISPOSED, RELAY_ERROR, RELAY_INIT, RELAY_READY, relayErrorText, relayUrl, THIRD_PARTY_HINT, toOrigin, WORKER_SCRIPT } from './relay-protocol'
 import { localChannel, relayChannel, relayWorker, type NodeChannel, type ProjectWorker } from './node/channel'
 import { DEFAULT_BROTLI_WASM_URL } from './node/brotli'
 import { clearPersisted, persistKey, VfsPersistence, type PersistOptions, type Persistence } from './persist'
@@ -49,8 +49,9 @@ export interface BootOptions {
    */
   previewOrigin?: string
   /**
-   * One origin per preview instead of one for all: a template with `{id}` (the container's `instanceId`) and `{port}`,
-   * e.g. 'https://{id}-{port}.preview.example.com', so previews can't script each other or read each other's storage.
+   * One origin per preview instead of one for all: a template with `{id}` (the container's `instanceId`) and `{port}`
+   * in the host name, apart (e.g. 'https://{id}-{port}.preview.example.com'), so previews can't script each other or
+   * read each other's storage.
    * Each port's preview gets its own relay frame and service worker on its origin (framed when the port opens;
    * `server-ready` / `port` fire once it's connected), which answers only that port. `node` processes and project
    * workers run on the `{port}` = 0 origin, which no preview shares. Not with `previewOrigin`.
@@ -106,6 +107,8 @@ type Handler = (...a: unknown[]) => void
 
 const randomId = () => Math.random().toString(36).slice(2, 10)
 const RELAY_TIMEOUT = 20_000
+/** How long a per-preview relay may take to unregister its service worker at teardown before its frame goes anyway. */
+const DISPOSE_TIMEOUT = 3_000
 
 /** Where the dev server sends live-reload / HMR / overlay notifications for its previews. */
 export interface PreviewChannel {
@@ -143,6 +146,8 @@ export class Container {
   private previewRelays = new Map<number, RelayLink>()
   /** `previewOrigins`: open ports whose `port` / `server-ready` were emitted (after their relay connected). */
   private announced = new Set<number>()
+  /** `previewOrigins`: the latest opening of each port, until its relay connected (or failed). */
+  private opening = new Map<number, Promise<void>>()
   /** No service worker or relays (`serviceWorkerUrl: false`). */
   private previewsOff = false
   /** The relay port the node worker script was last sent on. */
@@ -188,18 +193,25 @@ export class Container {
     this.ports = new PortTable(this.instanceId, {
       open: (port, url) => {
         if (!originOf || this.previewsOff) return announce(port, url)
-        // the preview's URL works once its origin's relay (and so its service worker) is up
-        this.previewRelay(port, originOf(port)).ready.then(
-          () => {
-            if (this.torndown || !this.ports.has(port) || this.announced.has(port)) return
-            this.announced.add(port)
-            announce(port, url)
-          },
-          (e: Error) => this.emit('error', { message: `port ${port}: ${e.message}` }),
+        // {port} 0 is the workers' origin, never a preview's (and the SW only forwards ports 1-65535 anyway)
+        if (!Number.isInteger(port) || port < 1 || port > 65535) return this.emit('error', { message: `port ${port}: previews need a port from 1 to 65535` })
+        // the preview's URL works once its origin's relay (and so its service worker) is connected
+        const settle = (fn: () => void) => () => {
+          if (this.opening.get(port) !== opening) return // closed (and maybe reopened) since
+          this.opening.delete(port)
+          if (!this.torndown) fn()
+        }
+        const opening: Promise<void> = connected(this.previewRelay(port, originOf(port))).then(
+          settle(() => (this.announced.add(port), announce(port, url))),
+          (e: Error) => settle(() => this.emit('error', { message: `port ${port}: ${e.message}` }))(),
         )
+        this.opening.set(port, opening)
       },
       close: (port, url) => {
-        if (originOf && !this.previewsOff && !this.announced.delete(port)) return
+        if (originOf && !this.previewsOff) {
+          this.opening.delete(port)
+          if (!this.announced.delete(port)) return
+        }
         this.emit('port', port, 'close', url)
       },
     }, originOf ?? previewOrigin ?? undefined)
@@ -547,6 +559,15 @@ export class Container {
     }
   }
 
+  /**
+   * Settles once `port`'s preview URL works (with `previewOrigins`: its relay connected or failed, see `server-ready`);
+   * at once otherwise. Never rejects.
+   * @internal
+   */
+  previewReady(port: number): Promise<void> {
+    return this.opening.get(port) ?? Promise.resolve()
+  }
+
   /** `previewOrigins`: the relay on `port`'s preview origin, framed on first use and kept until teardown. */
   private previewRelay(port: number, origin: string): RelayLink {
     let r = this.previewRelays.get(port)
@@ -566,7 +587,7 @@ export class Container {
    * first handshake fails or times out.
    */
   private connectRelay(origin: string, opts: { workers: boolean; sw: boolean; onlyPort?: number }): RelayLink {
-    const link: RelayLink = { port: null, conn: null, ready: null! }
+    const link: RelayLink = { port: null, conn: null, ready: null!, booted: false }
     if (typeof document === 'undefined' || typeof location === 'undefined') {
       link.ready = Promise.reject(new Error('previewOrigin needs a browser page'))
       return link
@@ -627,7 +648,7 @@ export class Container {
             if (link.port === port) link.conn = Promise.resolve(port)
             if (opts.sw) port.postMessage({ type: 'cresslet-register', instanceId: this.instanceId })
             if (!booted) {
-              booted = true
+              booted = link.booted = true
               clearTimeout(timer)
               resolve()
             }
@@ -647,15 +668,23 @@ export class Container {
       addEventListener('message', onWindowMessage)
       ;(document.body ?? document.documentElement).appendChild(frame)
       this.cleanups.push(() => {
-        if (!booted) return fail('container torn down')
+        if (failed) return
         const port = link.port
-        if (opts.sw) port?.postMessage({ type: 'cresslet-unregister', instanceId: this.instanceId })
-        // a per-preview origin is this container's alone: drop its service worker registration too
-        if (opts.onlyPort !== undefined) port?.postMessage({ type: RELAY_DISPOSE })
+        if (booted && opts.sw) port?.postMessage({ type: 'cresslet-unregister', instanceId: this.instanceId })
         link.port = null
         stop()
-        // let the relay forward the unregister before its frame goes
-        setTimeout(() => (port?.close(), frame.remove()), 250)
+        if (!booted) {
+          failed = true
+          reject(new Error('container torn down'))
+        }
+        // a per-preview origin is this container's alone: drop its service worker registration too (also when torn down
+        // mid-setup: the relay may be registering it; the message waits on the port until it's done)
+        const dispose = opts.onlyPort !== undefined && port
+        if (dispose) port.postMessage({ type: RELAY_DISPOSE })
+        // let the relay forward the unregister / unregister its SW before its frame goes
+        const done = () => (clearTimeout(t), port?.close(), frame.remove())
+        const t = setTimeout(done, dispose ? DISPOSE_TIMEOUT : 250)
+        if (dispose) port.onmessage = (e) => void (e.data?.type === RELAY_DISPOSED && done())
       })
     })
     return link
@@ -702,6 +731,14 @@ interface RelayLink {
   conn: Promise<MessagePort> | null
   /** Settles with the first handshake. */
   ready: Promise<void>
+  /** Whether the first handshake succeeded. */
+  booted: boolean
+}
+
+/** Resolves once `link`'s current connection is up (the first one, or a reconnect in progress), else rejects. */
+function connected(link: RelayLink): Promise<void> {
+  if (!link.booted) return link.ready
+  return link.conn ? link.conn.then(() => {}) : Promise.reject(new Error('preview relay is not connected'))
 }
 
 /** Run a caller's callback without letting it break ours. */
