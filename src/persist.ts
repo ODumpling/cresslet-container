@@ -359,6 +359,8 @@ export class VfsPersistence implements Persistence {
   }
 
   private flushQuietly(): void {
+    // a queued write will include these changes, and the call that queued it reports its failure: once
+    if (this.queued && this.pending) return
     this.flush().catch((e) => this.onError(`VFS persistence: snapshot '${this.key}' not saved: ${e instanceof Error ? e.message : e}`))
   }
 
@@ -369,9 +371,11 @@ export class VfsPersistence implements Persistence {
     // nothing new: wait for the write in progress; if it failed, its changes are pending again: retry them
     if (!this.pending) return this.queue.catch(() => {}).then(() => (this.pending ? this.flush() : undefined))
     if (!this.queued) {
-      const p = this.queue.catch(() => {}).then(() => {
-        this.queued = null
-        return this.write(store)
+      const gen = this.gen
+      const p: Promise<void> = this.queue.catch(() => {}).then(() => {
+        if (this.queued === p) this.queued = null
+        // queued before a clear(): its changes are gone, and later ones get a write of their own after the delete
+        if (gen === this.gen) return this.write(store)
       })
       this.queued = this.queue = p
     }
@@ -395,6 +399,7 @@ export class VfsPersistence implements Persistence {
     this.cancelTimer()
     this.pending = 0
     this.gen++
+    this.queued = null
     const store = this.store
     const p = this.queue.catch(() => {}).then(() => clearSnapshot(this.key, store))
     this.queue = p
@@ -409,5 +414,7 @@ export class VfsPersistence implements Persistence {
     this.cancelTimer()
     // the container's listeners are gone by the time this fails: warn instead
     if (this.pending) this.flush().catch((e) => console.warn(`[cresslet] VFS snapshot '${this.key}' not saved on teardown:`, e))
+    const store = this.store
+    void this.queue.catch(() => {}).then(() => store?.close())
   }
 }

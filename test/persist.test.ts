@@ -226,6 +226,38 @@ describe('VfsPersistence', () => {
     expect(store.writes).toBe(0)
   })
 
+  it('a change right after clear() is saved (not swallowed by a write queued before it)', async () => {
+    for (const slow of [false, true]) {
+      const store = new MemoryStore()
+      const { fs, p } = await setup({ debounceMs: 60_000 }, store)
+      const gate = deferred()
+      if (slow) store.gate = gate.p
+      fs.writeFile(`${W}/a`, '1')
+      const first = p.flush()
+      if (slow) await new Promise((r) => setTimeout(r)) // in progress
+      fs.writeFile(`${W}/b`, '1')
+      void p.flush() // queued behind it
+      const cleared = p.clear()
+      fs.writeFile(`${W}/y`, 'after clear')
+      const last = p.flush()
+      gate.open()
+      await first
+      await Promise.all([cleared, last, p.flush()])
+      const back = new VFS()
+      restoreSnapshot(back, W, store.data.get('default')!)
+      expect(back.readText(`${W}/y`)).toBe('after clear')
+    }
+  })
+
+  it('a failing write is reported once, however many changes join it', async () => {
+    const store = new MemoryStore()
+    store.fail = true
+    const { fs, errors } = await setup({ maxWrites: 2 }, store)
+    for (let i = 0; i < 50; i++) fs.writeFile(`${W}/f${i}`, 'x')
+    await new Promise((r) => setTimeout(r, 10))
+    expect(errors.length).toBe(1)
+  })
+
   it('changes during a slow write join one queued write (one serialization), not one per batch', async () => {
     const store = new MemoryStore()
     const { fs, p } = await setup({ maxWrites: 5 }, store)
