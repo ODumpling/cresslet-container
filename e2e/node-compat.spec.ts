@@ -183,12 +183,21 @@ const collect = (child) => new Promise((resolve) => {
   r.kill = await collect(sleeper)
   r.killed = sleeper.killed
   // kill(0) only probes; a paused stdout doesn't hold 'close' back; SIGKILL can't be caught
-  const probe = cp.spawn('node', ['-e', "process.on('SIGKILL', () => {}); console.log('x'); setInterval(() => {}, 1000)"])
+  const probe = cp.spawn('node', ['-e', "process.on('SIGKILL', () => console.error('caught')); console.log('x'); setInterval(() => {}, 1000)"])
+  let probeErr = ''
+  probe.stderr.on('data', (d) => (probeErr += d))
   await new Promise((res) => probe.stdout.once('data', res))
   probe.stdout.pause()
   r.probe = probe.kill(0) && probe.exitCode === null
   probe.kill('SIGKILL')
-  r.sigkill = await new Promise((res) => probe.on('close', (code, signal) => res(signal)))
+  r.sigkill = await new Promise((res) => probe.on('close', (code, signal) => res([signal, probeErr])))
+  // 'close' comes after a slow async-iterator reader has all the output
+  const slow = cp.spawn('node', ['-e', "for (let i = 0; i < 5; i++) console.log('line ' + i)"])
+  let slowOut = ''
+  const reading = (async () => { for await (const c of slow.stdout) { slowOut += c; await new Promise((res) => setTimeout(res, 20)) } })()
+  await new Promise((res) => slow.on('close', res))
+  r.slowAtClose = slowOut
+  await reading
   r.timeout = await new Promise((res) => cp.exec('sleep 5', { timeout: 200 }, (e) => res({ killed: e.killed, signal: e.signal })))
   // a child blocked reading stdin still dies when killed
   r.catTimeout = await new Promise((res) => cp.exec('cat', { timeout: 100 }, (e) => res(e.signal)))
@@ -231,7 +240,8 @@ function checkChild(r: Record<string, unknown>, out: string) {
   expect(r.kill).toMatchObject({ code: null, signal: 'SIGTERM', events: ['spawn', 'exit:null:SIGTERM'] })
   expect(r.killed).toBe(true)
   expect(r.probe).toBe(true)
-  expect(r.sigkill).toBe('SIGKILL')
+  expect(r.sigkill).toEqual(['SIGKILL', ''])
+  expect(r.slowAtClose).toBe('line 0\nline 1\nline 2\nline 3\nline 4\n')
   expect(r.timeout).toEqual({ killed: true, signal: 'SIGTERM' })
   expect(r.catTimeout).toBe('SIGTERM')
   expect(r.sigterm).toMatchObject({ out: 'got SIGTERM\n' })

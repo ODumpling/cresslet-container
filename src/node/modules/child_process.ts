@@ -178,22 +178,20 @@ export class ChildProcess extends EventEmitter {
   }
 
   /**
-   * End stdio, then 'close' once flowing or piped stdout/stderr have delivered their output. As in Node, output nobody
-   * reads is discarded, and a stream paused by its reader doesn't hold 'close' back.
+   * End stdio, then 'close' once stdout/stderr have ended, i.e. their readers took all the output. As in Node, output
+   * nobody reads is discarded, and a paused stream with nothing left buffered ends anyway.
    */
   private close(code: number | null, signal: string | null): void {
     this.ended = true
     children.delete(this.id)
     this.stdin?.destroy()
     const outs = [this.stdout, this.stderr].filter((s): s is Readable => !!s)
+    const ended = outs.map((s) => new Promise<void>((r) => (s.readableEnded || s.destroyed ? r() : (s.once('end', r), s.once('close', r)))))
     for (const s of outs) {
       s.push(null)
       if (s.readableFlowing === null) s.resume()
+      else s.read(0) // emits 'end' if it's paused with nothing buffered
     }
-    const piped = (s: Readable) => (s._readableState?.pipes?.length ?? 0) > 0
-    const ended = outs
-      .filter((s) => s.readableFlowing || piped(s))
-      .map((s) => new Promise<void>((r) => (s.readableEnded || s.destroyed ? r() : (s.once('end', r), s.once('close', r)))))
     Promise.all(ended).then(() =>
       nativeSetTimeout(() => {
         this.emit('close', code, signal)
