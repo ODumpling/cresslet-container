@@ -6,7 +6,7 @@ import { createProcess, EMPTY_STDIN, type Command, type CommandContext, type Con
 import { builtins } from './shell/builtins'
 import { COMMANDS } from './commands'
 import { dropLegacyCache, HttpRegistry, type Registry } from './npm/registry'
-import { checkMaxBytes, DEFAULT_MAX_BYTES, sharedIdbCache } from './npm/cache'
+import { sharedIdbCache } from './npm/cache'
 import { clearPackageCache, isBare, type ResolveFs } from './resolve'
 import { bundleVfs, DEFAULT_WASM_URL, type BuildOptions as EsbuildOptions, type OutputFile } from './esbuild'
 import { createDevServer, type DevServerHandle, type DevServerOptions } from './dev/server'
@@ -121,7 +121,7 @@ export class Container {
   private constructor(opts: BootOptions) {
     this.workdir = normalize(opts.workdir ?? '/home/project')
     const npmCache = opts.npmCache ?? true
-    const cache = npmCache === false ? null : sharedIdbCache(npmCache === true ? DEFAULT_MAX_BYTES : checkMaxBytes(npmCache.maxBytes ?? DEFAULT_MAX_BYTES))
+    const cache = npmCache === false ? null : sharedIdbCache(npmCache === true ? undefined : npmCache.maxBytes)
     this.registry = new HttpRegistry(opts.registry ?? 'https://registry.npmjs.org', { cache })
     dropLegacyCache()
     this.esbuildWasmUrl = opts.esbuildWasmUrl ?? DEFAULT_WASM_URL

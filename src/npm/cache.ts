@@ -21,7 +21,7 @@ const META = 'meta'
 const TOTAL = '#total'
 /** Default cap on the cache's (approximate) total size. */
 export const DEFAULT_MAX_BYTES = 256 * 1024 * 1024
-/** Read hits refresh their entry's last use in one batched write this long after the first of them. */
+/** Read hits refresh their entry's last use in one batched write this long after the first of them (or the next put). */
 export const TOUCH_DELAY = 500
 const OPEN_TIMEOUT = 3000
 /** Bound for one IndexedDB transaction (and for flushing pending writes): past it a get is a miss, a put/delete a no-op. */
@@ -77,6 +77,7 @@ export class IdbCache implements PackageCache {
   /** Read hits not yet written back: meta id → time of the hit. */
   private touched = new Map<string, number>()
   private touchTimer: ReturnType<typeof setTimeout> | null = null
+  private lastStamp = 0
 
   constructor(opts: IdbCacheOptions = {}) {
     this.maxBytes = checkMaxBytes(opts.maxBytes ?? DEFAULT_MAX_BYTES)
@@ -165,31 +166,18 @@ export class IdbCache implements PackageCache {
     const size = sizeOf(value)
     if (!(size <= this.maxBytes)) return void (await this.delete(store, key)) // could never fit; drop any older copy
     const id = metaId(store, key)
+    this.touched.delete(id) // this write is a newer use (and a touch must not overwrite its new record)
     await this.tx([...STORES, META], 'readwrite', (t) => {
       const meta = t.objectStore(META)
+      this.applyTouches(t) // recent read hits must count before this write evicts anything
       // requests run in order: `old` is read before the new record replaces it
       const old = meta.get(id)
       t.objectStore(store).put(value, key)
-      meta.put({ id, store, key, size, used: Date.now() } satisfies MetaEntry)
+      meta.put({ id, store, key, size, used: this.stamp() } satisfies MetaEntry)
       const total = meta.get(TOTAL)
       total.onsuccess = () => {
-        let bytes = Math.max(0, ((total.result as MetaTotal | undefined)?.bytes ?? 0) - ((old.result as MetaEntry | undefined)?.size ?? 0)) + size
-        const save = () => meta.put({ id: TOTAL, bytes } satisfies MetaTotal)
-        if (bytes <= this.maxBytes) return save()
-        const cur = meta.index('used').openCursor() // oldest first
-        cur.onsuccess = () => {
-          const c = cur.result
-          // ran out of other entries: only the new one is left (also repairs a total that drifted high)
-          if (!c) return (bytes = size), save()
-          const e = c.value as MetaEntry
-          if (e.id !== id) {
-            t.objectStore(e.store).delete(e.key)
-            c.delete()
-            bytes -= e.size
-          }
-          if (bytes <= this.maxBytes) return save()
-          c.continue()
-        }
+        const bytes = Math.max(0, ((total.result as MetaTotal | undefined)?.bytes ?? 0) - ((old.result as MetaEntry | undefined)?.size ?? 0)) + size
+        this.evict(t, bytes, { id, size })
       }
       return () => undefined
     })
@@ -213,27 +201,65 @@ export class IdbCache implements PackageCache {
     })
   }
 
-  /** Records a read hit as a use; hits are written back in batches so reads stay read-only transactions. */
+  /** Last-use stamp: wall-clock ms, strictly increasing here so uses within one tick keep their order. */
+  private stamp(): number {
+    return (this.lastStamp = Math.max(Date.now(), this.lastStamp + 0.001))
+  }
+
+  /** Records a read hit as a use; hits are written back in batches (or with the next write) so reads stay read-only. */
   private touch(id: string): void {
-    this.touched.set(id, Date.now())
+    this.touched.set(id, this.stamp())
     this.touchTimer ??= setTimeout(() => void this.flushTouches(), TOUCH_DELAY)
   }
 
-  /** Writes pending read hits' last-use times (entries evicted or deleted meanwhile are skipped). */
-  async flushTouches(): Promise<void> {
+  /** Queues the pending read hits' last-use writes in `t`; entries evicted or deleted meanwhile are skipped. */
+  private applyTouches(t: IDBTransaction): void {
     if (this.touchTimer) clearTimeout(this.touchTimer)
     this.touchTimer = null
-    if (!this.touched.size) return
-    const hits = [...this.touched]
+    const meta = t.objectStore(META)
+    for (const [id, used] of this.touched) {
+      const req = meta.get(id)
+      req.onsuccess = () => {
+        const e = req.result as MetaEntry | undefined
+        if (e && e.used < used) meta.put({ ...e, used })
+      }
+    }
     this.touched.clear()
-    await this.tx([META], 'readwrite', (t) => {
-      const meta = t.objectStore(META)
-      for (const [id, used] of hits) {
-        const req = meta.get(id)
-        req.onsuccess = () => {
-          const e = req.result as MetaEntry | undefined
-          if (e && e.used < used) meta.put({ ...e, used })
-        }
+  }
+
+  /**
+   * Evicts least-recently-used entries (other than the one just written, `keep`) until `bytes` fits the cap, and
+   * saves the new total. Also trims a cache left over a cap that was lowered since it was filled.
+   */
+  private evict(t: IDBTransaction, bytes: number, keep?: { id: string; size: number }): void {
+    const meta = t.objectStore(META)
+    const save = () => meta.put({ id: TOTAL, bytes } satisfies MetaTotal)
+    if (bytes <= this.maxBytes) return void save()
+    const cur = meta.index('used').openCursor() // oldest first
+    cur.onsuccess = () => {
+      const c = cur.result
+      // ran out of other entries: only `keep` is left (also repairs a total that drifted high)
+      if (!c) return (bytes = keep?.size ?? 0), void save()
+      const e = c.value as MetaEntry
+      if (e.id !== keep?.id) {
+        t.objectStore(e.store).delete(e.key)
+        c.delete()
+        bytes -= e.size
+      }
+      if (bytes <= this.maxBytes) return void save()
+      c.continue()
+    }
+  }
+
+  /** Writes pending read hits' last-use times now, and trims the cache if it is over the cap. */
+  async flushTouches(): Promise<void> {
+    if (!this.touched.size) return
+    await this.tx([...STORES, META], 'readwrite', (t) => {
+      this.applyTouches(t)
+      const total = t.objectStore(META).get(TOTAL)
+      total.onsuccess = () => {
+        const bytes = (total.result as MetaTotal | undefined)?.bytes ?? 0
+        if (bytes > this.maxBytes) this.evict(t, bytes)
       }
       return () => undefined
     })

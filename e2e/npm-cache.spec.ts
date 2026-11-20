@@ -68,7 +68,7 @@ test('boot({ npmCache: { maxBytes } }) keeps the persistent cache under the cap,
       await p.output.pipeTo(new WritableStream())
       return p.exit
     }
-    const codes = [await install({ react: '19.1.0' }), await install({ 'react-dom': '19.1.0' })]
+    const codes = [await install({ react: '19.1.0' })] // first, so the cache creates the database
     const db = await new Promise<IDBDatabase>((res, rej) => {
       const r = indexedDB.open('cresslet-npm')
       r.onsuccess = () => res(r.result)
@@ -79,12 +79,16 @@ test('boot({ npmCache: { maxBytes } }) keeps the persistent cache under the cap,
         const r = db.transaction(store).objectStore(store).getAll()
         r.onsuccess = () => res(r.result)
       })
+    const ids = async () => (await read<{ id: string }>('meta')).map((e) => e.id)
+    const afterFirst = await ids()
+    codes.push(await install({ 'react-dom': '19.1.0' }))
     const meta = await read<{ id: string; size?: number; bytes?: number }>('meta')
     const tarballs = await read<Uint8Array>('tarballs')
     db.close()
     const entries = meta.filter((e) => e.id !== '#total')
     return {
       codes,
+      afterFirst,
       total: meta.find((e) => e.id === '#total')?.bytes,
       sum: entries.reduce((a, e) => a + (e.size ?? 0), 0),
       tarballBytes: tarballs.reduce((a, t) => a + t.byteLength, 0),
@@ -97,6 +101,7 @@ test('boot({ npmCache: { maxBytes } }) keeps the persistent cache under the cap,
   expect(out.total).toBeLessThanOrEqual(CAP)
   expect(out.tarballBytes).toBeLessThanOrEqual(out.total!)
   expect(out.ids.length).toBeGreaterThan(0)
+  expect(out.afterFirst).toContain('packuments:https://registry.npmjs.org|react')
   // the first install's packument is the least recently used entry once react-dom's (~3 MB) is written
   expect(out.ids).not.toContain('packuments:https://registry.npmjs.org|react')
 })

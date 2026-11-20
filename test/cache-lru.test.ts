@@ -62,6 +62,34 @@ describe('IdbCache size cap', () => {
     expect(await c.get('tarballs', 'b')).toBeUndefined()
   })
 
+  it('a read hit counts before the next write evicts, without waiting for the batched write-back', async () => {
+    const c = new IdbCache({ maxBytes: 100 })
+    await c.put('tarballs', 'a', bytes(40))
+    await c.put('tarballs', 'b', bytes(40))
+    await c.get('tarballs', 'a')
+    await c.put('tarballs', 'c', bytes(40))
+    expect((await meta()).ids).toEqual(['tarballs:a', 'tarballs:c'])
+  })
+
+  it('keeps use order within one clock tick', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(5_000)
+    const c = new IdbCache({ maxBytes: 100 })
+    await c.put('tarballs', 'z', bytes(40))
+    await c.put('tarballs', 'a', bytes(40))
+    await c.put('tarballs', 'b', bytes(40))
+    expect((await meta()).ids).toEqual(['tarballs:a', 'tarballs:b'])
+  })
+
+  it('a lowered cap trims the cache on read hits alone', async () => {
+    const big = new IdbCache({ maxBytes: 100 })
+    await big.put('tarballs', 'a', bytes(40))
+    await big.put('tarballs', 'b', bytes(40))
+    const small = new IdbCache({ maxBytes: 50 })
+    expect(await small.get('tarballs', 'b')).toEqual(bytes(40))
+    await small.flushTouches()
+    expect(await meta()).toEqual({ ids: ['tarballs:b'], total: 40, sum: 40 })
+  })
+
   it('writes read hits back on its own after TOUCH_DELAY', async () => {
     const c = new IdbCache({ maxBytes: 100 })
     await c.put('tarballs', 'a', bytes(40))
