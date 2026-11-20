@@ -93,6 +93,11 @@ export declare class VfsPersistence implements Persistence {
     flush(): Promise<void>;
     private write;
     clear(): Promise<void>;
+    /**
+     * Delete the snapshot of `users`' key (one or more instances sharing it): each drops its pending changes now; one
+     * delete runs after everything they have queued, and their later writes wait for it.
+     */
+    static clearVia(users: VfsPersistence[]): Promise<void>;
     /** Stop watching; write pending changes (best effort: teardown can't wait for it). */
     close(): void;
 }

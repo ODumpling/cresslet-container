@@ -302,9 +302,7 @@ const live = new Set<VfsPersistence>()
  */
 export async function clearPersisted(key: string): Promise<void> {
   const users = [...live].filter((p) => p.key === key)
-  if (!users.length) return clearSnapshot(key)
-  // all at once: each drops its pending changes now, and deletes after what it has queued
-  await Promise.all(users.map((p) => p.clear()))
+  return users.length ? VfsPersistence.clearVia(users) : clearSnapshot(key)
 }
 
 export class VfsPersistence implements Persistence {
@@ -474,15 +472,25 @@ export class VfsPersistence implements Persistence {
   }
 
   clear(): Promise<void> {
-    this.cancelTimer()
-    this.pending = 0
-    this.gen++
-    this.queued = null
-    this.otherSavedAt = null // deleted too
+    return VfsPersistence.clearVia([this])
+  }
+
+  /**
+   * Delete the snapshot of `users`' key (one or more instances sharing it): each drops its pending changes now; one
+   * delete runs after everything they have queued, and their later writes wait for it.
+   */
+  static clearVia(users: VfsPersistence[]): Promise<void> {
+    for (const p of users) {
+      p.cancelTimer()
+      p.pending = 0
+      p.gen++
+      p.queued = null
+      p.otherSavedAt = null // deleted too
+    }
     // the store as of when the delete runs: none after teardown closed it (clearSnapshot opens its own)
-    const p = this.queue.catch(() => {}).then(() => clearSnapshot(this.key, this.store))
-    this.queue = p
-    return p
+    const shared = Promise.all(users.map((p) => p.queue.catch(() => {}))).then(() => clearSnapshot(users[0].key, users[0].store))
+    for (const p of users) p.queue = shared
+    return shared
   }
 
   /** Stop watching; write pending changes (best effort: teardown can't wait for it). */

@@ -482,6 +482,32 @@ describe('VfsPersistence', () => {
     expect(store.data.has('default')).toBe(false)
   })
 
+  it('the static clear deletes once for containers sharing a key, after all their queued saves', async () => {
+    // one backend, two connections: only the old one's write is slow
+    const store = new MemoryStore()
+    const slow = new MemoryStore()
+    slow.data = store.data
+    const old = await setup({ debounceMs: 60_000 }, slow)
+    const now = await setup({ debounceMs: 60_000 }, store) // e.g. rebooted with the same key
+    const gate = deferred()
+    slow.gate = gate.p
+    old.fs.writeFile(`${W}/a`, 'old')
+    void old.p.flush().catch(() => {}) // slow write in flight
+    await new Promise((r) => setTimeout(r))
+    old.p.close()
+    const cleared = clearPersisted('default')
+    now.fs.writeFile(`${W}/b`, 'new') // an edit in the new container while the clear is pending
+    const saved = now.p.flush()
+    await new Promise((r) => setTimeout(r, 5))
+    gate.open()
+    await cleared
+    await saved
+    await new Promise((r) => setTimeout(r, 5))
+    const back = new VFS()
+    restoreSnapshot(back, W, store.data.get('default')!)
+    expect(back.readdir(W)).toEqual(['b'])
+  })
+
   it('validates options', () => {
     const fs = new VFS()
     expect(() => new VfsPersistence(fs, W, { key: '' }, () => {})).toThrow(/key/)
