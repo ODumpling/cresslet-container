@@ -52,7 +52,7 @@ async function connect(p: MessagePort) {
   sw.addEventListener('message', (ev) => {
     const d = ev.data
     if (!isSwToPage(d, ev.ports)) return
-    const transfer: Transferable[] = [ev.ports[0]]
+    const transfer: Transferable[] = [...ev.ports]
     if (d.type === 'cresslet-request' && d.body instanceof ArrayBuffer) transfer.push(d.body)
     p.postMessage(d, transfer)
   })

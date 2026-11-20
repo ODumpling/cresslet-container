@@ -4,7 +4,9 @@
 // Handshake: the relay (hidden iframe on the preview origin) posts HELLO to its parent, targeted at its `host` param.
 // The container answers with INIT + a MessagePort, targeted at the preview origin. From then on everything goes over
 // that port:
-//   relay -> host: SW messages for the owning page (cresslet-who / cresslet-request, reply ports transferred),
+//   relay -> host: SW messages for the owning page (cresslet-who / cresslet-request, reply ports transferred; a
+//                  preview WebSocket is a cresslet-request with `websocket: true` and the socket's server end as a
+//                  second port),
 //                  RELAY_READY / RELAY_ERROR
 //   host -> relay: cresslet-register / cresslet-unregister (forwarded to the SW), BROADCAST / BROADCAST_CLOSE
 //                  (re-posted on the preview origin's BroadcastChannel of that name), WORKER_SCRIPT (node-worker.js
@@ -75,10 +77,11 @@ export function isPageToSw(d: unknown): d is { type: string; instanceId: string 
   return !!m && typeof m === 'object' && typeof m.type === 'string' && PAGE_TO_SW.has(m.type) && typeof m.instanceId === 'string' && INSTANCE_ID.test(m.instanceId)
 }
 
-/** Relay side: a SW -> page message worth forwarding (always carries exactly one reply port). */
+/** Relay side: a SW -> page message worth forwarding (one reply port; a WebSocket request also carries its socket). */
 export function isSwToPage(d: unknown, ports: readonly unknown[]): boolean {
-  const m = d as { type?: unknown } | null
-  return !!m && typeof m === 'object' && typeof m.type === 'string' && SW_TO_PAGE.has(m.type) && ports.length === 1
+  const m = d as { type?: unknown; websocket?: unknown } | null
+  if (!m || typeof m !== 'object' || typeof m.type !== 'string' || !SW_TO_PAGE.has(m.type)) return false
+  return ports.length === (m.type === 'cresslet-request' && m.websocket === true ? 2 : 1)
 }
 
 /** Relay side: the node worker script to run processes with. */

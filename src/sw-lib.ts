@@ -1,4 +1,5 @@
 // Pure helpers for cresslet-sw.js (kept out of sw.ts so they can be unit tested without a service worker global).
+import WS_SHIM from './preview-ws.js?raw'
 
 export const PREFIX = '/__cresslet__/'
 /** Relay page path on a preview origin (see relay.ts). */
@@ -124,13 +125,40 @@ export function receiveResponse(port: MessagePort, o: ReceiveOptions): Promise<R
 
 /** Injected first into preview HTML: hide the preview prefix from the app (routers see "/"). */
 const STRIP_SCRIPT = `<script>(function(){var l=location,m=/^\\/__cresslet__\\/[^/]+\\/\\d+/.exec(l.pathname);if(m)history.replaceState(history.state,'',(l.pathname.slice(m[0].length)||'/')+l.search+l.hash)})()</script>`
+/** Then: WebSockets to the preview's host go to the container through the SW (see preview-ws.js). */
+const INJECTED = STRIP_SCRIPT + `<script>${WS_SHIM}</script>`
+
+const TAG_REST = String.raw`(?=[\s>/])(?:[^>"']|"[^"]*"|'[^']*')*>`
+const HEAD_TAG = new RegExp(`<head${TAG_REST}`, 'iy')
+/** What may come before `<head>`: whitespace, comments, the doctype, `<html …>`. */
+const PROLOGUE = new RegExp(String.raw`[\s\uFEFF]+|<!--[^]*?-->|<!doctype[^>]*>|<html${TAG_REST}`, 'iy')
+
+/**
+ * Where the injected scripts go, ahead of the app's: after an explicit `<head …>` in the document's prologue (not a
+ * `<header>`, a comment or a script's text), else after the prologue's doctype / `<html>` (prepending would put the
+ * page in quirks mode), else at the start.
+ */
+export function insertionPoint(html: string): number {
+  let i = 0
+  let at = 0
+  for (;;) {
+    HEAD_TAG.lastIndex = i
+    const head = HEAD_TAG.exec(html)
+    if (head) return i + head[0].length
+    PROLOGUE.lastIndex = i
+    const m = PROLOGUE.exec(html)
+    if (!m) return at
+    i += m[0].length
+    if (m[0].startsWith('<') && !m[0].startsWith('<!--')) at = i
+  }
+}
 
 export async function injectStrip(res: Response): Promise<Response> {
   // Null-body statuses (204/205/304) can't carry the script: pass them through unchanged.
   if (res.body === null || [101, 204, 205, 304].includes(res.status)) return res
   const html = await res.text()
-  const at = html.search(/<head[^>]*>/i)
-  const body = at >= 0 ? html.replace(/<head[^>]*>/i, (h) => h + STRIP_SCRIPT) : STRIP_SCRIPT + html
+  const at = insertionPoint(html)
+  const body = html.slice(0, at) + INJECTED + html.slice(at)
   const headers = new Headers(res.headers)
   headers.delete('content-length')
   return new Response(body, { status: res.status, statusText: res.statusText, headers })

@@ -1,7 +1,7 @@
 // Container: public entry point. Owns the VFS, port table, command registry and the SW bridge.
 import { VFS, type Dirent, type Stats } from './vfs'
 import { exportTree, globToRegExp, mountTree, type FileSystemTree } from './tree'
-import { isSwRequest, PortTable, rejectRequest, type PortHandler } from './ports'
+import { isSwRequest, PortTable, rejectRequest, upgradeWebSocket, type PortHandler, type WebSocketUpgrade } from './ports'
 import { createProcess, EMPTY_STDIN, type Command, type CommandContext, type ContainerProcess, type SpawnOptions } from './process'
 import { builtins } from './shell/builtins'
 import { COMMANDS } from './commands'
@@ -339,6 +339,16 @@ export class Container {
     return { url, close: () => this.ports.close(port) }
   }
 
+  /**
+   * Accept a WebSocket a preview opened to its own host (`new WebSocket(...)` there is routed to this container's port
+   * handlers, dev server `middleware` included, as a GET with `Upgrade: websocket`). Call it on the request the handler
+   * got and return `response` from the handler; any other response refuses the socket. `protocol` must be one the
+   * preview offered (`Sec-WebSocket-Protocol`). Throws for any other request. See `WebSocketUpgrade.socket` for the port.
+   */
+  upgradeWebSocket(req: Request, opts: { protocol?: string } = {}): WebSocketUpgrade {
+    return upgradeWebSocket(req, opts)
+  }
+
   createDevServer(opts: DevServerOptions = {}): Promise<DevServerHandle> {
     return createDevServer(this, opts)
   }
@@ -466,7 +476,7 @@ export class Container {
       ports[0].postMessage({ owns: d.instanceId === this.instanceId })
       ports[0].close()
     } else if (d.type === 'cresslet-request' && ports[0] && (exclusive || d.instanceId === this.instanceId)) {
-      if (isSwRequest(m) && m.instanceId === this.instanceId) void this.ports.answer(m, ports[0])
+      if (isSwRequest(m) && m.instanceId === this.instanceId && (!m.websocket || ports[1])) void this.ports.answer(m, ports[0], ports[1])
       else rejectRequest(ports[0])
     }
   }

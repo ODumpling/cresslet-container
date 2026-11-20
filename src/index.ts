@@ -19,6 +19,6 @@ export type {
   PersistOptions,
   Persistence,
 } from './container'
-export type { PortHandler } from './ports'
+export type { PortHandler, WebSocketUpgrade } from './ports'
 export type { ProjectWorker } from './node/channel'
 export { ESBUILD_VERSION, DEFAULT_WASM_URL } from './esbuild'
