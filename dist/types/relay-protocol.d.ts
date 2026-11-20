@@ -7,13 +7,29 @@ export declare const BROADCAST_CLOSE = "cresslet-broadcast-close";
 export declare const WORKER_SCRIPT = "cresslet-worker-script";
 export declare const PROC_SPAWN = "cresslet-proc-spawn";
 export declare const WORKER_SPAWN = "cresslet-worker-spawn";
+/** host -> relay: the container is going away; unregister this origin's service worker (per-preview origins only). */
+export declare const RELAY_DISPOSE = "cresslet-relay-dispose";
+/** relay -> host: done with RELAY_DISPOSE (the frame can go). */
+export declare const RELAY_DISPOSED = "cresslet-relay-disposed";
 /** SW -> owning page messages the relay forwards. */
 export declare const SW_TO_PAGE: Set<string>;
 /** Host -> SW messages the relay forwards. */
 export declare const PAGE_TO_SW: Set<string>;
 /** Origin of a URL-ish string, or null when it isn't an http(s) origin. */
 export declare function toOrigin(s: string | null | undefined): string | null;
-export declare function relayUrl(previewOrigin: string, hostOrigin: string): string;
+/** `sw: false`: a relay that only runs workers (no service worker on its origin; see `previewOrigins`). */
+export declare function relayUrl(previewOrigin: string, hostOrigin: string, opts?: {
+    sw?: boolean;
+}): string;
+/** `boot({ previewOrigins })`: the origin for one preview port (`port` 0: where the container's workers run). */
+export declare function expandOriginTemplate(template: string, instanceId: string, port: number): string;
+/**
+ * Check a `previewOrigins` template: `{id}` and `{port}` once each in an ASCII host name (letters, digits, `-`, `.`),
+ * apart (a `-` or `.` between them, e.g. `{id}-{port}`, so no two containers or ports share an origin: ids are letters
+ * and digits), not in the last label (which mustn't be numeric: IPv4), and an http(s) origin with no path once they're
+ * filled in. Returns the error, or null.
+ */
+export declare function originTemplateError(template: unknown): string | null;
 /**
  * Relay side: accept an INIT only from the host named in the relay's own URL, sent by its parent window, and (where
  * the browser exposes it) only when the parent really is that origin.

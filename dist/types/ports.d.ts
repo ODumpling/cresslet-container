@@ -23,8 +23,8 @@ export declare function websocketHeaders(protocols: string[], origin: string): [
 export declare function offeredProtocols(headers: [string, string][]): string[] | null;
 /** A well-formed `cresslet-request` (checked before anything is dispatched to a port handler). */
 export declare function isSwRequest(d: unknown): d is SwRequest;
-/** Reply to a request that failed validation: 400, then close the reply port (the SW would otherwise wait for its deadline). */
-export declare function rejectRequest(reply: MessagePort): void;
+/** Reply to a request that failed validation: 400 (or `status`), then close the reply port (the SW would otherwise wait for its deadline). */
+export declare function rejectRequest(reply: MessagePort, status?: 400 | 403, text?: string): void;
 /** What `Container.upgradeWebSocket` returns. */
 export interface WebSocketUpgrade {
     /**
@@ -43,15 +43,17 @@ export declare function upgradeWebSocket(req: Request, opts?: {
 export declare class PortTable {
     instanceId: string;
     private events;
-    /** Origin previews are served from. Default: the page's own origin. */
+    /** Origin previews are served from, or one per port (`boot({ previewOrigins })`). Default: the page's own origin. */
     private previewOrigin?;
     private ports;
     constructor(instanceId: string, events: PortEvents, 
-    /** Origin previews are served from. Default: the page's own origin. */
-    previewOrigin?: string | undefined);
-    /** Origin previews are served from. */
-    origin(): string;
+    /** Origin previews are served from, or one per port (`boot({ previewOrigins })`). Default: the page's own origin. */
+    previewOrigin?: string | ((port: number) => string) | undefined);
+    /** Origin previews (`port`'s, with per-preview origins: then `port` is required) are served from. */
+    origin(port?: number): string;
     url(port: number): string;
+    /** Throws a RangeError for a port previews can't use (per-preview origins: 1-65535; {port} 0 is the workers' origin). */
+    checkPort(port: number): void;
     open(port: number, handler: PortHandler, owner?: string): string;
     close(port: number): void;
     has(port: number): boolean;

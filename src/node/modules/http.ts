@@ -4,7 +4,7 @@ import { Buffer } from 'buffer'
 import { EventEmitter } from 'events'
 import { Readable, Writable } from 'readable-stream'
 import { asyncCall, post, ref } from '../rpc'
-import type { MainToWorker } from '../protocol'
+import { listenPort, type MainToWorker } from '../protocol'
 
 export const STATUS_CODES: Record<number, string> = {
   100: 'Continue', 101: 'Switching Protocols', 200: 'OK', 201: 'Created', 202: 'Accepted', 204: 'No Content', 206: 'Partial Content',
@@ -183,10 +183,7 @@ export class Server extends EventEmitter {
   }
   listen(...args: unknown[]) {
     const cb = typeof args[args.length - 1] === 'function' ? (args.pop() as () => void) : undefined
-    let port: number
-    const first = args[0]
-    if (first && typeof first === 'object') port = Number((first as { port?: number }).port ?? 0)
-    else port = Number(first ?? 0)
+    let port = listenPort(args[0])
     if (!port) {
       while (servers.has(autoPort)) autoPort++
       port = autoPort++

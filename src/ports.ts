@@ -74,10 +74,10 @@ export function isSwRequest(d: unknown): d is SwRequest {
   )
 }
 
-/** Reply to a request that failed validation: 400, then close the reply port (the SW would otherwise wait for its deadline). */
-export function rejectRequest(reply: MessagePort): void {
-  const body = new TextEncoder().encode('Cresslet: malformed preview request')
-  reply.postMessage({ type: 'head', status: 400, statusText: 'Bad Request', headers: [['content-type', 'text/plain']] })
+/** Reply to a request that failed validation: 400 (or `status`), then close the reply port (the SW would otherwise wait for its deadline). */
+export function rejectRequest(reply: MessagePort, status: 400 | 403 = 400, text = 'Cresslet: malformed preview request'): void {
+  const body = new TextEncoder().encode(text)
+  reply.postMessage({ type: 'head', status, statusText: status === 400 ? 'Bad Request' : 'Forbidden', headers: [['content-type', 'text/plain']] })
   reply.postMessage({ type: 'chunk', data: body }, [body.buffer])
   reply.postMessage({ type: 'end' })
   reply.close()
@@ -129,20 +129,31 @@ export class PortTable {
   constructor(
     public instanceId: string,
     private events: PortEvents,
-    /** Origin previews are served from. Default: the page's own origin. */
-    private previewOrigin?: string,
+    /** Origin previews are served from, or one per port (`boot({ previewOrigins })`). Default: the page's own origin. */
+    private previewOrigin?: string | ((port: number) => string),
   ) {}
 
-  /** Origin previews are served from. */
-  origin(): string {
-    return this.previewOrigin ?? (typeof location !== 'undefined' ? location.origin : 'http://localhost')
+  /** Origin previews (`port`'s, with per-preview origins: then `port` is required) are served from. */
+  origin(port?: number): string {
+    const o = this.previewOrigin
+    if (typeof o === 'function') {
+      if (port === undefined) throw new TypeError('ports.origin(port): previews have one origin per port (previewOrigins)')
+      return o(port)
+    }
+    return o ?? (typeof location !== 'undefined' ? location.origin : 'http://localhost')
   }
 
   url(port: number): string {
-    return `${this.origin()}${PREVIEW_PREFIX}${this.instanceId}/${port}/`
+    return `${this.origin(port)}${PREVIEW_PREFIX}${this.instanceId}/${port}/`
+  }
+
+  /** Throws a RangeError for a port previews can't use (per-preview origins: 1-65535; {port} 0 is the workers' origin). */
+  checkPort(port: number): void {
+    if (typeof this.previewOrigin === 'function' && (!Number.isInteger(port) || port < 1 || port > 65535)) throw new RangeError(`port ${port}: previews need a port from 1 to 65535`)
   }
 
   open(port: number, handler: PortHandler, owner = 'user'): string {
+    this.checkPort(port)
     const existed = this.ports.has(port)
     this.ports.set(port, { handler, owner })
     const u = this.url(port)
@@ -243,7 +254,7 @@ export class PortTable {
       return reply.close()
     }
     const req = new Request(requestUrl(m))
-    Object.defineProperty(req, 'headers', { value: new Headers(websocketHeaders(offered, this.origin())), enumerable: true })
+    Object.defineProperty(req, 'headers', { value: new Headers(websocketHeaders(offered, this.origin(m.port))), enumerable: true })
     const pending: PendingUpgrade = { protocols: offered, socket }
     upgrades.set(req, pending)
     // also told over the socket, but Firefox drops that one when the page unloads before its receiver has started

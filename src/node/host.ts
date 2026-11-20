@@ -315,8 +315,12 @@ export async function runNode(ctx: CommandContext, entry: string, args: string[]
           if (typeof m.id === 'number') children.kill(m.id, typeof m.signal === 'string' ? m.signal.slice(0, 32) : 'SIGTERM')
           break
         case 'listen': {
-          ports.add(m.port)
-          c.ports.open(m.port, (req) => forward(m.port, req), 'node')
+          try {
+            c.ports.open(m.port, (req) => forward(m.port, req), 'node')
+            ports.add(m.port)
+          } catch (e) {
+            console.error(`node: listen ${m.port}:`, e) // http.ts rejects bad ports before posting; keep the host up anyway
+          }
           break
         }
         case 'unlisten':

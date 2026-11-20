@@ -145,6 +145,12 @@ export type WorkerToMain = {
     id: number;
     signal: string;
 };
+/**
+ * The port `server.listen(first, …)` asks for (0: pick one). Strings are coerced as Node does ('3e3' is 3000); a string
+ * that isn't a number is a pipe path, which gets an automatic port here (no sockets). A bad port throws
+ * ERR_SOCKET_BAD_PORT, as in Node.
+ */
+export declare function listenPort(first: unknown): number;
 export declare const HEADER = 8;
 export declare const STATE_IDLE = 0;
 export declare const STATE_DONE = 1;

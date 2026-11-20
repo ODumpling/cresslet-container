@@ -24,6 +24,10 @@ export const BROADCAST_CLOSE = 'cresslet-broadcast-close'
 export const WORKER_SCRIPT = 'cresslet-worker-script'
 export const PROC_SPAWN = 'cresslet-proc-spawn'
 export const WORKER_SPAWN = 'cresslet-worker-spawn'
+/** host -> relay: the container is going away; unregister this origin's service worker (per-preview origins only). */
+export const RELAY_DISPOSE = 'cresslet-relay-dispose'
+/** relay -> host: done with RELAY_DISPOSE (the frame can go). */
+export const RELAY_DISPOSED = 'cresslet-relay-disposed'
 
 /** SW -> owning page messages the relay forwards. */
 export const SW_TO_PAGE = new Set(['cresslet-who', 'cresslet-request'])
@@ -44,8 +48,42 @@ export function toOrigin(s: string | null | undefined): string | null {
   }
 }
 
-export function relayUrl(previewOrigin: string, hostOrigin: string): string {
-  return `${previewOrigin}/cresslet-relay.html?host=${encodeURIComponent(hostOrigin)}`
+/** `sw: false`: a relay that only runs workers (no service worker on its origin; see `previewOrigins`). */
+export function relayUrl(previewOrigin: string, hostOrigin: string, opts: { sw?: boolean } = {}): string {
+  return `${previewOrigin}/cresslet-relay.html?host=${encodeURIComponent(hostOrigin)}${opts.sw === false ? '&sw=0' : ''}`
+}
+
+/** `boot({ previewOrigins })`: the origin for one preview port (`port` 0: where the container's workers run). */
+export function expandOriginTemplate(template: string, instanceId: string, port: number): string {
+  return template.replaceAll('{id}', instanceId).replaceAll('{port}', String(port))
+}
+
+/**
+ * Check a `previewOrigins` template: `{id}` and `{port}` once each in an ASCII host name (letters, digits, `-`, `.`),
+ * apart (a `-` or `.` between them, e.g. `{id}-{port}`, so no two containers or ports share an origin: ids are letters
+ * and digits), not in the last label (which mustn't be numeric: IPv4), and an http(s) origin with no path once they're
+ * filled in. Returns the error, or null.
+ */
+export function originTemplateError(template: unknown): string | null {
+  if (typeof template !== 'string') return 'must be a string'
+  const m = /^https?:\/\/([^/?#@:\\]+)(:\d{1,5})?\/?$/i.exec(template)
+  if (!m) return 'must be an http(s) origin (scheme, host name, optional port; no path)'
+  const host = m[1]
+  const once = (s: string) => host.split(s).length === 2
+  if (!once('{id}') || !once('{port}')) return 'must contain {id} and {port} once each, in the host name'
+  // plain ASCII only: URL parsing would turn e.g. `%31` or `①` into a digit, and so a separator into nothing
+  if (!/^[a-z0-9.-]*$/i.test(host.replace('{id}', '').replace('{port}', ''))) return 'may only use ASCII letters, digits, "-" and "." in its host name (besides {id} and {port})'
+  const i = host.indexOf('{id}')
+  const j = host.indexOf('{port}')
+  // a last label with a placeholder could come out all digits (ids can be), and then parse as an IPv4 address
+  const last = host.replace(/\.$/, '').split('.').pop()!
+  if (last.includes('{') || /^(\d+|0x[0-9a-f]*)$/i.test(last)) return 'must end its host name in a fixed, non-numeric label (e.g. .com)'
+  if (!/[^a-z0-9]/i.test(i < j ? host.slice(i + 4, j) : host.slice(j + 6, i))) return 'must separate {id} and {port} with something other than a letter or digit (e.g. {id}-{port})'
+  for (const [id, port] of [['a0', 1], ['zz9zz9zz', 65535], ['zz9zz9zz', 0]] as const) {
+    const s = expandOriginTemplate(template, id, port)
+    if (toOrigin(s) === null) return `must be an http(s) origin once {id} and {port} are filled in (${s} isn't)`
+  }
+  return null
 }
 
 /**
