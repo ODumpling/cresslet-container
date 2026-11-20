@@ -4,7 +4,7 @@
 // on teardown / page hide (best effort). Each one replaces the previous snapshot as a whole (one OPFS file or one
 // IndexedDB record), so a write cut short leaves the previous snapshot.
 import type { VFS } from './vfs'
-import { normalize } from './path'
+import { basename, dirname, join, normalize } from './path'
 
 export interface PersistOptions {
   /** Snapshot name: one per project. Default 'default'. Containers with the same key share (overwrite) one snapshot. */
@@ -364,9 +364,18 @@ export class VfsPersistence implements Persistence {
     if (this.closed) return
     // from the root: removing or renaming an ancestor (`rm -rf /home`) changes the workdir too
     const base = this.dir === '/' ? '' : this.dir
+    const counts = (abs: string) => abs.startsWith(base + '/') && !isNodeModules(abs.slice(base.length + 1))
     const w = this.vfs.watch('/', { recursive: true }, (_e, rel) => {
       const abs = '/' + rel
-      if ((base + '/').startsWith(abs + '/') || (abs.startsWith(base + '/') && !isNodeModules(abs.slice(base.length + 1)))) this.changed()
+      if ((base + '/').startsWith(abs + '/') || counts(abs)) return this.changed()
+      // written through a symlink into the workdir (`node_modules/pkg -> ../packages/pkg`, a link elsewhere)?
+      try {
+        if (this.vfs.exists(abs) && counts(this.vfs.realpath(abs))) return this.changed()
+        const dir = dirname(abs)
+        if (this.vfs.isDir(dir) && counts(join(this.vfs.realpath(dir), basename(abs)))) this.changed()
+      } catch {
+        /* a symlink loop (ELOOP): not a path into the workdir */
+      }
     })
     this.stops.push(() => w.close())
     if (typeof addEventListener === 'function' && typeof document !== 'undefined') {

@@ -160,6 +160,32 @@ describe('VfsPersistence', () => {
     expect(store.writes).toBe(1)
   })
 
+  it('counts writes through symlinks into the workdir (node_modules/pkg -> packages/pkg, links elsewhere)', async () => {
+    const { fs, p, store } = await setup({ debounceMs: 60_000 })
+    fs.writeFile(`${W}/packages/pkg/index.js`, 'v1', { mkdirp: true })
+    fs.writeFile(`${W}/a.txt`, 'v1')
+    fs.mkdir(`${W}/node_modules`)
+    fs.symlink('../packages/pkg', `${W}/node_modules/pkg`)
+    fs.symlink(W, '/tmp-link')
+    await p.flush()
+    for (const [path, file] of [
+      [`${W}/node_modules/pkg/index.js`, 'packages/pkg/index.js'],
+      [`${W}/node_modules/pkg/new.js`, 'packages/pkg/new.js'],
+      ['/tmp-link/a.txt', 'a.txt'],
+    ]) {
+      fs.writeFile(path, 'v2')
+      await p.flush()
+      const back = new VFS()
+      restoreSnapshot(back, W, store.data.get('default')!)
+      expect(back.readText(`${W}/${file}`)).toBe('v2')
+    }
+    fs.rm(`${W}/node_modules/pkg/new.js`)
+    await p.flush()
+    const back = new VFS()
+    restoreSnapshot(back, W, store.data.get('default')!)
+    expect(back.exists(`${W}/packages/pkg/new.js`)).toBe(false)
+  })
+
   it('flush() writes now; clear() drops pending changes and the snapshot', async () => {
     const { fs, p, store } = await setup({ key: 'proj', debounceMs: 60_000 })
     fs.writeFile(`${W}/a`, '1')
