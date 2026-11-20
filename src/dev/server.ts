@@ -739,7 +739,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
 
   const url = c.ports.open(port, handler, 'dev-server')
   // with per-preview origins, `url` works once its origin's relay is up (as `server-ready` says)
-  await c.previewReady(port)
+  await c.previewReady?.(port) // (test doubles may not have it)
   return {
     url,
     port,
