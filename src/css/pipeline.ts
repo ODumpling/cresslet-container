@@ -146,6 +146,7 @@ export class CssPipeline {
     let known = this.rules.get(file)
     if (known && known.css !== css) known = undefined
     let r!: CssResult
+    let built = false
     for (let attempt = 0, restarts = 0; attempt < 4; attempt++) {
       // the stylesheet's source rules come first (a discovery request when they aren't known for this text), so its
       // first build already has the candidates of exactly its sources
@@ -156,8 +157,9 @@ export class CssPipeline {
       const candidates = scanner ? await scanner.all() : []
       // closed meanwhile (dev server closed, build done): nothing may recreate its worker-side state
       if (this.released) throw new Error('CSS pipeline closed')
-      if (gen !== this.generation && ++restarts <= 3) {
+      if (gen !== this.generation) {
         // reset during the scan: prepare it again under the new mode (rules and scanners were cleared)
+        if (++restarts > 3) throw new Error('CSS mode kept changing; try again')
         known = undefined
         attempt--
         continue
@@ -188,8 +190,11 @@ export class CssPipeline {
       const key = r.tailwind.length ? rulesKey(r.tailwind) : null
       const done = discover ? key === null : key === (known?.key ?? null) || !this.mode.tailwind
       this.rules.set(file, (known = { css, key, rules: r.tailwind }))
+      built = !discover || done
       if (done) break
     }
+    // out of attempts on a discovery (its output is no stylesheet)
+    if (!built) throw new Error('CSS mode kept changing; try again')
     for (const w of r.warnings) console.warn(`[cresslet] ${file}: ${w}`)
     return { css: r.css, deps: r.deps, dirs: r.dirs ?? [], scanner: known?.key ?? null }
   }
@@ -246,7 +251,7 @@ function containerSpawn(c: Container): CssWorkerSpawn {
 export function nodeCssBackend(c: Container, o: { timeoutMs?: number; spawn?: CssWorkerSpawn } = {}): CssBackend & { close(): void } {
   const timeoutMs = o.timeoutMs ?? TIMEOUT_MS
   const spawn = o.spawn ?? containerSpawn(c)
-  type Job = { req: CssRequest; resolve: (r: CssResult) => void; reject: (e: Error) => void; retried: boolean; timer?: ReturnType<typeof setTimeout> }
+  type Job = { req: CssRequest; resolve: (r: CssResult) => void; reject: (e: Error) => void; retried: boolean; timer?: ReturnType<typeof setTimeout>; released?: boolean }
   type Proc = { w: CssWorkerProcess; pending: Map<number, Job>; sent: Map<string, number> }
   let proc: Proc | null = null
   let nextId = 0
@@ -275,6 +280,7 @@ export function nodeCssBackend(c: Container, o: { timeoutMs?: number; spawn?: Cs
           me.pending.delete(m.id)
           clearTimeout(job.timer)
           arm(me)
+          if (job.released) continue
           if (m.ok) job.resolve(m)
           else job.reject(Object.assign(new Error(m.error), { deps: m.deps ?? [], dirs: m.dirs ?? [] }))
         }
@@ -316,7 +322,7 @@ export function nodeCssBackend(c: Container, o: { timeoutMs?: number; spawn?: Cs
     job.timer = setTimeout(() => {
       if (me.pending.get(id) !== job) return
       me.pending.delete(id)
-      job.reject(new Error(`CSS worker timed out after ${Math.round(timeoutMs / 1000)}s processing ${job.req.file} (a PostCSS plugin or Tailwind plugin/config that never finishes?); the worker was restarted`))
+      if (!job.released) job.reject(new Error(`CSS worker timed out after ${Math.round(timeoutMs / 1000)}s processing ${job.req.file} (a PostCSS plugin or Tailwind plugin/config that never finishes?); the worker was restarted`))
       recycle(me, 'retry')
     }, timeoutMs)
   }
@@ -330,6 +336,7 @@ export function nodeCssBackend(c: Container, o: { timeoutMs?: number; spawn?: Cs
     for (const j of jobs) {
       clearTimeout(j.timer)
       j.timer = undefined
+      if (j.released) continue
       if (then === 'retry' && !j.retried && !closed) {
         j.retried = true
         send(j)
@@ -342,10 +349,11 @@ export function nodeCssBackend(c: Container, o: { timeoutMs?: number; spawn?: Cs
     restart: () => void (proc && recycle(proc, 'restarted')),
     release(session) {
       if (!proc) return
-      // its requests still queued are never replayed on another worker (a timeout recycling this one)
-      for (const [id, j] of proc.pending) {
-        if (j.req.session !== session || j.timer) continue
-        proc.pending.delete(id)
+      // its requests are rejected now and never replayed on another worker (a timeout recycling this one); they stay
+      // queued, as the worker still runs them in order (the timeout follows the one it is on)
+      for (const j of proc.pending.values()) {
+        if (j.req.session !== session || j.released) continue
+        j.released = true
         j.reject(new Error('CSS pipeline closed'))
       }
       for (const k of proc.sent.keys()) if (k.startsWith(session + ':')) proc.sent.delete(k)

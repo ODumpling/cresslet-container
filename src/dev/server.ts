@@ -428,6 +428,8 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
           if (stale && tracked && page === pageGen) scheduleHmr(abs) // still changing: the page gets the newer one
           return out
         } catch (e) {
+          // the stylesheet itself was deleted meanwhile: nothing to retry or report
+          if (!vfs.isFile(abs)) throw e
           const stale = cssStale(abs, cssDeps, uses, seq, rev)
           if (stale && attempt < 2 && page === pageGen) continue
           // keep a node, with what it read (incl. missing imports/configs), so fixing or creating those hot-updates it

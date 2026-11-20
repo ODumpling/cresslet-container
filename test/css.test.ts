@@ -308,6 +308,47 @@ describe('CSS mode', () => {
     }
   })
 
+  it('pipeline: resets that keep landing during the scan give up instead of sending stale candidates', async () => {
+    const v = tailwindProject()
+    for (let i = 0; i < 40; i++) v.writeFile(`/p/src/f${i}.js`, '"flex"')
+    let t = 0
+    const spy = vi.spyOn(performance, 'now').mockImplementation(() => (t += 5))
+    const reqs: CssRequest[] = []
+    let p!: CssPipeline
+    const timer = setInterval(() => p.reset(), 0) // Tailwind stays on: every attempt is cut off mid-scan
+    const backend: CssBackend = {
+      restart() {},
+      async process(r) {
+        reqs.push(r)
+        return { css: 'built', deps: [], dirs: [], warnings: [], tailwind: [{ root: null, sources: [] }] }
+      },
+    }
+    p = new CssPipeline({ vfs: v, cssWorker: () => backend }, '/p', 'development')
+    try {
+      await expect(p.process('/p/a.css', '@import "tailwindcss";')).rejects.toThrow(/kept changing/)
+      expect(reqs.every((q) => q.discover)).toBe(true)
+    } finally {
+      clearInterval(timer)
+      spy.mockRestore()
+    }
+  })
+
+  it('pipeline: warm rules, then a reset during every scan: the fourth restart throws before any stale build is sent', async () => {
+    const v = tailwindProject()
+    const { reqs, backend } = fakeBackend({ '/p/a.css': [{ root: null, sources: [] }] })
+    const p = new CssPipeline({ vfs: v, cssWorker: () => backend }, '/p', 'development')
+    await p.process('/p/a.css', '@import "tailwindcss";') // rules known now
+    const before = reqs.length
+    const spy = vi.spyOn(CandidateScanner.prototype, 'all').mockImplementation(async () => (p.reset(), []))
+    try {
+      await expect(p.process('/p/a.css', '@import "tailwindcss";')).rejects.toThrow(/kept changing/)
+      expect(spy).toHaveBeenCalledTimes(4)
+      expect(reqs.slice(before).map((q) => q.discover)).toEqual([true, true, true])
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
   it('pipeline: released while a discovery request runs, it sends no build (nothing recreates its worker state)', async () => {
     const v = tailwindProject()
     let release!: () => void
@@ -617,6 +658,25 @@ describe('CSS worker process (nodeCssBackend over a real node child)', () => {
       await expect(hang).rejects.toThrow(/timed out/)
       await new Promise((r) => setTimeout(r, 100))
       expect(s.lines.filter((l) => l.session === 'b' && l.op !== 'release')).toHaveLength(1)
+    } finally {
+      b.close()
+    }
+  })
+
+  it('a released request still counts in the queue: the one behind it gets its own full timeout', async () => {
+    const dir = project({ 'postcss.config.cjs': "module.exports = { plugins: [{ postcssPlugin: 'slow', Once: () => new Promise((r) => setTimeout(r, 600)) }] }\n" })
+    const s = nodeSpawn()
+    const b = nodeCssBackend({} as never, { spawn: s.spawn, timeoutMs: 1000 })
+    try {
+      const pc = { postcssConfig: join(dir, 'postcss.config.cjs'), css: 'a{}' }
+      const first = b.process(req(dir, { ...pc, session: 'live' }))
+      const gone = b.process(req(dir, { ...pc, session: 'gone' }))
+      const last = b.process(req(dir, { ...pc, session: 'live' }))
+      b.release!('gone')
+      await expect(gone).rejects.toThrow(/closed/)
+      expect((await first).css).toContain('a{}')
+      expect((await last).css).toContain('a{}') // ~1.8s after it was sent, 0.6s after the worker started it
+      expect(s.spawns()).toBe(1)
     } finally {
       b.close()
     }
