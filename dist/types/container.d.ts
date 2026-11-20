@@ -18,6 +18,13 @@ export interface BootOptions {
     workdir?: string;
     /** Persist npm tarballs + packuments in IndexedDB across reloads. Default true; silently off if IndexedDB is unavailable. */
     npmCache?: boolean;
+    /**
+     * Serve previews from this origin (e.g. 'https://preview.example.com') instead of the host page's, so preview code
+     * can't read the host's storage. The container frames `${previewOrigin}/cresslet-relay.html`, which registers
+     * `${previewOrigin}/cresslet-sw.js`; `serviceWorkerUrl` is then unused (`false` still disables previews).
+     * Unset (or equal to the page's origin): previews share the host origin.
+     */
+    previewOrigin?: string;
 }
 export interface ContainerEvents {
     'server-ready': (port: number, url: string) => void;
@@ -68,6 +75,11 @@ export interface BundleResult {
     warnings: unknown[];
     metafile?: unknown;
 }
+/** Where the dev server sends live-reload / HMR / overlay notifications for its previews. */
+export interface PreviewChannel {
+    postMessage(message: unknown): void;
+    close(): void;
+}
 export declare class Container {
     readonly instanceId: string;
     readonly workdir: string;
@@ -78,6 +90,9 @@ export declare class Container {
     readonly esbuildWasmUrl: string;
     readonly resolveFs: ResolveFs;
     readonly fs: FsApi;
+    /** Origin previews are served from when it differs from the page's (`boot({ previewOrigin })`), else null. */
+    readonly previewOrigin: string | null;
+    private relayPort;
     private listeners;
     private commands;
     private procs;
@@ -117,6 +132,22 @@ export declare class Container {
     bundle(options: BundleOptions): Promise<BundleResult>;
     /** Create a runtime worker shipped next to this module (dist/node-worker.js). */
     createWorker(_name: 'node-worker.js'): Worker;
+    /**
+     * A message the SW posts to the page that owns an instance (directly, or forwarded by the relay). `exclusive`: the
+     * channel is this container's own (the relay port), so every request on it is ours to answer, if only with a 400;
+     * on the page's shared SW channel, requests for other instance ids belong to other containers in this page.
+     */
+    private onSwMessage;
+    /**
+     * Channel for notifying this container's previews (used by the dev server). A BroadcastChannel on the page's origin,
+     * or, with a separate preview origin, re-posted by the relay on the preview origin's BroadcastChannel of that name.
+     */
+    previewChannel(name: string): PreviewChannel;
+    /**
+     * Frame the preview origin's relay and bridge its service worker over a MessagePort (see relay-protocol.ts). Rejects
+     * (leaving no frame or listener behind) if the first handshake fails or times out.
+     */
+    private connectRelay;
     private connectServiceWorker;
     teardown(): void;
 }

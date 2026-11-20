@@ -44,6 +44,7 @@ async function devServer(files: Record<string, string>) {
     instanceId: id,
     esbuildWasmUrl: '',
     resolveFs: { isFile: (p: string) => vfs.isFile(p), isDir: (p: string) => vfs.isDir(p), readText: (p: string) => vfs.tryReadText(p) },
+    previewChannel: (name: string) => new BroadcastChannel(name),
     ports: { free: () => 5173, open: (_p: number, h: typeof handler) => ((handler = h), 'http://localhost/'), close() {} },
   }
   const server = await createDevServer(c as never, {})

@@ -1,4 +1,4 @@
-// Build dist/: library (ESM), node worker (ESM), service worker (IIFE), then .d.ts via tsc.
+// Build dist/: library (ESM), node worker (ESM), service worker + preview relay (IIFE, + relay HTML), then .d.ts via tsc.
 import * as esbuild from 'esbuild'
 import { execSync } from 'node:child_process'
 import { copyFileSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -40,7 +40,11 @@ const configs = [
   { ...common, entryPoints: { 'cresslet-container': 'src/index.ts' }, format: 'esm', outdir: 'dist', minify: true },
   { ...common, entryPoints: { 'node-worker': 'src/node/worker.ts' }, format: 'esm', outdir: 'dist', minify: true, define: {} },
   { ...common, entryPoints: { 'cresslet-sw': 'src/sw.ts' }, format: 'iife', outdir: 'dist', minify: true },
+  { ...common, entryPoints: { 'cresslet-relay': 'src/relay.ts' }, format: 'iife', outdir: 'dist', minify: true },
 ]
+
+mkdirSync(`${root}dist`, { recursive: true })
+copyFileSync(`${root}src/relay.html`, `${root}dist/cresslet-relay.html`)
 
 if (watch) {
   for (const c of configs) await (await esbuild.context(c)).watch()

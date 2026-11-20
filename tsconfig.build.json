@@ -7,5 +7,5 @@
     "noEmit": false
   },
   "include": ["src"],
-  "exclude": ["src/node/shims", "src/sw.ts", "src/node/worker.ts", "src/node/modules", "src/node/rpc.ts"]
+  "exclude": ["src/node/shims", "src/sw.ts", "src/sw-lib.ts", "src/relay.ts", "src/node/worker.ts", "src/node/modules", "src/node/rpc.ts"]
 }
