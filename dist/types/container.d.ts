@@ -24,7 +24,7 @@ export interface BootOptions {
      * Serve previews from this origin (e.g. 'https://preview.example.com') instead of the host page's, so preview code
      * can't read the host's storage. The container frames `${previewOrigin}/cresslet-relay.html`, which registers
      * `${previewOrigin}/cresslet-sw.js` and also runs `node` processes (server code, npm bins, the CSS worker) on that
-     * origin; `serviceWorkerUrl` is then unused (`false` disables previews, and `node` stays on the page's origin).
+     * origin; `serviceWorkerUrl` is then unused (`false` disables previews, and then `node` / `projectWorker` fail to start).
      * Unset (or equal to the page's origin): previews share the host origin.
      */
     previewOrigin?: string;
@@ -163,7 +163,7 @@ export declare class Container {
      * Start a module Web Worker for project code (e.g. an app's server handler) where `node` runs: on the preview origin
      * when previews are served from a separate `previewOrigin` (the page fetches `url` and the relay runs it from a
      * `blob:` URL there, so its imports must be absolute URLs), else `new Worker(url, { type: 'module' })` on this page.
-     * Messages are structured-cloned (MessagePorts are passed on; other transferables are copied after the first hop);
+     * Messages are structured-cloned and MessagePorts passed on; values that can only be transferred (streams, ...) fail;
      * `onerror` gets `{ message }`. With a `previewOrigin` it never falls back to this page's origin: it rejects when
      * there's no relay (`serviceWorkerUrl: false`).
      */

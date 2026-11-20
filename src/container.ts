@@ -31,7 +31,7 @@ export interface BootOptions {
    * Serve previews from this origin (e.g. 'https://preview.example.com') instead of the host page's, so preview code
    * can't read the host's storage. The container frames `${previewOrigin}/cresslet-relay.html`, which registers
    * `${previewOrigin}/cresslet-sw.js` and also runs `node` processes (server code, npm bins, the CSS worker) on that
-   * origin; `serviceWorkerUrl` is then unused (`false` disables previews, and `node` stays on the page's origin).
+   * origin; `serviceWorkerUrl` is then unused (`false` disables previews, and then `node` / `projectWorker` fail to start).
    * Unset (or equal to the page's origin): previews share the host origin.
    */
   previewOrigin?: string
@@ -360,7 +360,8 @@ export class Container {
       nodeSource = null
       throw e
     })
-    const [source, relay] = await Promise.all([nodeSource, this.workerRelay()])
+    const source = await nodeSource
+    const relay = await this.workerRelay() // after the fetch: a relay that reconnected meanwhile has a new port
     if (this.relayScriptPort !== relay) {
       relay.postMessage({ type: WORKER_SCRIPT, source })
       this.relayScriptPort = relay
@@ -377,14 +378,15 @@ export class Container {
    * Start a module Web Worker for project code (e.g. an app's server handler) where `node` runs: on the preview origin
    * when previews are served from a separate `previewOrigin` (the page fetches `url` and the relay runs it from a
    * `blob:` URL there, so its imports must be absolute URLs), else `new Worker(url, { type: 'module' })` on this page.
-   * Messages are structured-cloned (MessagePorts are passed on; other transferables are copied after the first hop);
+   * Messages are structured-cloned and MessagePorts passed on; values that can only be transferred (streams, ...) fail;
    * `onerror` gets `{ message }`. With a `previewOrigin` it never falls back to this page's origin: it rejects when
    * there's no relay (`serviceWorkerUrl: false`).
    */
   async projectWorker(url: string | URL, opts: { name?: string } = {}): Promise<ProjectWorker> {
     const href = new URL(url, typeof location === 'undefined' ? undefined : location.href).href
     if (!this.previewOrigin) return new Worker(href, { type: 'module', name: opts.name }) as ProjectWorker
-    const [source, relay] = await Promise.all([fetchSource(href), this.workerRelay()])
+    const source = await fetchSource(href)
+    const relay = await this.workerRelay()
     const { port1, port2 } = new MessageChannel()
     const kill = (reason: string) => (w.onerror?.({ message: reason }), w.terminate())
     const w = relayWorker(port1, () => this.relayProcs.delete(kill))
