@@ -309,8 +309,8 @@ export class VfsPersistence implements Persistence {
   private queue: Promise<void> = Promise.resolve()
   /** A write waiting for the one in progress. It serializes the workdir when it starts, so later changes join it. */
   private queued: Promise<void> | null = null
-  /** The other backend holds a copy of this key: dropped after the first save. */
-  private otherCopy = false
+  /** When the other backend's copy of this key (seen at boot) was saved: dropped after the first save. */
+  private otherSavedAt: number | null = null
   private stops: (() => void)[] = []
   private closed = false
   private readonly dir: string
@@ -346,14 +346,18 @@ export class VfsPersistence implements Persistence {
         this.store.read(this.key).catch((e) => (console.warn(`[cresslet] VFS snapshot '${this.key}' unreadable:`, e), null)),
         other?.read(this.key).catch(() => null) ?? null,
       ])
-      this.otherCopy = !!theirs
-      const bytes = theirs && (!mine || savedAt(theirs) > savedAt(mine)) ? theirs : mine
-      if (bytes) {
-        restoreSnapshot(this.vfs, this.dir, bytes)
-        this.restored = true
+      this.otherSavedAt = theirs ? savedAt(theirs) : null
+      // newest first; restoreSnapshot validates before writing, so a bad one leaves nothing behind for the next
+      const candidates = [mine, theirs].filter((b): b is Uint8Array => !!b).sort((a, b) => savedAt(b) - savedAt(a))
+      for (const bytes of candidates) {
+        try {
+          restoreSnapshot(this.vfs, this.dir, bytes)
+          this.restored = true
+          break
+        } catch (e) {
+          console.warn(`[cresslet] VFS snapshot '${this.key}' not restored:`, e)
+        }
       }
-    } catch (e) {
-      console.warn(`[cresslet] VFS snapshot '${this.key}' not restored:`, e)
     } finally {
       other?.close()
     }
@@ -421,12 +425,20 @@ export class VfsPersistence implements Persistence {
       if (gen === this.gen) this.pending += n // the next change, flush() or teardown retries
       throw e
     }
-    if (this.otherCopy) {
-      // older than what was just saved; best effort (newest-wins at boot covers a copy that can't be deleted)
-      this.otherCopy = false
+    if (this.otherSavedAt !== null) {
+      // older than what was just saved; best effort (newest-wins at boot covers a copy that can't be deleted).
+      // Only the copy seen at boot: not one another container (tab) saved there since
+      const seen = this.otherSavedAt
+      this.otherSavedAt = null
       const other = await this.getOther(store.backend).catch(() => null)
-      await other?.delete(this.key).catch(() => {})
-      other?.close()
+      try {
+        const now = await other?.read(this.key)
+        if (now && savedAt(now) <= seen) await other!.delete(this.key)
+      } catch {
+        /* best effort */
+      } finally {
+        other?.close()
+      }
     }
   }
 
@@ -435,7 +447,7 @@ export class VfsPersistence implements Persistence {
     this.pending = 0
     this.gen++
     this.queued = null
-    this.otherCopy = false // deleted too
+    this.otherSavedAt = null // deleted too
     // the store as of when the delete runs: none after teardown closed it (clearSnapshot opens its own)
     const p = this.queue.catch(() => {}).then(() => clearSnapshot(this.key, this.store))
     this.queue = p

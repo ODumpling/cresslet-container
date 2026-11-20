@@ -301,6 +301,31 @@ describe('VfsPersistence', () => {
     }
   })
 
+  it('a newer snapshot that fails validation falls back to the older one', async () => {
+    const store = new MemoryStore('opfs')
+    const other = new MemoryStore('indexeddb')
+    other.data.set('default', encodeSnapshot(project(), W))
+    await new Promise((r) => setTimeout(r, 2))
+    const newer = encodeSnapshot(project(), W)
+    store.data.set('default', newer.slice(0, newer.byteLength - 3)) // valid header, truncated payload
+    const { fs, p } = await setup({}, store, other)
+    expect(p.restored).toBe(true)
+    expect(fs.readText(`${W}/src/main.ts`)).toBe('console.log(1)')
+  })
+
+  it("the first save doesn't delete a copy saved to the other backend since boot", async () => {
+    const store = new MemoryStore('opfs')
+    const other = new MemoryStore('indexeddb')
+    other.data.set('default', encodeSnapshot(project(), W))
+    const { fs, p } = await setup({ debounceMs: 60_000 }, store, other)
+    await new Promise((r) => setTimeout(r, 2))
+    const fromOtherTab = encodeSnapshot(project(), W)
+    other.data.set('default', fromOtherTab)
+    fs.writeFile(`${W}/a`, '1')
+    await p.flush()
+    expect(other.data.get('default')).toBe(fromOtherTab)
+  })
+
   it('normalizes the workdir path (trailing slash, relative)', async () => {
     for (const dir of [`${W}/`, W.slice(1)]) {
       const store = new MemoryStore()

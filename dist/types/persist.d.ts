@@ -72,8 +72,8 @@ export declare class VfsPersistence implements Persistence {
     private queue;
     /** A write waiting for the one in progress. It serializes the workdir when it starts, so later changes join it. */
     private queued;
-    /** The other backend holds a copy of this key: dropped after the first save. */
-    private otherCopy;
+    /** When the other backend's copy of this key (seen at boot) was saved: dropped after the first save. */
+    private otherSavedAt;
     private stops;
     private closed;
     private readonly dir;
