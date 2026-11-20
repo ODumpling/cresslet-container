@@ -8,6 +8,7 @@ import { type BuildOptions as EsbuildOptions } from './esbuild';
 import { type DevServerHandle, type DevServerOptions } from './dev/server';
 import { type BuildOptions } from './build/build';
 import { type CssBackend } from './css/pipeline';
+import { type NodeChannel, type ProjectWorker } from './node/channel';
 export interface BootOptions {
     /** Service worker URL served by the host at its origin root. Default '/cresslet-sw.js'. `false` disables previews. */
     serviceWorkerUrl?: string | false;
@@ -22,7 +23,8 @@ export interface BootOptions {
     /**
      * Serve previews from this origin (e.g. 'https://preview.example.com') instead of the host page's, so preview code
      * can't read the host's storage. The container frames `${previewOrigin}/cresslet-relay.html`, which registers
-     * `${previewOrigin}/cresslet-sw.js`; `serviceWorkerUrl` is then unused (`false` still disables previews).
+     * `${previewOrigin}/cresslet-sw.js` and also runs `node` processes (server code, npm bins, the CSS worker) on that
+     * origin; `serviceWorkerUrl` is then unused (`false` disables previews, and then `node` / `projectWorker` fail to start).
      * Unset (or equal to the page's origin): previews share the host origin.
      */
     previewOrigin?: string;
@@ -101,6 +103,14 @@ export declare class Container {
     /** Whether CSS processing runs project code (`boot({ cssPlugins })`). */
     readonly cssPlugins: boolean;
     private relayPort;
+    /** Whether the relay connected at boot (previews, and `node`, run on the preview origin). */
+    private relayBooted;
+    /** The current relay connection once it's ready (set up its service worker and message handler), else rejected. */
+    private relayConn;
+    /** The relay port the node worker script was last sent on. */
+    private relayScriptPort;
+    /** Kill switches of `node` processes and project workers running in the relay (they die with its document). */
+    private relayProcs;
     private listeners;
     private commands;
     private procs;
@@ -143,6 +153,26 @@ export declare class Container {
     cssWorker(): CssBackend;
     /** Create a runtime worker shipped next to this module (dist/node-worker.js). */
     createWorker(_name: 'node-worker.js'): Worker;
+    /**
+     * Start a `node` worker: on the preview origin (run by the relay) when previews are served from a separate
+     * `previewOrigin`, so project code there can't open this page's IndexedDB / Cache Storage; on this page otherwise.
+     * @internal
+     */
+    nodeChannel(): Promise<NodeChannel>;
+    /**
+     * Start a module Web Worker for project code (e.g. an app's server handler) where `node` runs: on the preview origin
+     * when previews are served from a separate `previewOrigin` (the page fetches `url` and the relay runs it from a
+     * `blob:` URL there, so its imports must be absolute URLs), else `new Worker(url, { type: 'module' })` on this page.
+     * Messages are structured-cloned and MessagePorts passed on; values that can only be transferred (streams, ...) fail;
+     * `onerror` gets `{ message }`. With a `previewOrigin` it never falls back to this page's origin: it rejects when
+     * there's no relay (`serviceWorkerUrl: false`).
+     */
+    projectWorker(url: string | URL, opts?: {
+        name?: string;
+    }): Promise<ProjectWorker>;
+    /** The relay port to start workers on. Never falls back to this page's origin when there is a `previewOrigin`. */
+    private workerRelay;
+    private checkRelayEnabled;
     /**
      * A message the SW posts to the page that owns an instance (directly, or forwarded by the relay). `exclusive`: the
      * channel is this container's own (the relay port), so every request on it is ours to answer, if only with a 400;

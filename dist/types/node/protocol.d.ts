@@ -36,6 +36,17 @@ export type MainToWorker = StartMsg | {
     type: 'http-abort';
     id: number;
 };
+/** Host <-> preview relay, per process (relay-hosted workers only): sync replies, kill, worker errors. */
+export type HostToRelayProc = MainToWorker | {
+    type: 'sync-result';
+    payload: Uint8Array;
+} | {
+    type: 'terminate';
+};
+export type RelayProcToHost = WorkerToMain | {
+    type: 'worker-error';
+    message: string;
+};
 export type WorkerToMain = {
     type: 'stdout' | 'stderr';
     data: string;
@@ -85,6 +96,18 @@ export declare const TAG_JSON = 0;
 export declare const TAG_BYTES = 1;
 export declare const TAG_ERROR = 2;
 export declare const TAG_UNDEFINED = 3;
+/**
+ * Writes sync-call results into the SharedArrayBuffer a blocked worker waits on. Lives in the worker's agent cluster:
+ * the host page's main thread, or the preview relay for workers on the preview origin (a SAB can't cross origins).
+ */
+export declare class SyncReplier {
+    sab: SharedArrayBuffer;
+    private stash;
+    constructor(sab: SharedArrayBuffer);
+    write(payload: Uint8Array): void;
+    /** The worker's bigger buffer after STATE_GROW: deliver the stashed payload into it. */
+    grow(sab: SharedArrayBuffer): void;
+}
 export declare function encodeResult(ok: boolean, value: unknown): Uint8Array;
 export interface RemoteError extends Error {
     code?: string;

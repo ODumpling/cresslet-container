@@ -29,7 +29,7 @@ Install: `pnpm add github:ODumpling/cresslet-container` (dist is committed) or l
 2. **Serve `dist/cresslet-sw.js` from your origin root** (default URL `/cresslet-sw.js`, scope `/`; override with `boot({ serviceWorkerUrl })`). Service workers must be same-origin, so copy it even when loading the library from a CDN.
 3. `dist/node-worker.js` is loaded via `new URL('./node-worker.js', import.meta.url)`; cross-origin (CDN) copies are wrapped in a same-origin blob worker automatically.
 4. esbuild-wasm (0.28.2) loads lazily from jsDelivr; override with `boot({ esbuildWasmUrl })`.
-5. Optional, recommended when the host keeps secrets in storage: a **separate preview origin** (`boot({ previewOrigin })`, see [below](#separate-preview-origin)).
+5. Optional, recommended when the host keeps secrets in storage: a **separate preview origin** (`boot({ previewOrigin })`, see [below](#separate-preview-origin)). Previews and project code in workers (`node`, the CSS worker, `c.projectWorker`) then run there.
 
 `pnpm demo` serves `demo/` with these headers (http://localhost:4400), plus a preview origin on http://127.0.0.1:4401 (try http://localhost:4400/?previewOrigin=http://127.0.0.1:4401).
 
@@ -52,7 +52,7 @@ await c.bundle(esbuildOptions)                   // { outputFiles: [{ path, text
 c.teardown()
 ```
 
-Extras (not in the original contract): `c.vfs` (sync FS), `c.ports`, `c.exec`, `c.which`, `c.path`, `boot({ serviceWorkerUrl: false })`, `boot({ npmCache: false })` (no persistent npm cache), `spawn(..., { terminal: true })` (CRLF output), `c.previewOrigin` (separate preview origin or `null`), `c.previewChannel(name)` (what the dev server notifies previews through), `c.cssWorker()` (the [CSS worker](#css-postcss--tailwind) dev servers and builds share), `boot({ cssPlugins: false })` (CSS processing runs no project code, see [CSS](#css-postcss--tailwind)).
+Extras (not in the original contract): `c.vfs` (sync FS), `c.ports`, `c.exec`, `c.which`, `c.path`, `boot({ serviceWorkerUrl: false })`, `boot({ npmCache: false })` (no persistent npm cache), `spawn(..., { terminal: true })` (CRLF output), `c.previewOrigin` (separate preview origin or `null`), `c.previewChannel(name)` (what the dev server notifies previews through), `c.cssWorker()` (the [CSS worker](#css-postcss--tailwind) dev servers and builds share), `boot({ cssPlugins: false })` (CSS processing runs no project code, see [CSS](#css-postcss--tailwind)), `await c.projectWorker(url, { name? })` (a module Web Worker for project code, e.g. an app's server handler: on the [preview origin](#separate-preview-origin) when there is one, else `new Worker(url, { type: 'module' })`).
 
 Notes:
 - Relative paths resolve against `workdir`.
@@ -68,20 +68,21 @@ Root-relative paths keep working: the SW injects a one-line script into preview 
 
 ### Separate preview origin
 
-By default previews share the host page's origin, so preview code (the user's app and its npm deps) can read the host's `localStorage`, IndexedDB and cookies. `boot({ previewOrigin: 'https://preview.example.com' })` serves them from another origin instead:
+By default previews share the host page's origin, so preview code (the user's app and its npm deps) can read the host's `localStorage`, IndexedDB and cookies, and so can project code in workers (`node`), IndexedDB and Cache Storage included. `boot({ previewOrigin: 'https://preview.example.com' })` runs both on another origin instead:
 
 - The container adds a hidden iframe `${previewOrigin}/cresslet-relay.html?host=<host origin>`. The relay registers `${previewOrigin}/cresslet-sw.js?xorigin=1` (scope `/`) and bridges it to the container over one `MessageChannel`: the SW's requests for the owning page (`cresslet-who`, `cresslet-request`, reply ports and bodies transferred) go relay → container, (un)registration goes container → relay → SW. The relay accepts the handshake only from its `host` param's origin, from its parent window, and (where `location.ancestorOrigins` exists) only when the parent really is that origin; the container accepts the relay's hello only from `previewOrigin` and the relay iframe's window.
 - Dev server notifications (live reload, HMR updates, overlay errors) go container → relay, which re-posts them on the same-named `BroadcastChannel` on the preview origin.
 - `server-ready` / `port` URLs and `c.ports.url()` are `${previewOrigin}/__cresslet__/<id>/<port>/`. With `?xorigin=1` the SW sends `Cross-Origin-Resource-Policy: cross-origin` on preview responses, so the cross-origin-isolated host can frame them.
 - Previews are same-origin with the relay (and so can script it); the container treats relay messages as untrusted and only answers what the SW could ask anyway: requests to this container's own ports. The SW takes ownership (register/unregister, owner probes, recovery after an SW restart) only from relay frames (`/cresslet-relay.html`, nested), never from preview windows; this is hygiene, not a security boundary (previews can script the relay frame and speak through it, see "One trust boundary per preview origin" below). It never routes `/cresslet-relay.html`, `/cresslet-relay.js` or `/cresslet-sw.js` to a preview, so the relay always comes from your server with its `frame-ancestors`. Relay errors are shown only during its setup, prefixed `preview relay:`.
 - A forwarded request whose head doesn't arrive within 30 s (e.g. the relay reloaded mid-request) gets a `504` with `Retry-After: 1`; it isn't replayed.
-- `serviceWorkerUrl` is unused with `previewOrigin` (`false` still disables previews). If the relay reports an error or doesn't connect within 20 s, `boot` rejects (and removes the relay frame).
+- **Workers run in the relay too.** `node` processes (scripts, servers, npm bins, the [CSS worker](#css-postcss--tailwind)) and `c.projectWorker(url)` workers are started by the relay frame, on the preview origin: the container fetches the script (`node-worker.js` once per page, a project worker's `url` per call) and sends its source over the relay port, and the relay runs it from a `blob:` URL (so nothing more needs serving there, and a project worker's imports must be absolute URLs). Each one talks to the container over its own `MessagePort`, proxied by the relay (messages are cloned again there: MessagePorts pass through, transfer-only values such as streams don't). `node`'s sync calls block on a `SharedArrayBuffer`, which can't cross origins, so the relay owns it: the worker posts a call, the container answers, and the relay writes the result into the buffer. The relay frame gets `allow="cross-origin-isolated"` for that (it must be cross-origin isolated itself: COEP below). If the relay reloads, its workers die with it: their processes exit with `node: worker error: preview relay restarted` (project workers get an `onerror`); workers started while it reconnects wait for it.
+- `serviceWorkerUrl` is unused with `previewOrigin` (`false` still disables previews; then there is no relay, and `node` / `c.projectWorker` fail to start rather than run on the host origin). If the relay reports an error or doesn't connect within 20 s, `boot` rejects (and removes the relay frame).
 
 The host page keeps COOP/COEP as above. At the **preview origin's root**, serve these files from `dist/`, with these headers:
 
 | Path | Headers |
 | --- | --- |
-| `/cresslet-relay.html` | `Cross-Origin-Embedder-Policy: require-corp`, `Cross-Origin-Resource-Policy: cross-origin`, `Content-Security-Policy: frame-ancestors <host origin>` |
+| `/cresslet-relay.html` | `Cross-Origin-Embedder-Policy: require-corp`, `Cross-Origin-Resource-Policy: cross-origin`, `Content-Security-Policy: frame-ancestors <host origin>` (a stricter CSP must allow `worker-src blob:`) |
 | `/cresslet-relay.js` | none required (same-origin to the relay); `Cross-Origin-Resource-Policy: cross-origin` is fine |
 | `/cresslet-sw.js` | `Service-Worker-Allowed: /` |
 
@@ -89,7 +90,8 @@ The host page keeps COOP/COEP as above. At the **preview origin's root**, serve 
 
 What it does and doesn't isolate:
 - **One trust boundary per preview origin.** All previews served from one `previewOrigin` (every container, every port, every tab) share that origin: they can script each other's frames and the relay, read each other's storage, and answer each other's requests. Use distinct preview origins for containers that must not trust each other (e.g. different users' projects).
-- **Only browser-rendered preview code moves.** `node` and other server code the container runs (dev server plugins, `node server.js`, npm bins) still runs in Web Workers on the **host origin**. Workers can't read `localStorage` or cookies via `document.cookie`, but they can open the host's IndexedDB and Cache Storage and make same-origin (credentialed) requests to the host. Don't rely on `previewOrigin` to contain untrusted `node` code.
+- **What moves, what doesn't.** Previews, `node` processes and project workers run on the preview origin: they can't open the host's IndexedDB or Cache Storage, and requests to the host are cross-origin. The container itself (VFS, shell, npm, esbuild, the dev server and builds) stays on the host page; it runs no project code there except `servePort` / dev server `middleware` handlers the host registers, and the host's own registered commands. Workers still get the container's VFS (their project's files) over their port, as before.
+- **Workers are in the preview origin's trust boundary.** Previews can script the relay frame, so they can reach the workers it runs, and through a `node` process, its container's VFS: on one preview origin, a project's client code can do what its server code can (and, as above, other containers' previews there can too).
 - **Cross-site preview origins need third-party service workers and storage.** Browsers or settings that block them (some privacy modes, "block third-party cookies" in some browsers) make the relay fail: `boot` rejects with a `preview relay:` error that says so. Fall back to a same-site preview origin or no `previewOrigin`.
 
 Choosing the origin:
@@ -123,7 +125,7 @@ These run in the **CSS worker**: one long-lived `node` process per container (st
 
 **HMR**: editing a stylesheet or anything it `@import`s swaps it in place; so does editing a Tailwind config/plugin or (v3) a file in its content globs. A source file that brings **new** Tailwind class candidates re-serves the Tailwind stylesheets in the same update as the component's Fast Refresh, so new utilities apply without a reload (like Tailwind itself, the candidate set only grows during a session).
 
-**Security**: serving or building a stylesheet runs project code (the PostCSS config and its plugins, Tailwind `@plugin`/`@config` modules) in the CSS worker, a container worker on the **host page's origin** (like `node`; it isn't sandboxed on the preview origin). For untrusted projects, `boot({ cssPlugins: false })` ignores PostCSS configs and refuses `@plugin`/`@config`; Tailwind v4 core still compiles (so the installed `tailwindcss` package's own code still runs there).
+**Security**: serving or building a stylesheet runs project code (the PostCSS config and its plugins, Tailwind `@plugin`/`@config` modules) in the CSS worker, a `node` process: on the host page's origin, or on the [preview origin](#separate-preview-origin) with `previewOrigin`. For untrusted projects without a preview origin, `boot({ cssPlugins: false })` ignores PostCSS configs and refuses `@plugin`/`@config`; Tailwind v4 core still compiles (so the installed `tailwindcss` package's own code still runs there).
 
 ## Build
 
@@ -136,7 +138,7 @@ Parses `index.html`, bundles each `<script type="module" src>` and local stylesh
 - CSS: PostCSS plugins must be pure JS (native addons, `child_process`, workers don't run); `postcss-load-config`'s YAML/`.postcssrc` (no extension) and `package.json#postcss` aren't read. Tailwind v4 output isn't run through lightningcss (no `optimize`, nesting/`@property` left for the browser; minified by esbuild in `build`). Content detection ignores `.gitignore` (fixed skip list instead) and tokenizes generically (a superset of Tailwind's own candidates; classes assembled from string fragments are missed, as in Tailwind). Tailwind v3 works through PostCSS but is best-effort (tested: build + HMR of a React app).
 - `node` needs a cross-origin isolated page; without it sync fs/`require` fail with a clear error.
 - `npm`: no lockfile-driven installs, no workspaces, no git/file deps, no lifecycle scripts. The package cache has no size cap/eviction of its own (the browser may evict it; clear with `indexedDB.deleteDatabase('cresslet-npm')`).
-- Without `previewOrigin`, previews share the host origin (and its storage); a preview at `/` and a host page at `/` can't be told apart on a *top-level* reload. Manual reload of a preview frame after `pushState` is best-effort in WebKit.
+- Without `previewOrigin`, previews and `node` share the host origin (and its storage); a preview at `/` and a host page at `/` can't be told apart on a *top-level* reload. Manual reload of a preview frame after `pushState` is best-effort in WebKit.
 - With a cross-site `previewOrigin` (or in WebKit), previews work in frames of the host page only, not as top-level tabs (see [Separate preview origin](#separate-preview-origin)).
 - In-memory only: the VFS is lost on reload (persist with `export()`/`mount()`).
 
@@ -148,6 +150,7 @@ host page ───────────────────────�
      ├─ jsh (parser + builtins) ── commands: npm · npx · vite · serve · node · registered
      ├─ npm: resolver (semver, hoist) → registry fetch → gunzip/untar → VFS
      ├─ node → Web Worker (CJS loader, polyfills) ⇄ SAB/Atomics sync RPC (fs, resolve, esbuild transform)
+     │    └─ with previewOrigin: started by the relay on the preview origin (it owns the SAB), proxied over a MessagePort
      ├─ dev server (module graph, HMR, React Refresh) / build → esbuild-wasm (VFS plugin)
      │    └─ stylesheets → CSS worker (`node` process: project's postcss + plugins, tailwindcss compile(); candidates scanned on the main thread)
      └─ PortTable ⇄ cresslet-sw.js ⇄ preview iframes (/__cresslet__/<id>/<port>/…)

@@ -13,7 +13,8 @@ import { createDevServer, type DevServerHandle, type DevServerOptions } from './
 import { build, type BuildOptions } from './build/build'
 import { nodeCssBackend, type CssBackend } from './css/pipeline'
 import { dirname, join, normalize, resolve } from './path'
-import { acceptHello, BROADCAST, BROADCAST_CLOSE, newestWorker, RELAY_ERROR, RELAY_INIT, RELAY_READY, relayErrorText, relayUrl, THIRD_PARTY_HINT, toOrigin } from './relay-protocol'
+import { acceptHello, BROADCAST, BROADCAST_CLOSE, newestWorker, PROC_SPAWN, WORKER_SPAWN, RELAY_ERROR, RELAY_INIT, RELAY_READY, relayErrorText, relayUrl, THIRD_PARTY_HINT, toOrigin, WORKER_SCRIPT } from './relay-protocol'
+import { localChannel, relayChannel, relayWorker, type NodeChannel, type ProjectWorker } from './node/channel'
 
 export interface BootOptions {
   /** Service worker URL served by the host at its origin root. Default '/cresslet-sw.js'. `false` disables previews. */
@@ -29,7 +30,8 @@ export interface BootOptions {
   /**
    * Serve previews from this origin (e.g. 'https://preview.example.com') instead of the host page's, so preview code
    * can't read the host's storage. The container frames `${previewOrigin}/cresslet-relay.html`, which registers
-   * `${previewOrigin}/cresslet-sw.js`; `serviceWorkerUrl` is then unused (`false` still disables previews).
+   * `${previewOrigin}/cresslet-sw.js` and also runs `node` processes (server code, npm bins, the CSS worker) on that
+   * origin; `serviceWorkerUrl` is then unused (`false` disables previews, and then `node` / `projectWorker` fail to start).
    * Unset (or equal to the page's origin): previews share the host origin.
    */
   previewOrigin?: string
@@ -98,6 +100,14 @@ export class Container {
   /** Whether CSS processing runs project code (`boot({ cssPlugins })`). */
   readonly cssPlugins: boolean
   private relayPort: MessagePort | null = null
+  /** Whether the relay connected at boot (previews, and `node`, run on the preview origin). */
+  private relayBooted = false
+  /** The current relay connection once it's ready (set up its service worker and message handler), else rejected. */
+  private relayConn: Promise<MessagePort> | null = null
+  /** The relay port the node worker script was last sent on. */
+  private relayScriptPort: MessagePort | null = null
+  /** Kill switches of `node` processes and project workers running in the relay (they die with its document). */
+  private relayProcs = new Set<(reason: string) => void>()
   private listeners = new Map<string, Set<Handler>>()
   private commands = new Map<string, Command>()
   private procs = new Set<ContainerProcess>()
@@ -333,10 +343,68 @@ export class Container {
 
   /** Create a runtime worker shipped next to this module (dist/node-worker.js). */
   createWorker(_name: 'node-worker.js'): Worker {
-    const url = new URL('./node-worker.js', import.meta.url)
+    const url = workerScriptUrl()
     if (typeof location === 'undefined' || url.origin === location.origin) return new Worker(url, { type: 'module', name: 'cresslet-node' })
     const blob = new Blob([`import ${JSON.stringify(url.href)};`], { type: 'text/javascript' })
     return new Worker(URL.createObjectURL(blob), { type: 'module', name: 'cresslet-node' })
+  }
+
+  /**
+   * Start a `node` worker: on the preview origin (run by the relay) when previews are served from a separate
+   * `previewOrigin`, so project code there can't open this page's IndexedDB / Cache Storage; on this page otherwise.
+   * @internal
+   */
+  async nodeChannel(): Promise<NodeChannel> {
+    if (!this.previewOrigin) return localChannel(this.createWorker('node-worker.js'))
+    this.checkRelayEnabled()
+    nodeSource ??= fetchSource(workerScriptUrl().href).catch((e) => {
+      nodeSource = null
+      throw e
+    })
+    const source = await nodeSource
+    const relay = await this.workerRelay() // after the fetch: a relay that reconnected meanwhile has a new port
+    if (this.relayScriptPort !== relay) {
+      relay.postMessage({ type: WORKER_SCRIPT, source })
+      this.relayScriptPort = relay
+    }
+    const { port1, port2 } = new MessageChannel()
+    const kill = (reason: string) => (ch.terminate(), notify(() => ch.onerror?.(reason)))
+    const ch = relayChannel(port1, () => this.relayProcs.delete(kill))
+    this.relayProcs.add(kill)
+    relay.postMessage({ type: PROC_SPAWN }, [port2])
+    return ch
+  }
+
+  /**
+   * Start a module Web Worker for project code (e.g. an app's server handler) where `node` runs: on the preview origin
+   * when previews are served from a separate `previewOrigin` (the page fetches `url` and the relay runs it from a
+   * `blob:` URL there, so its imports must be absolute URLs), else `new Worker(url, { type: 'module' })` on this page.
+   * Messages are structured-cloned and MessagePorts passed on; values that can only be transferred (streams, ...) fail;
+   * `onerror` gets `{ message }`. With a `previewOrigin` it never falls back to this page's origin: it rejects when
+   * there's no relay (`serviceWorkerUrl: false`).
+   */
+  async projectWorker(url: string | URL, opts: { name?: string } = {}): Promise<ProjectWorker> {
+    const href = new URL(url, typeof location === 'undefined' ? undefined : location.href).href
+    if (!this.previewOrigin) return new Worker(href, { type: 'module', name: opts.name }) as ProjectWorker
+    this.checkRelayEnabled()
+    const source = await fetchSource(href)
+    const relay = await this.workerRelay()
+    const { port1, port2 } = new MessageChannel()
+    const kill = (reason: string) => (w.terminate(), notify(() => w.onerror?.({ message: reason })))
+    const w = relayWorker(port1, () => this.relayProcs.delete(kill))
+    this.relayProcs.add(kill)
+    relay.postMessage({ type: WORKER_SPAWN, source, name: opts.name }, [port2])
+    return w
+  }
+
+  /** The relay port to start workers on. Never falls back to this page's origin when there is a `previewOrigin`. */
+  private async workerRelay(): Promise<MessagePort> {
+    if (!this.relayConn) throw new Error('preview relay is not connected')
+    return this.relayConn
+  }
+
+  private checkRelayEnabled(): void {
+    if (!this.relayBooted) throw new Error('project code runs on the preview origin, but previews are disabled (serviceWorkerUrl: false): no relay to run it')
   }
 
   // ---------------- service worker bridge ----------------
@@ -380,6 +448,8 @@ export class Container {
     frame.title = 'cresslet preview relay'
     frame.tabIndex = -1
     frame.setAttribute('aria-hidden', 'true')
+    // node workers run in the relay and block on SharedArrayBuffers: the frame must be cross-origin isolated too
+    frame.allow = 'cross-origin-isolated'
     frame.style.display = 'none'
     return new Promise<void>((resolve, reject) => {
       let booted = false
@@ -397,29 +467,45 @@ export class Container {
         removeEventListener('message', onWindowMessage)
         this.relayPort?.close()
         this.relayPort = null
+        this.relayConn = null
       }
       const onWindowMessage = (ev: MessageEvent) => {
         if (!acceptHello(ev, { previewOrigin: origin, relay: frame.contentWindow })) return
-        // (re)connect: a reloaded relay says hello again
+        // (re)connect: a reloaded relay says hello again; its node workers died with the old document
+        for (const kill of [...this.relayProcs]) kill('preview relay restarted')
         const ch = new MessageChannel()
         this.relayPort?.close()
         const port = (this.relayPort = ch.port1)
         let ready = false
+        // workers started meanwhile wait for this connection (or fail with its setup error)
+        let settle!: (e?: Error) => void
+        const conn = (this.relayConn = new Promise<MessagePort>((res, rej) => {
+          const t = setTimeout(() => settle(new Error(`preview relay did not reconnect within ${RELAY_TIMEOUT / 1000}s`)), RELAY_TIMEOUT)
+          settle = (e) => (clearTimeout(t), e ? rej(e) : res(port))
+        }))
+        conn.catch(() => {})
         port.onmessage = (e) => {
           const m = e.data
           if (m?.type === RELAY_READY && !ready) {
             ready = true
+            settle()
+            // ready after the deadline (launches that waited got the timeout): later launches use it
+            if (this.relayPort === port) this.relayConn = Promise.resolve(port)
             port.postMessage({ type: 'cresslet-register', instanceId: this.instanceId })
             if (!booted) {
-              booted = true
+              booted = this.relayBooted = true
               clearTimeout(timer)
               resolve()
             }
           } else if (m?.type === RELAY_ERROR) {
             // previews can script the relay: only believe errors from its setup, and never show them unmarked
             if (ready) return
+            settle(new Error(relayErrorText(m.message)))
             if (!booted) fail(relayErrorText(m.message))
-            else this.emit('error', { message: relayErrorText(m.message) })
+            else {
+              for (const kill of [...this.relayProcs]) kill(relayErrorText(m.message))
+              this.emit('error', { message: relayErrorText(m.message) })
+            }
           } else this.onSwMessage(m, e.ports, true)
         }
         frame.contentWindow!.postMessage({ type: RELAY_INIT }, origin, [ch.port2])
@@ -469,6 +555,25 @@ export class Container {
     for (const fn of this.cleanups.splice(0)) fn()
     this.listeners.clear()
   }
+}
+
+/** Run a caller's callback without letting it break ours. */
+function notify(fn: () => void): void {
+  try {
+    fn()
+  } catch (e) {
+    console.error(e)
+  }
+}
+
+const workerScriptUrl = () => new URL('./node-worker.js', import.meta.url)
+/** node-worker.js's source (fetched once per page). */
+let nodeSource: Promise<string> | null = null
+/** A worker script's source, for the relay to run as a blob: worker on the preview origin (no extra files to serve there). */
+async function fetchSource(href: string): Promise<string> {
+  const r = await fetch(href)
+  if (!r.ok) throw new Error(`fetching ${href}: HTTP ${r.status}`)
+  return r.text()
 }
 
 export type { FileSystemTree, ContainerProcess, SpawnOptions, Command, CommandContext, DevServerOptions, DevServerHandle, BuildOptions, Dirent, Stats }

@@ -7,15 +7,8 @@ import { FsError, toBytes } from '../vfs'
 import { NODE_OPTS, resolveModule } from '../resolve'
 import { isEsmFile } from '../esm'
 import { formatErrors, loadEsbuild } from '../esbuild'
-import {
-  DEFAULT_SAB,
-  encodeResult,
-  HEADER,
-  STATE_DONE,
-  STATE_GROW,
-  type MainToWorker,
-  type WorkerToMain,
-} from './protocol'
+import { encodeResult, type MainToWorker, type WorkerToMain } from './protocol'
+import type { NodeChannel } from './channel'
 
 const HASHES: Record<string, string> = { sha1: 'SHA-1', sha256: 'SHA-256', sha384: 'SHA-384', sha512: 'SHA-512' }
 
@@ -230,31 +223,19 @@ export async function nodeCommand(ctx: CommandContext): Promise<number> {
 
 export const NODE_VERSION = 'v22.12.0'
 
-export function runNode(ctx: CommandContext, entry: string, args: string[]): Promise<number> {
+export async function runNode(ctx: CommandContext, entry: string, args: string[]): Promise<number> {
   const c = ctx.container
-  const worker = c.createWorker('node-worker.js')
-  const isolated = typeof SharedArrayBuffer !== 'undefined' && (globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated !== false
-  let sab: SharedArrayBuffer | null = isolated ? new SharedArrayBuffer(HEADER + DEFAULT_SAB) : null
-  const post = (m: MainToWorker, transfer: Transferable[] = []) => worker.postMessage(m, transfer)
+  let worker: NodeChannel
+  try {
+    worker = await c.nodeChannel()
+  } catch (e) {
+    ctx.stderr.write(`node: ${errorMessage(e)}\n`)
+    return 1
+  }
+  const post = (m: MainToWorker, transfer: Transferable[] = []) => worker.post(m, transfer)
   const ports = new Set<number>()
   const pending = new Map<number, { resolve: (r: Response) => void; reject: (e: Error) => void; ctrl?: ReadableStreamDefaultController<Uint8Array> }>()
   let reqId = 0
-  let stash: Uint8Array | null = null
-
-  const writeSync = (payload: Uint8Array) => {
-    const buf = sab!
-    const i32 = new Int32Array(buf, 0, 2)
-    if (payload.byteLength > buf.byteLength - HEADER) {
-      stash = payload
-      Atomics.store(i32, 1, payload.byteLength)
-      Atomics.store(i32, 0, STATE_GROW)
-    } else {
-      new Uint8Array(buf, HEADER, payload.byteLength).set(payload)
-      Atomics.store(i32, 1, payload.byteLength)
-      Atomics.store(i32, 0, STATE_DONE)
-    }
-    Atomics.notify(i32, 0)
-  }
 
   return new Promise<number>((resolveExit) => {
     let done = false
@@ -272,14 +253,14 @@ export function runNode(ctx: CommandContext, entry: string, args: string[]): Pro
       // give the process a moment to clean up, then hard-kill
       setTimeout(() => finish(130), 150)
     }
+    if (ctx.signal.aborted) return finish(130)
     ctx.signal.addEventListener('abort', onAbort, { once: true })
 
-    worker.onerror = (e) => {
-      ctx.stderr.write(`node: worker error: ${e.message ?? e}\n`)
+    worker.onerror = (message) => {
+      ctx.stderr.write(`node: worker error: ${message}\n`)
       finish(1)
     }
-    worker.onmessage = async (ev: MessageEvent<WorkerToMain>) => {
-      const m = ev.data
+    worker.onmessage = async (m: WorkerToMain) => {
       switch (m.type) {
         case 'stdout':
           ctx.stdout.write(m.data)
@@ -297,14 +278,7 @@ export function runNode(ctx: CommandContext, entry: string, args: string[]): Pro
           } catch (e) {
             payload = encodeResult(false, e instanceof FsError ? e : { message: errorMessage(e), code: (e as { code?: string }).code })
           }
-          writeSync(payload)
-          break
-        }
-        case 'sync-grow': {
-          sab = m.sab
-          const payload = stash!
-          stash = null
-          writeSync(payload)
+          worker.reply(payload)
           break
         }
         case 'async': {
@@ -383,7 +357,7 @@ export function runNode(ctx: CommandContext, entry: string, args: string[]): Pro
       isTTY: !!ctx.isTTY,
       columns: 80,
       pid: ++pidCounter,
-      sab,
+      sab: null, // filled in by the channel (whoever owns the worker owns its SharedArrayBuffer)
       ports: c.ports.list(),
     })
   })

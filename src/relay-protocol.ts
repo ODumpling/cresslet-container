@@ -7,7 +7,11 @@
 //   relay -> host: SW messages for the owning page (cresslet-who / cresslet-request, reply ports transferred),
 //                  RELAY_READY / RELAY_ERROR
 //   host -> relay: cresslet-register / cresslet-unregister (forwarded to the SW), BROADCAST / BROADCAST_CLOSE
-//                  (re-posted on the preview origin's BroadcastChannel of that name)
+//                  (re-posted on the preview origin's BroadcastChannel of that name), WORKER_SCRIPT (node-worker.js
+//                  source, once per connection), PROC_SPAWN + a MessagePort (start a `node` worker on the preview
+//                  origin; the relay proxies it over that port, see node/channel.ts), WORKER_SPAWN + a MessagePort
+//                  (start a project worker from the given source, `Container.projectWorker`; messages go over the
+//                  port wrapped as { t: 'msg', data }, plus { t: 'terminate' } / { t: 'error', message })
 
 export const RELAY_HELLO = 'cresslet-relay-hello'
 export const RELAY_INIT = 'cresslet-relay-init'
@@ -15,6 +19,9 @@ export const RELAY_READY = 'cresslet-relay-ready'
 export const RELAY_ERROR = 'cresslet-relay-error'
 export const BROADCAST = 'cresslet-broadcast'
 export const BROADCAST_CLOSE = 'cresslet-broadcast-close'
+export const WORKER_SCRIPT = 'cresslet-worker-script'
+export const PROC_SPAWN = 'cresslet-proc-spawn'
+export const WORKER_SPAWN = 'cresslet-worker-spawn'
 
 /** SW -> owning page messages the relay forwards. */
 export const SW_TO_PAGE = new Set(['cresslet-who', 'cresslet-request'])
@@ -72,6 +79,24 @@ export function isPageToSw(d: unknown): d is { type: string; instanceId: string 
 export function isSwToPage(d: unknown, ports: readonly unknown[]): boolean {
   const m = d as { type?: unknown } | null
   return !!m && typeof m === 'object' && typeof m.type === 'string' && SW_TO_PAGE.has(m.type) && ports.length === 1
+}
+
+/** Relay side: the node worker script to run processes with. */
+export function isWorkerScript(d: unknown): d is { type: string; source: string } {
+  const m = d as { type?: unknown; source?: unknown } | null
+  return !!m && typeof m === 'object' && m.type === WORKER_SCRIPT && typeof m.source === 'string'
+}
+
+/** Relay side: start a process, talking to the host over the one transferred port. */
+export function isProcSpawn(d: unknown, ports: readonly unknown[]): boolean {
+  const m = d as { type?: unknown } | null
+  return !!m && typeof m === 'object' && m.type === PROC_SPAWN && ports.length === 1
+}
+
+/** Relay side: start a project worker from `source`, talking to the host over the one transferred port. */
+export function isWorkerSpawn(d: unknown, ports: readonly unknown[]): d is { type: string; source: string; name?: string } {
+  const m = d as { type?: unknown; source?: unknown; name?: unknown } | null
+  return !!m && typeof m === 'object' && m.type === WORKER_SPAWN && typeof m.source === 'string' && (m.name === undefined || typeof m.name === 'string') && ports.length === 1
 }
 
 export function isChannelName(s: unknown): s is string {
