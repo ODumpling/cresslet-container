@@ -362,17 +362,22 @@ export class VfsPersistence implements Persistence {
       other?.close()
     }
     if (this.closed) return
-    // from the root: removing or renaming an ancestor (`rm -rf /home`) changes the workdir too
+    // from the root: removing or renaming an ancestor (`rm -rf /home`) changes the workdir too.
+    // `dir` counts if it's the workdir `b` or an ancestor (removed / renamed), or a path in it outside node_modules
+    const under = (abs: string, b: string) => (b + '/').startsWith(abs + '/') || (abs.startsWith(b + '/') && !isNodeModules(abs.slice(b.length + 1)))
     const base = this.dir === '/' ? '' : this.dir
-    // the workdir or an ancestor (removed / renamed), or a path in it outside node_modules
-    const counts = (abs: string) => (base + '/').startsWith(abs + '/') || (abs.startsWith(base + '/') && !isNodeModules(abs.slice(base.length + 1)))
     const w = this.vfs.watch('/', { recursive: true }, (event, rel) => {
       const abs = '/' + rel
-      if (counts(abs)) return this.changed()
-      // through a symlink into the workdir (`node_modules/pkg -> ../packages/pkg`, a link elsewhere)? A linked
-      // directory on the way (writes, new files, removals), or a write through a link to a file
+      if (under(abs, base)) return this.changed()
+      // through a symlink? A linked directory on the way (`node_modules/pkg -> ../packages/pkg`, a link from
+      // elsewhere: writes, new files, removals), a write through a link to a file, or a workdir that is itself a
+      // link now (moved, linked back)
       try {
+        const real = this.vfs.exists(this.dir) ? this.vfs.realpath(this.dir) : this.dir
+        const bases = real === this.dir ? [base] : [base, real === '/' ? '' : real]
+        const counts = (p: string) => bases.some((b) => under(p, b))
         const dir = dirname(abs)
+        if (counts(abs)) return this.changed()
         if (this.vfs.isDir(dir) && counts(join(this.vfs.realpath(dir), basename(abs)))) return this.changed()
         if (event === 'change' && this.vfs.lstat(abs).isSymbolicLink() && counts(this.vfs.realpath(abs))) this.changed()
       } catch {

@@ -205,6 +205,19 @@ describe('VfsPersistence', () => {
     expect(gone.readdir(W)).toEqual([])
   })
 
+  it('a workdir moved and linked back keeps saving edits made at its new path', async () => {
+    const { fs, p, store } = await setup({ debounceMs: 60_000 })
+    fs.writeFile(`${W}/a.txt`, 'v1')
+    fs.rename(W, '/home/moved')
+    fs.symlink('/home/moved', W)
+    await p.flush()
+    fs.writeFile('/home/moved/a.txt', 'v2')
+    await p.flush()
+    const back = new VFS()
+    restoreSnapshot(back, W, store.data.get('default')!)
+    expect(back.readText(`${W}/a.txt`)).toBe('v2')
+  })
+
   it('flush() writes now; clear() drops pending changes and the snapshot', async () => {
     const { fs, p, store } = await setup({ key: 'proj', debounceMs: 60_000 })
     fs.writeFile(`${W}/a`, '1')
