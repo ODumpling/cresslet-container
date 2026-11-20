@@ -20,6 +20,9 @@ importers:
       autoprefixer:
         specifier: ^10.7.0
         version: 10.7.0(postcss@8.5.33)
+      brotli-wasm:
+        specifier: 3.0.1
+        version: 3.0.1
       buffer:
         specifier: 6.0.3
         version: 6.0.3
@@ -413,6 +416,10 @@ packages:
     resolution: {integrity: sha512-Q9buOYhr2ggrEZpImICecZTJHCCd8yXkRUokFlUEQ8uiD6oP82F4W4jWnhOHZYV+wlvrC51V7Wy0ULyWjil5Wg==}
     engines: {node: '>=6.0.0'}
     hasBin: true
+
+  brotli-wasm@3.0.1:
+    resolution: {integrity: sha512-U3K72/JAi3jITpdhZBqzSUq+DUY697tLxOuFXB+FpAE/Ug+5C3VZrv4uA674EUZHxNAuQ9wETXNqQkxZD6oL4A==}
+    engines: {node: '>=v18.0.0'}
 
   browserslist@4.29.6:
     resolution: {integrity: sha512-CmVVIQ3RVc5HxYEc9X84GvxK/C8C1wH8TlKAiO7uTxF8PDwt7r8t9Qk3J9NkMOVzX5O/HbLv3yzxZg9HPrnI9w==}
@@ -986,6 +993,8 @@ snapshots:
   base64-js@1.5.1: {}
 
   baseline-browser-mapping@2.11.39: {}
+
+  brotli-wasm@3.0.1: {}
 
   browserslist@4.29.6:
     dependencies:

@@ -23,6 +23,36 @@ export type MainToWorker =
   | { type: 'async-result'; id: number; ok: boolean; value: unknown }
   | { type: 'http-request'; id: number; port: number; method: string; url: string; headers: [string, string][]; body: ArrayBuffer | null }
   | { type: 'http-abort'; id: number }
+  | ChildEvent
+
+/** `child_process`: what happens to a child the worker spawned (`child-spawn`), in order: spawn | error, out*, exit. */
+export type ChildEvent =
+  | { type: 'child'; id: number; ev: 'spawn' }
+  | { type: 'child'; id: number; ev: 'error'; message: string; code: string }
+  | { type: 'child'; id: number; ev: 'out'; fd: 1 | 2; data: string }
+  | { type: 'child'; id: number; ev: 'exit'; code: number | null; signal: string | null }
+
+/** How a child's stdin / stdout / stderr connect: to the parent worker, the parent's own stdio, or nothing. */
+export type ChildStdio = 'pipe' | 'inherit' | 'ignore'
+
+export interface ChildSpec {
+  /** Command name or path; with `shell`, a jsh command line. */
+  file: string
+  args: string[]
+  shell: boolean
+  cwd?: string
+  env?: Record<string, string>
+  stdio: [ChildStdio, ChildStdio, ChildStdio]
+}
+
+/** spawnSync's result: output as text (the parent worker makes Buffers), status null when killed by `signal`. */
+export interface ChildSyncResult {
+  status: number | null
+  signal: string | null
+  stdout: string
+  stderr: string
+  error?: { message: string; code: string }
+}
 
 /** Host <-> preview relay, per process (relay-hosted workers only): sync replies, kill, worker errors. */
 export type HostToRelayProc = MainToWorker | { type: 'sync-result'; payload: Uint8Array } | { type: 'terminate' }
@@ -39,6 +69,10 @@ export type WorkerToMain =
   | { type: 'http-head'; id: number; status: number; statusText: string; headers: [string, string][] }
   | { type: 'http-chunk'; id: number; data: Uint8Array }
   | { type: 'http-end'; id: number; error?: string }
+  | ({ type: 'child-spawn'; id: number } & ChildSpec)
+  /** A chunk for the child's stdin; `null` ends it. */
+  | { type: 'child-stdin'; id: number; data: string | null }
+  | { type: 'child-kill'; id: number; signal: string }
 
 // SAB layout: Int32 [0]=state, [1]=payload length; bytes from offset 8 = payload.
 export const HEADER = 8

@@ -9,6 +9,9 @@ import { isEsmFile } from '../esm'
 import { formatErrors, loadEsbuild } from '../esbuild'
 import { encodeResult, type MainToWorker, type WorkerToMain } from './protocol'
 import type { NodeChannel } from './channel'
+import { zlibOp } from './brotli'
+import { ChildHost, parseSpec } from './child'
+import type { ZFormat, ZMode } from './codec'
 
 const HASHES: Record<string, string> = { sha1: 'SHA-1', sha256: 'SHA-256', sha384: 'SHA-384', sha512: 'SHA-512' }
 
@@ -174,6 +177,8 @@ export async function runOp(c: Container, op: string, args: unknown[]): Promise<
       const key = await crypto.subtle.importKey('raw', args[1] as BufferSource, { name: 'HMAC', hash: name }, false, ['sign'])
       return new Uint8Array(await crypto.subtle.sign('HMAC', key, args[2] as BufferSource))
     }
+    case 'zlib':
+      return zlibOp(args[0] as ZFormat, args[1] as ZMode, args[2] as Uint8Array, args[3] as number | undefined, c.brotliWasmUrl)
     case 'fetch-local': {
       const [port, method, url, headers, body] = args as [number, string, string, [string, string][], ArrayBuffer | null]
       const res = await c.ports.dispatch(port, new Request(url, { method, headers, body: body && method !== 'GET' && method !== 'HEAD' ? body : undefined }))
@@ -236,12 +241,14 @@ export async function runNode(ctx: CommandContext, entry: string, args: string[]
   const ports = new Set<number>()
   const pending = new Map<number, { resolve: (r: Response) => void; reject: (e: Error) => void; ctrl?: ReadableStreamDefaultController<Uint8Array> }>()
   let reqId = 0
+  const children = new ChildHost(ctx, (e) => post(e))
 
   return new Promise<number>((resolveExit) => {
     let done = false
     const finish = (code: number) => {
       if (done) return
       done = true
+      children.killAll()
       worker.terminate()
       for (const p of ports) c.ports.close(p)
       for (const [, p] of pending) p.reject(new Error('process exited'))
@@ -274,7 +281,7 @@ export async function runNode(ctx: CommandContext, entry: string, args: string[]
         case 'sync': {
           let payload: Uint8Array
           try {
-            payload = encodeResult(true, await runOp(c, m.op, m.args))
+            payload = encodeResult(true, m.op === 'spawnSync' ? await spawnSync(m.args) : await runOp(c, m.op, m.args))
           } catch (e) {
             payload = encodeResult(false, e instanceof FsError ? e : { message: errorMessage(e), code: (e as { code?: string }).code })
           }
@@ -290,6 +297,17 @@ export async function runNode(ctx: CommandContext, entry: string, args: string[]
           }
           break
         }
+        case 'child-spawn': {
+          const spec = parseSpec(m)
+          if (typeof m.id === 'number' && spec) children.spawn(m.id, spec)
+          break
+        }
+        case 'child-stdin':
+          if (typeof m.id === 'number' && (typeof m.data === 'string' || m.data === null)) children.stdin(m.id, m.data)
+          break
+        case 'child-kill':
+          if (typeof m.id === 'number') children.kill(m.id, typeof m.signal === 'string' ? m.signal.slice(0, 32) : 'SIGTERM')
+          break
         case 'listen': {
           ports.add(m.port)
           c.ports.open(m.port, (req) => forward(m.port, req), 'node')
@@ -328,6 +346,12 @@ export async function runNode(ctx: CommandContext, entry: string, args: string[]
           break
         }
       }
+    }
+
+    const spawnSync = (args: unknown[]) => {
+      const [spec, input, timeout] = [parseSpec(args[0]), args[1], args[2]]
+      if (!spec || (input !== null && typeof input !== 'string')) throw new TypeError('spawnSync: bad arguments')
+      return children.spawnSync(spec, input, typeof timeout === 'number' ? timeout : 0)
     }
 
     const forward = async (port: number, req: Request): Promise<Response> => {

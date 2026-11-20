@@ -15,12 +15,18 @@ import { nodeCssBackend, type CssBackend } from './css/pipeline'
 import { dirname, join, normalize, resolve } from './path'
 import { acceptHello, BROADCAST, BROADCAST_CLOSE, newestWorker, PROC_SPAWN, WORKER_SPAWN, RELAY_ERROR, RELAY_INIT, RELAY_READY, relayErrorText, relayUrl, THIRD_PARTY_HINT, toOrigin, WORKER_SCRIPT } from './relay-protocol'
 import { localChannel, relayChannel, relayWorker, type NodeChannel, type ProjectWorker } from './node/channel'
+import { DEFAULT_BROTLI_WASM_URL } from './node/brotli'
 
 export interface BootOptions {
   /** Service worker URL served by the host at its origin root. Default '/cresslet-sw.js'. `false` disables previews. */
   serviceWorkerUrl?: string | false
   /** esbuild.wasm URL (must match esbuild-wasm version). Default: jsDelivr. */
   esbuildWasmUrl?: string
+  /**
+   * brotli WASM URL for `zlib` brotli in `node` where the browser's CompressionStream lacks it (Chromium); must match
+   * brotli-wasm 3.0.1 (`pkg.web/brotli_wasm_bg.wasm`). Fetched on first use. Default: jsDelivr.
+   */
+  brotliWasmUrl?: string
   /** npm registry base. Default 'https://registry.npmjs.org'. */
   registry?: string
   /** Project directory. Default '/home/project'. */
@@ -97,6 +103,7 @@ export class Container {
   readonly ports: PortTable
   readonly registry: Registry
   readonly esbuildWasmUrl: string
+  readonly brotliWasmUrl: string
   readonly resolveFs: ResolveFs
   readonly fs: FsApi
   /** Origin previews are served from when it differs from the page's (`boot({ previewOrigin })`), else null. */
@@ -125,6 +132,7 @@ export class Container {
     this.registry = new HttpRegistry(opts.registry ?? 'https://registry.npmjs.org', { cache })
     dropLegacyCache()
     this.esbuildWasmUrl = opts.esbuildWasmUrl ?? DEFAULT_WASM_URL
+    this.brotliWasmUrl = opts.brotliWasmUrl ?? DEFAULT_BROTLI_WASM_URL
     this.cssPlugins = opts.cssPlugins !== false
     let previewOrigin: string | null = null
     if (opts.previewOrigin !== undefined) {

@@ -24,6 +24,7 @@
     "@types/node": "^26.6.6",
     "@types/semver": "^7.8.0",
     "autoprefixer": "^10.7.0",
+    "brotli-wasm": "3.0.1",
     "buffer": "6.0.3",
     "cjs-module-lexer": "^2.3.0",
     "esbuild": "^0.28.2",

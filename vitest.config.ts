@@ -7,6 +7,7 @@ export default defineConfig({
     alias: [
       { find: /^react-refresh\/(cjs\/.*\?raw)$/, replacement: nm('react-refresh/') + '$1' },
       { find: /^cjs-lexer-js$/, replacement: nm('cjs-module-lexer/lexer.js') },
+      { find: /^brotli-wasm-web$/, replacement: nm('brotli-wasm/pkg.web/brotli_wasm.js') },
     ],
   },
   test: { include: ['test/**/*.test.ts'], environment: 'node' },

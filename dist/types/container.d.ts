@@ -14,6 +14,11 @@ export interface BootOptions {
     serviceWorkerUrl?: string | false;
     /** esbuild.wasm URL (must match esbuild-wasm version). Default: jsDelivr. */
     esbuildWasmUrl?: string;
+    /**
+     * brotli WASM URL for `zlib` brotli in `node` where the browser's CompressionStream lacks it (Chromium); must match
+     * brotli-wasm 3.0.1 (`pkg.web/brotli_wasm_bg.wasm`). Fetched on first use. Default: jsDelivr.
+     */
+    brotliWasmUrl?: string;
     /** npm registry base. Default 'https://registry.npmjs.org'. */
     registry?: string;
     /** Project directory. Default '/home/project'. */
@@ -102,6 +107,7 @@ export declare class Container {
     readonly ports: PortTable;
     readonly registry: Registry;
     readonly esbuildWasmUrl: string;
+    readonly brotliWasmUrl: string;
     readonly resolveFs: ResolveFs;
     readonly fs: FsApi;
     /** Origin previews are served from when it differs from the page's (`boot({ previewOrigin })`), else null. */

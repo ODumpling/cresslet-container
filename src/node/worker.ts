@@ -10,6 +10,8 @@ import { createProcess, ExitSignal } from './modules/process'
 import fsMod, { promises as fsPromises } from './modules/fs'
 import utilMod, { format, inspect } from './modules/util'
 import { containerFetch, handleHttpMessage, makeHttp } from './modules/http'
+import childProcess, { handleChildMessage } from './modules/child_process'
+import zlibMod from './modules/zlib'
 import {
   assert,
   asyncHooks,
@@ -175,7 +177,7 @@ const builtinFactories: Record<string, () => unknown> = {
   'assert/strict': () => assert,
   async_hooks: () => asyncHooks,
   buffer: () => ({ Buffer, constants: { MAX_LENGTH: 2 ** 31 - 1 }, kMaxLength: 2 ** 31 - 1, Blob, atob, btoa, File: globalThis.File }),
-  child_process: () => unsupportedModule('child_process'),
+  child_process: () => childProcess,
   cluster: () => unsupportedModule('cluster', { isMaster: true, isPrimary: true, isWorker: false }),
   console: () => console,
   constants: () => ({ ...os.constants, ...(fsMod.constants as object) }),
@@ -210,7 +212,8 @@ const builtinFactories: Record<string, () => unknown> = {
     },
   }),
   repl: () => unsupportedModule('repl'),
-  stream: () => streamMod,
+  // as in Node, the module is the legacy Stream class too (`x instanceof require('stream')`, e.g. the `destroy` package)
+  stream: () => Object.assign(streamMod.Stream, streamMod),
   'stream/promises': () => (streamMod as unknown as { promises: unknown }).promises,
   'stream/web': () => ({ ReadableStream, WritableStream, TransformStream, TextEncoderStream, TextDecoderStream }),
   string_decoder: () => ({ StringDecoder }),
@@ -226,7 +229,7 @@ const builtinFactories: Record<string, () => unknown> = {
   vm: () => vm,
   wasi: () => unsupportedModule('wasi'),
   worker_threads: () => workerThreads,
-  zlib: () => unsupportedModule('zlib', { constants: {} }),
+  zlib: () => zlibMod,
 }
 const builtinCache = new Map<string, unknown>()
 const builtinModules = Object.keys(builtinFactories)
@@ -504,6 +507,9 @@ self.onmessage = (ev: MessageEvent<MainToWorker>) => {
       case 'http-request':
       case 'http-abort':
         handleHttpMessage(m)
+        break
+      case 'child':
+        handleChildMessage(m)
         break
     }
   } catch (e) {

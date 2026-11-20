@@ -342,12 +342,16 @@ for (const k of ['open', 'close', 'read', 'write', 'fstat'] as const) {
 }
 
 // ---------------- streams ----------------
+/** What createReadStream / createWriteStream return (`instanceof fs.ReadStream` checks, e.g. the `destroy` package). */
+export class ReadStream extends Readable {}
+export class WriteStream extends Writable {}
+
 export function createReadStream(p: PathLike, o?: Enc & { start?: number; end?: number; highWaterMark?: number }) {
   const path = P(p)
   const enc = encOf(o)
   const opts = typeof o === 'object' && o ? o : {}
   let loaded = false
-  const stream = new Readable({
+  const stream = new ReadStream({
     highWaterMark: opts.highWaterMark ?? 64 * 1024,
     read() {
       if (loaded) return
@@ -376,7 +380,7 @@ export function createWriteStream(p: PathLike, o?: Enc) {
   const path = P(p)
   const append = typeof o === 'object' && o?.flag?.startsWith('a')
   let first = !append
-  const stream = new Writable({
+  const stream = new WriteStream({
     write(chunk: unknown, _enc: string, cb: (e?: Error | null) => void) {
       const mode = first ? 'w' : 'a'
       first = false
@@ -429,6 +433,8 @@ const fs = {
   Dirent,
   createReadStream,
   createWriteStream,
+  ReadStream,
+  WriteStream,
   watch,
   watchFile: () => {},
   unwatchFile: () => {},
