@@ -29,13 +29,14 @@ Install: `pnpm add github:ODumpling/cresslet-container` (dist is committed) or l
 2. **Serve `dist/cresslet-sw.js` from your origin root** (default URL `/cresslet-sw.js`, scope `/`; override with `boot({ serviceWorkerUrl })`). Service workers must be same-origin, so copy it even when loading the library from a CDN.
 3. `dist/node-worker.js` is loaded via `new URL('./node-worker.js', import.meta.url)`; cross-origin (CDN) copies are wrapped in a same-origin blob worker automatically.
 4. esbuild-wasm (0.28.2) loads lazily from jsDelivr; override with `boot({ esbuildWasmUrl })`.
+5. Optional, recommended when the host keeps secrets in storage: a **separate preview origin** (`boot({ previewOrigin })`, see [below](#separate-preview-origin)).
 
-`pnpm demo` serves `demo/` with these headers (http://localhost:4400).
+`pnpm demo` serves `demo/` with these headers (http://localhost:4400), plus a preview origin on http://127.0.0.1:4401 (try http://localhost:4400/?previewOrigin=http://127.0.0.1:4401).
 
 ## API
 
 ```ts
-const c = await Container.boot({ serviceWorkerUrl?, esbuildWasmUrl?, registry?, workdir? /* '/home/project' */, npmCache? /* true */ })
+const c = await Container.boot({ serviceWorkerUrl?, esbuildWasmUrl?, registry?, workdir? /* '/home/project' */, npmCache? /* true */, previewOrigin? /* e.g. 'https://preview.example.com' */ })
 c.workdir; c.instanceId
 c.fs.readFile(p, 'utf8'?) / writeFile(p, data) /* mkdir -p */ / readdir(p, { withFileTypes? }) / mkdir / rm / rename / stat / exists
 c.fs.watch(p, { recursive? }, (event: 'change' | 'rename', filename) => {}) // { close() }
@@ -51,7 +52,7 @@ await c.bundle(esbuildOptions)                   // { outputFiles: [{ path, text
 c.teardown()
 ```
 
-Extras (not in the original contract): `c.vfs` (sync FS), `c.ports`, `c.exec`, `c.which`, `c.path`, `boot({ serviceWorkerUrl: false })`, `boot({ npmCache: false })` (no persistent npm cache), `spawn(..., { terminal: true })` (CRLF output).
+Extras (not in the original contract): `c.vfs` (sync FS), `c.ports`, `c.exec`, `c.which`, `c.path`, `boot({ serviceWorkerUrl: false })`, `boot({ npmCache: false })` (no persistent npm cache), `spawn(..., { terminal: true })` (CRLF output), `c.previewOrigin` (separate preview origin or `null`), `c.previewChannel(name)` (what the dev server notifies previews through).
 
 Notes:
 - Relative paths resolve against `workdir`.
@@ -64,6 +65,31 @@ Notes:
 Preview URL: `${origin}/__cresslet__/<instanceId>/<port>/`. The SW forwards requests to the owning page (MessageChannel, streamed bodies) and adds `COEP: require-corp` + `CORP: same-origin`.
 
 Root-relative paths keep working: the SW injects a one-line script into preview HTML that `history.replaceState`s the prefix away (apps and routers see `/`), and attributes later requests to the preview by the document's client id (persisted in Cache Storage across SW restarts). Full navigations inside a preview (links, reloads) are matched by the frame's current URL; live reload navigates through the prefixed URL so it works in every browser.
+
+### Separate preview origin
+
+By default previews share the host page's origin, so preview code (the user's app and its npm deps) can read the host's `localStorage`, IndexedDB and cookies. `boot({ previewOrigin: 'https://preview.example.com' })` serves them from another origin instead:
+
+- The container adds a hidden iframe `${previewOrigin}/cresslet-relay.html?host=<host origin>`. The relay registers `${previewOrigin}/cresslet-sw.js?xorigin=1` (scope `/`) and bridges it to the container over one `MessageChannel`: the SW's requests for the owning page (`cresslet-who`, `cresslet-request`, reply ports and bodies transferred) go relay → container, (un)registration goes container → relay → SW. The relay accepts the handshake only from its `host` param's origin, from its parent window, and (where `location.ancestorOrigins` exists) only when the parent really is that origin; the container accepts the relay's hello only from `previewOrigin` and the relay iframe's window.
+- Dev server notifications (live reload, HMR updates, overlay errors) go container → relay, which re-posts them on the same-named `BroadcastChannel` on the preview origin.
+- `server-ready` / `port` URLs and `c.ports.url()` are `${previewOrigin}/__cresslet__/<id>/<port>/`. With `?xorigin=1` the SW sends `Cross-Origin-Resource-Policy: cross-origin` on preview responses, so the cross-origin-isolated host can frame them.
+- Previews are same-origin with the relay (and so can script it); the container treats relay messages as untrusted and only answers what the SW could ask anyway: requests to this container's own ports.
+- `serviceWorkerUrl` is unused with `previewOrigin` (`false` still disables previews). If the relay doesn't connect within 20 s, `boot` resolves and emits `error`.
+
+The host page keeps COOP/COEP as above. At the **preview origin's root**, serve these files from `dist/`, with these headers:
+
+| Path | Headers |
+| --- | --- |
+| `/cresslet-relay.html` | `Cross-Origin-Embedder-Policy: require-corp`, `Cross-Origin-Resource-Policy: cross-origin`, `Content-Security-Policy: frame-ancestors <host origin>` |
+| `/cresslet-relay.js` | none required (same-origin to the relay); `Cross-Origin-Resource-Policy: cross-origin` is fine |
+| `/cresslet-sw.js` | `Service-Worker-Allowed: /` |
+
+`frame-ancestors` is the real guard against other sites framing the relay (the origin checks above are a second layer; Firefox has no `ancestorOrigins`). Nothing else needs to be served there: every `/__cresslet__/…` URL is answered by the service worker. Serving the whole preview origin with COEP + CORP as `scripts/serve.mjs` does is fine too.
+
+Choosing the origin:
+- **Different site** (e.g. `preview.example-usercontent.com` for a studio on `example.com`): full isolation, incl. cookies and same-site requests to the host's API. Browsers partition third-party service workers and BroadcastChannels by top-level site, so a preview URL opened **top-level in a new tab** can't reach the container (it hits the preview origin's server instead).
+- **Same site, other origin** (e.g. `preview.example.com`): storage (`localStorage`, IndexedDB, Cache Storage) is still isolated, and top-level tabs keep working while the host tab is open (Chromium, Firefox). Cookies scoped to the parent domain, and requests to the host as "same-site", are shared with previews. Different ports on one host share all cookies.
+- Safari/WebKit keys service worker registrations by top-level *origin*, so top-level preview tabs don't work there with any `previewOrigin`.
 
 ## Commands
 
@@ -90,7 +116,8 @@ Parses `index.html`, bundles each `<script type="module" src>` and local stylesh
 - HMR covers CSS and React Fast Refresh only (no `import.meta.hot` API, no Preact/Vue/Svelte HMR; those full-reload). Refresh signatures come from a light pass over esbuild output, not Babel: hook changes are detected per component, but unusual code shapes may remount or reload instead. No PostCSS/Tailwind v3/Sass/Less (Tailwind via CDN works).
 - `node` needs a cross-origin isolated page; without it sync fs/`require` fail with a clear error.
 - `npm`: no lockfile-driven installs, no workspaces, no git/file deps, no lifecycle scripts. The package cache has no size cap/eviction of its own (the browser may evict it; clear with `indexedDB.deleteDatabase('cresslet-npm')`).
-- Previews share the host origin: a preview at `/` and a host page at `/` can't be told apart on a *top-level* reload; manual reload of a preview frame after `pushState` is best-effort in WebKit.
+- Without `previewOrigin`, previews share the host origin (and its storage); a preview at `/` and a host page at `/` can't be told apart on a *top-level* reload. Manual reload of a preview frame after `pushState` is best-effort in WebKit.
+- With a cross-site `previewOrigin` (or in WebKit), previews work in frames of the host page only, not as top-level tabs (see [Separate preview origin](#separate-preview-origin)).
 - In-memory only: the VFS is lost on reload (persist with `export()`/`mount()`).
 
 ## Architecture
@@ -103,21 +130,22 @@ host page ───────────────────────�
      ├─ node → Web Worker (CJS loader, polyfills) ⇄ SAB/Atomics sync RPC (fs, resolve, esbuild transform)
      ├─ dev server (module graph, HMR, React Refresh) / build → esbuild-wasm (VFS plugin)
      └─ PortTable ⇄ cresslet-sw.js ⇄ preview iframes (/__cresslet__/<id>/<port>/…)
+          └─ or, with previewOrigin: ⇄ cresslet-relay.html (hidden iframe) ⇄ cresslet-sw.js on the preview origin
 ```
 
 ## Development
 
 ```sh
 pnpm install
-pnpm build       # dist/: cresslet-container.js, node-worker.js, cresslet-sw.js, index.d.ts (+ types/)
-pnpm test        # vitest: VFS, parser, resolver/hoisting, tar, html, module resolution
+pnpm build       # dist/: cresslet-container.js, node-worker.js, cresslet-sw.js, cresslet-relay.{html,js}, index.d.ts (+ types/)
+pnpm test        # vitest: VFS, parser, resolver/hoisting, tar, html, module resolution, relay message validation
 pnpm test:e2e    # Playwright (chromium); test:e2e:all adds firefox + webkit
-pnpm demo        # http://localhost:4400
+pnpm demo        # http://localhost:4400 (+ preview origin http://127.0.0.1:4401)
 ```
 
 ## Roadmap
 
-VFS persistence (IndexedDB/OPFS snapshots; the npm cache already persists), npm cache size cap/LRU, `import.meta.hot` API + non-React HMR, lockfile-driven installs + workspaces, PostCSS/Tailwind, more Node compat (zlib, child_process via jsh), real Node via WASM for big CLIs, subdomain-isolated previews.
+VFS persistence (IndexedDB/OPFS snapshots; the npm cache already persists), npm cache size cap/LRU, `import.meta.hot` API + non-React HMR, lockfile-driven installs + workspaces, PostCSS/Tailwind, more Node compat (zlib, child_process via jsh), real Node via WASM for big CLIs, per-preview origins.
 
 ## License
 

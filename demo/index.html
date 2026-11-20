@@ -54,7 +54,9 @@
       fit.fit()
       addEventListener('resize', () => fit.fit())
 
-      const c = await Container.boot()
+      // ?previewOrigin=http://127.0.0.1:4401 serves previews from a separate origin (see scripts/serve.mjs)
+      const previewOrigin = new URLSearchParams(location.search).get('previewOrigin') ?? undefined
+      const c = await Container.boot({ previewOrigin })
       window.container = c
       c.on('error', (e) => term.write(`\r\n\x1b[31m${e.message}\x1b[0m\r\n`))
       c.on('server-ready', (port, url) => {

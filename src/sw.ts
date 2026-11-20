@@ -7,6 +7,8 @@ export {}
 declare const self: ServiceWorkerGlobalScope
 
 const PREFIX = '/__cresslet__/'
+/** Registered by cresslet-relay.html on a separate preview origin: previews are embedded cross-origin by the host. */
+const XORIGIN = new URL(location.href).searchParams.get('xorigin') === '1'
 const STORE = 'cresslet-sw-clients-v1'
 interface Target {
   instanceId: string
@@ -204,7 +206,7 @@ async function findOwner(instanceId: string): Promise<Client | null> {
 function isolate(headers: [string, string][], t: Target): Headers {
   const h = new Headers(headers)
   if (!h.has('cross-origin-embedder-policy')) h.set('Cross-Origin-Embedder-Policy', 'require-corp')
-  if (!h.has('cross-origin-resource-policy')) h.set('Cross-Origin-Resource-Policy', 'same-origin')
+  if (!h.has('cross-origin-resource-policy')) h.set('Cross-Origin-Resource-Policy', XORIGIN ? 'cross-origin' : 'same-origin')
   const loc = h.get('location')
   if (loc && loc.startsWith('/') && !loc.startsWith('//') && !loc.startsWith(PREFIX)) h.set('location', prefixOf(t) + loc)
   return h
@@ -212,7 +214,11 @@ function isolate(headers: [string, string][], t: Target): Headers {
 
 async function forward(req: Request, t: Target, path: string): Promise<Response> {
   const client = await findOwner(t.instanceId)
-  if (!client) return new Response(`Cresslet preview ${t.instanceId}:${t.port} is not running (owning page closed?)`, { status: 503, headers: { 'content-type': 'text/plain' } })
+  if (!client)
+    return new Response(`Cresslet preview ${t.instanceId}:${t.port} is not running (owning page closed?)`, {
+      status: 503,
+      headers: { 'content-type': 'text/plain', ...(XORIGIN && { 'cross-origin-resource-policy': 'cross-origin', 'cross-origin-embedder-policy': 'require-corp' }) },
+    })
   const body = req.method === 'GET' || req.method === 'HEAD' ? null : await req.arrayBuffer()
   const ch = new MessageChannel()
   const headers: [string, string][] = []

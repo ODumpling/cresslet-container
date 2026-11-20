@@ -18,8 +18,12 @@ export interface SwRequest {
 export declare class PortTable {
     instanceId: string;
     private events;
+    /** Origin previews are served from. Default: the page's own origin. */
+    private previewOrigin?;
     private ports;
-    constructor(instanceId: string, events: PortEvents);
+    constructor(instanceId: string, events: PortEvents, 
+    /** Origin previews are served from. Default: the page's own origin. */
+    previewOrigin?: string | undefined);
     url(port: number): string;
     open(port: number, handler: PortHandler, owner?: string): string;
     close(port: number): void;

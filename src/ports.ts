@@ -31,10 +31,12 @@ export class PortTable {
   constructor(
     public instanceId: string,
     private events: PortEvents,
+    /** Origin previews are served from. Default: the page's own origin. */
+    private previewOrigin?: string,
   ) {}
 
   url(port: number): string {
-    const origin = typeof location !== 'undefined' ? location.origin : 'http://localhost'
+    const origin = this.previewOrigin ?? (typeof location !== 'undefined' ? location.origin : 'http://localhost')
     return `${origin}${PREVIEW_PREFIX}${this.instanceId}/${port}/`
   }
 

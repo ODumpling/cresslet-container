@@ -12,6 +12,7 @@ import { bundleVfs, DEFAULT_WASM_URL, type BuildOptions as EsbuildOptions, type 
 import { createDevServer, type DevServerHandle, type DevServerOptions } from './dev/server'
 import { build, type BuildOptions } from './build/build'
 import { dirname, join, normalize, resolve } from './path'
+import { acceptHello, BROADCAST, BROADCAST_CLOSE, RELAY_ERROR, RELAY_INIT, RELAY_READY, relayUrl, toOrigin } from './relay-protocol'
 
 export interface BootOptions {
   /** Service worker URL served by the host at its origin root. Default '/cresslet-sw.js'. `false` disables previews. */
@@ -24,6 +25,13 @@ export interface BootOptions {
   workdir?: string
   /** Persist npm tarballs + packuments in IndexedDB across reloads. Default true; silently off if IndexedDB is unavailable. */
   npmCache?: boolean
+  /**
+   * Serve previews from this origin (e.g. 'https://preview.example.com') instead of the host page's, so preview code
+   * can't read the host's storage. The container frames `${previewOrigin}/cresslet-relay.html`, which registers
+   * `${previewOrigin}/cresslet-sw.js`; `serviceWorkerUrl` is then unused (`false` still disables previews).
+   * Unset (or equal to the page's origin): previews share the host origin.
+   */
+  previewOrigin?: string
 }
 
 export interface ContainerEvents {
@@ -61,6 +69,13 @@ export interface BundleResult {
 type Handler = (...a: unknown[]) => void
 
 const randomId = () => Math.random().toString(36).slice(2, 10)
+const RELAY_TIMEOUT = 20_000
+
+/** Where the dev server sends live-reload / HMR / overlay notifications for its previews. */
+export interface PreviewChannel {
+  postMessage(message: unknown): void
+  close(): void
+}
 
 export class Container {
   readonly instanceId = randomId()
@@ -72,6 +87,9 @@ export class Container {
   readonly esbuildWasmUrl: string
   readonly resolveFs: ResolveFs
   readonly fs: FsApi
+  /** Origin previews are served from when it differs from the page's (`boot({ previewOrigin })`), else null. */
+  readonly previewOrigin: string | null
+  private relayPort: MessagePort | null = null
   private listeners = new Map<string, Set<Handler>>()
   private commands = new Map<string, Command>()
   private procs = new Set<ContainerProcess>()
@@ -83,13 +101,20 @@ export class Container {
     this.registry = new HttpRegistry(opts.registry ?? 'https://registry.npmjs.org', { cache: opts.npmCache === false ? null : sharedIdbCache() })
     dropLegacyCache()
     this.esbuildWasmUrl = opts.esbuildWasmUrl ?? DEFAULT_WASM_URL
+    let previewOrigin: string | null = null
+    if (opts.previewOrigin !== undefined) {
+      previewOrigin = toOrigin(opts.previewOrigin)
+      if (!previewOrigin) throw new TypeError(`previewOrigin must be an http(s) origin, got ${JSON.stringify(opts.previewOrigin)}`)
+      if (typeof location !== 'undefined' && previewOrigin === location.origin) previewOrigin = null
+    }
+    this.previewOrigin = previewOrigin
     this.ports = new PortTable(this.instanceId, {
       open: (port, url) => {
         this.emit('port', port, 'open', url)
         this.emit('server-ready', port, url)
       },
       close: (port, url) => this.emit('port', port, 'close', url),
-    })
+    }, previewOrigin ?? undefined)
     const vfs = this.vfs
     this.resolveFs = { isFile: (p) => vfs.isFile(p), isDir: (p) => vfs.isDir(p), readText: (p) => vfs.tryReadText(p) }
     for (const d of ['/tmp', '/home', '/usr/local/bin', this.workdir]) vfs.mkdir(d, { recursive: true })
@@ -103,7 +128,9 @@ export class Container {
   /** Boot a container. Registers the preview service worker (unless disabled). */
   static async boot(opts: BootOptions = {}): Promise<Container> {
     const c = new Container(opts)
-    if (opts.serviceWorkerUrl !== false) await c.connectServiceWorker(opts.serviceWorkerUrl ?? '/cresslet-sw.js')
+    if (opts.serviceWorkerUrl === false) return c
+    if (c.previewOrigin) await c.connectRelay(c.previewOrigin)
+    else await c.connectServiceWorker(opts.serviceWorkerUrl ?? '/cresslet-sw.js')
     return c
   }
 
@@ -290,18 +317,85 @@ export class Container {
   }
 
   // ---------------- service worker bridge ----------------
+  /** A message the SW posts to the page that owns an instance (directly, or forwarded by the relay). */
+  private onSwMessage(m: unknown, ports: readonly MessagePort[]): void {
+    if (!m || typeof m !== 'object') return
+    const d = m as Partial<Record<keyof SwRequest, unknown>>
+    if (d.type === 'cresslet-who') ports[0]?.postMessage({ owns: d.instanceId === this.instanceId })
+    else if (d.type === 'cresslet-request' && d.instanceId === this.instanceId && ports[0] && typeof d.port === 'number' && typeof d.path === 'string' && typeof d.method === 'string' && Array.isArray(d.headers))
+      void this.ports.answer(m as SwRequest, ports[0])
+  }
+
+  /**
+   * Channel for notifying this container's previews (used by the dev server). A BroadcastChannel on the page's origin,
+   * or, with a separate preview origin, re-posted by the relay on the preview origin's BroadcastChannel of that name.
+   */
+  previewChannel(name: string): PreviewChannel {
+    if (!this.previewOrigin) return new BroadcastChannel(name)
+    return {
+      postMessage: (message) => this.relayPort?.postMessage({ type: BROADCAST, channel: name, message }),
+      close: () => this.relayPort?.postMessage({ type: BROADCAST_CLOSE, channel: name }),
+    }
+  }
+
+  /** Frame the preview origin's relay and bridge its service worker over a MessagePort (see relay-protocol.ts). */
+  private connectRelay(origin: string): Promise<void> {
+    if (typeof document === 'undefined' || typeof location === 'undefined') {
+      this.emit('error', { message: 'previewOrigin needs a browser page: previews disabled' })
+      return Promise.resolve()
+    }
+    const frame = document.createElement('iframe')
+    frame.src = relayUrl(origin, location.origin)
+    frame.title = 'cresslet preview relay'
+    frame.tabIndex = -1
+    frame.setAttribute('aria-hidden', 'true')
+    frame.style.display = 'none'
+    return new Promise<void>((settle) => {
+      const timer = setTimeout(() => {
+        this.emit('error', { message: `Preview relay ${frame.src} did not connect: serve it with the headers in the README (COEP, CORP, CSP frame-ancestors)` })
+        settle()
+      }, RELAY_TIMEOUT)
+      const done = () => (clearTimeout(timer), settle())
+      const onWindowMessage = (ev: MessageEvent) => {
+        if (!acceptHello(ev, { previewOrigin: origin, relay: frame.contentWindow })) return
+        // (re)connect: a reloaded relay says hello again
+        const ch = new MessageChannel()
+        this.relayPort?.close()
+        const port = (this.relayPort = ch.port1)
+        port.onmessage = (e) => {
+          const m = e.data
+          if (m?.type === RELAY_READY) {
+            port.postMessage({ type: 'cresslet-register', instanceId: this.instanceId })
+            done()
+          } else if (m?.type === RELAY_ERROR) {
+            this.emit('error', { message: String(m.message) })
+            done()
+          } else this.onSwMessage(m, e.ports)
+        }
+        frame.contentWindow!.postMessage({ type: RELAY_INIT }, origin, [ch.port2])
+      }
+      addEventListener('message', onWindowMessage)
+      ;(document.body ?? document.documentElement).appendChild(frame)
+      this.cleanups.push(() => {
+        clearTimeout(timer)
+        removeEventListener('message', onWindowMessage)
+        const port = this.relayPort
+        this.relayPort = null
+        port?.postMessage({ type: 'cresslet-unregister', instanceId: this.instanceId })
+        // let the relay forward the unregister before its frame goes
+        setTimeout(() => (port?.close(), frame.remove()), 250)
+        settle()
+      })
+    })
+  }
+
   private async connectServiceWorker(url: string): Promise<void> {
     if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
       this.emit('error', { message: 'Service workers unavailable: previews disabled' })
       return
     }
     const sw = navigator.serviceWorker
-    const onMessage = (ev: MessageEvent) => {
-      const m = ev.data
-      if (!m || typeof m !== 'object') return
-      if (m.type === 'cresslet-who') ev.ports[0]?.postMessage({ owns: m.instanceId === this.instanceId })
-      else if (m.type === 'cresslet-request' && m.instanceId === this.instanceId && ev.ports[0]) void this.ports.answer(m as SwRequest, ev.ports[0])
-    }
+    const onMessage = (ev: MessageEvent) => this.onSwMessage(ev.data, ev.ports)
     sw.addEventListener('message', onMessage)
     sw.startMessages()
     this.cleanups.push(() => sw.removeEventListener('message', onMessage))
