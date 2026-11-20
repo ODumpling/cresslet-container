@@ -191,6 +191,18 @@ describe('VfsPersistence', () => {
     const back = new VFS()
     restoreSnapshot(back, W, store.data.get('default')!)
     expect(back.exists(`${W}/packages/pkg/new.js`)).toBe(false)
+
+    // creating a link inside node_modules isn't a change; removing the workdir through a link to its parent is
+    const writes = store.writes
+    fs.symlink('../a.txt', `${W}/node_modules/project-link`)
+    await p.flush()
+    expect(store.writes).toBe(writes)
+    fs.symlink('/home', '/workspace')
+    fs.rm('/workspace/project', { recursive: true })
+    await p.flush()
+    const gone = new VFS()
+    restoreSnapshot(gone, W, store.data.get('default')!)
+    expect(gone.readdir(W)).toEqual([])
   })
 
   it('flush() writes now; clear() drops pending changes and the snapshot', async () => {

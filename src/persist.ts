@@ -364,10 +364,11 @@ export class VfsPersistence implements Persistence {
     if (this.closed) return
     // from the root: removing or renaming an ancestor (`rm -rf /home`) changes the workdir too
     const base = this.dir === '/' ? '' : this.dir
-    const counts = (abs: string) => abs.startsWith(base + '/') && !isNodeModules(abs.slice(base.length + 1))
+    // the workdir or an ancestor (removed / renamed), or a path in it outside node_modules
+    const counts = (abs: string) => (base + '/').startsWith(abs + '/') || (abs.startsWith(base + '/') && !isNodeModules(abs.slice(base.length + 1)))
     const w = this.vfs.watch('/', { recursive: true }, (event, rel) => {
       const abs = '/' + rel
-      if ((base + '/').startsWith(abs + '/') || counts(abs)) return this.changed()
+      if (counts(abs)) return this.changed()
       // through a symlink into the workdir (`node_modules/pkg -> ../packages/pkg`, a link elsewhere)? A linked
       // directory on the way (writes, new files, removals), or a write through a link to a file
       try {
