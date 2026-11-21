@@ -43,9 +43,9 @@ export function heavyCli(vfs: VFS, entry: string): Pick<FallbackContext, 'packag
     const shim = binShimTarget(new TextDecoder().decode(vfs.readFile(file).subarray(0, 512)))
     if (shim) file = main(resolve(dirname(file), shim))
   }
-  // the greedy `.*` takes every earlier node_modules segment, so this is the package's own dir
+  // (only installed packages: the greedy `.*` takes every earlier node_modules segment, so m[1] is the package's own dir)
   const m = /^(.*\/node_modules\/(?:@[^/]+\/)?[^/]+)\//.exec(file)
-  if (!m) return null
+  if (!m || !vfs.isFile(file)) return null // a missing script: node reports it
   let name: unknown, bin: unknown
   try {
     ;({ name, bin } = readPkg(vfs, m[1]) ?? {})
@@ -59,7 +59,7 @@ export function heavyCli(vfs: VFS, entry: string): Pick<FallbackContext, 'packag
 
 /** The error for running `cli` on `node` with `args`, or null when it runs there anyway (`next --version`). */
 export function heavyCliError(cli: { package: string; bin: string }, args: string[]): string | null {
-  const { hint, infoOnNode } = HEAVY_CLIS[cli.package] ?? { hint: '' }
+  const { hint, infoOnNode } = HEAVY_CLIS[cli.package]
   if (infoOnNode && args.length === 1 && /^(-v|--version|-h|--help)$/.test(args[0])) return null
   return `${cli.bin}: ${cli.package}'s CLI doesn't run on cresslet's node${hint}. A host can run it elsewhere with boot({ fallbackRuntime }).\n`
 }

@@ -19,6 +19,7 @@ function project() {
   file('/p/node_modules/next-alt/dist/bin/next')
   pkg('/p/node_modules/constructor', { name: 'constructor', bin: 'cli.js' })
   file('/p/node_modules/constructor/cli.js')
+  pkg('/t/node_modules/next', { name: 'next', bin: { next: './dist/bin/next' } }) // its bin script missing
   pkg('/q/node_modules/vite', { name: 'not-vite', bin: { vite: 'bin/vite.js' } }) // another package in a `vite` dir
   file('/q/node_modules/vite/bin/vite.js')
   const shim = (name: string, target: string) => file(`/p/node_modules/.bin/${name}`, `#!/usr/bin/env node\n// cresslet-bin -> ${target}\nrequire(${JSON.stringify(target)})\n`)
@@ -59,6 +60,7 @@ describe('heavyCli', () => {
     expect(heavyCli(v, '/p/next/dist/bin/next')).toBeNull()
     expect(heavyCli(v, '/p/server.js')).toBeNull()
     expect(heavyCli(v, '/r/node_modules/next/dist/bin/next')).toBeNull() // no package.json
+    expect(heavyCli(v, '/t/node_modules/next/dist/bin/next')).toBeNull() // no such script
   })
   it('names the CLI and the hook in its error', () => {
     expect(heavyCliError(next, ['build'])).toMatch(/^next: next's CLI doesn't run on cresslet's node\. .*boot\(\{ fallbackRuntime \}\)/)
