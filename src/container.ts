@@ -7,6 +7,7 @@ import { builtins } from './shell/builtins'
 import { COMMANDS } from './commands'
 import { dropLegacyCache, HttpRegistry, type Registry } from './npm/registry'
 import { sharedIdbCache } from './npm/cache'
+import { binShimTarget } from './npm/install'
 import { clearPackageCache, isBare, type ResolveFs } from './resolve'
 import { bundleVfs, DEFAULT_WASM_URL, type BuildOptions as EsbuildOptions, type OutputFile } from './esbuild'
 import { createDevServer, type DevServerHandle, type DevServerOptions } from './dev/server'
@@ -16,6 +17,7 @@ import { basename, dirname, join, normalize, resolve } from './path'
 import { acceptHello, BROADCAST, BROADCAST_CLOSE, expandOriginTemplate, newestWorker, originTemplateError, PROC_SPAWN, WORKER_SPAWN, RELAY_DISPOSE, RELAY_DISPOSED, RELAY_ERROR, RELAY_INIT, RELAY_READY, relayErrorText, relayUrl, THIRD_PARTY_HINT, toOrigin, WORKER_SCRIPT } from './relay-protocol'
 import { localChannel, relayChannel, relayWorker, type NodeChannel, type ProjectWorker } from './node/channel'
 import { DEFAULT_BROTLI_WASM_URL } from './node/brotli'
+import type { FallbackRuntime } from './node/fallback'
 import { clearPersisted, persistKey, VfsPersistence, type PersistOptions, type Persistence } from './persist'
 
 const VIRTUAL_BIN_DIRS = new Set(['/usr/local/bin', '/usr/bin', '/bin'])
@@ -69,6 +71,14 @@ export interface BootOptions {
    * Default off. `true` uses key 'default'; give each project its own `key`.
    */
   persist?: boolean | PersistOptions
+  /**
+   * Runs the CLIs cresslet's `node` can't (`next`, and vite's own bin rather than the built-in `vite` command): when
+   * `node` is asked to run one's bin script (a `node_modules/.bin` shim, `npx`, a package script, `node <path>`), this
+   * is called instead, with the command's context plus `{ package, bin, entry }`, and its result is the exit code.
+   * Unset: those fail with an error saying so (`next --version` / `--help` alone still run on `node`). See
+   * docs/research/wasm-node.md.
+   */
+  fallbackRuntime?: FallbackRuntime
 }
 
 export interface ContainerEvents {
@@ -135,6 +145,8 @@ export class Container {
   readonly cssPlugins: boolean
   /** Workdir snapshots (`boot({ persist })`), else null. */
   readonly persistence: Persistence | null
+  /** Where heavy CLIs run (`boot({ fallbackRuntime })`), else null. */
+  readonly fallbackRuntime: FallbackRuntime | null
   private persist: VfsPersistence | null = null
   /** Origin `node` processes and project workers run on (by its relay), when not this page's. */
   private workersOrigin: string | null = null
@@ -171,6 +183,7 @@ export class Container {
     this.esbuildWasmUrl = opts.esbuildWasmUrl ?? DEFAULT_WASM_URL
     this.brotliWasmUrl = opts.brotliWasmUrl ?? DEFAULT_BROTLI_WASM_URL
     this.cssPlugins = opts.cssPlugins !== false
+    this.fallbackRuntime = opts.fallbackRuntime ?? null
     let previewOrigin: string | null = null
     if (opts.previewOrigin !== undefined) {
       if (opts.previewOrigins !== undefined) throw new TypeError('boot: pass previewOrigin or previewOrigins, not both')
@@ -393,8 +406,8 @@ export class Container {
 
   private runFile(file: string, ctx: CommandContext): Promise<number> {
     const head = this.vfs.readText(file).slice(0, 512)
-    const shim = /^#!\/usr\/bin\/env node\n\/\/ cresslet-bin -> (.+)\n/.exec(head) // only an npm .bin shim's own header line
-    if (shim) return COMMANDS.node({ ...ctx, args: [resolve(dirname(file), shim[1]), ...ctx.args] })
+    const shim = binShimTarget(head)
+    if (shim) return COMMANDS.node({ ...ctx, args: [resolve(dirname(file), shim), ...ctx.args] })
     const shebang = head.startsWith('#!') ? head.slice(2, head.indexOf('\n')) : ''
     if (/\b(sh|bash|jsh|zsh)\b/.test(shebang)) return COMMANDS.jsh({ ...ctx, args: [file, ...ctx.args] })
     return COMMANDS.node({ ...ctx, args: [file, ...ctx.args] })

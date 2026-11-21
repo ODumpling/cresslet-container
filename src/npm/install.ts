@@ -413,6 +413,11 @@ function isLink(vfs: VFS, p: string): boolean {
   }
 }
 
+/** The script a `.bin` shim (as linkBins writes it) runs, relative to the shim's directory; null for other files. */
+export function binShimTarget(text: string): string | null {
+  return /^#!\/usr\/bin\/env node\n\/\/ cresslet-bin -> (.+)\n/.exec(text)?.[1] ?? null // only a shim's own header line
+}
+
 export function binEntries(name: string, bin: Manifest['bin']): [string, string][] {
   if (!bin) return []
   if (typeof bin === 'string') return [[name.startsWith('@') ? name.split('/')[1] : name, bin]]

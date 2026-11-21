@@ -36,7 +36,7 @@ Install: `pnpm add github:ODumpling/cresslet-container` (dist is committed) or l
 ## API
 
 ```ts
-const c = await Container.boot({ serviceWorkerUrl?, esbuildWasmUrl?, brotliWasmUrl?, registry?, workdir? /* '/home/project' */, npmCache? /* true, or { maxBytes } */, previewOrigin? /* e.g. 'https://preview.example.com' */, previewOrigins? /* e.g. 'https://{id}-{port}.preview.example.com' */, persist? /* off; true, or { key?, debounceMs?, maxWrites? } */ })
+const c = await Container.boot({ serviceWorkerUrl?, esbuildWasmUrl?, brotliWasmUrl?, registry?, workdir? /* '/home/project' */, npmCache? /* true, or { maxBytes } */, previewOrigin? /* e.g. 'https://preview.example.com' */, previewOrigins? /* e.g. 'https://{id}-{port}.preview.example.com' */, persist? /* off; true, or { key?, debounceMs?, maxWrites? } */, fallbackRuntime? /* see Heavy CLIs */ })
 c.workdir; c.instanceId
 c.fs.readFile(p, 'utf8'?) / writeFile(p, data) /* mkdir -p */ / readdir(p, { withFileTypes? }) / mkdir / rm / rename / stat / exists
 c.fs.watch(p, { recursive? }, (event: 'change' | 'rename', filename) => {}) // { close() }
@@ -198,9 +198,21 @@ These run in the **CSS worker**: one long-lived `node` process per container (st
 
 Parses `index.html`, bundles each `<script type="module" src>` and local stylesheet (`.css`, `.scss`, `.sass`, `.less`; minify, splitting, `process.env.NODE_ENV=production`), runs [Sass/Less and PostCSS/Tailwind](#css-postcss--tailwind) on stylesheets (same pipeline as the dev server; PostCSS function configs get `env: 'production'`), emits CSS, hashes everything into `dist/assets/`, rewrites HTML, copies `public/` and HTML-referenced assets.
 
+## Heavy CLIs
+
+Real `next`, and vite's own CLI, don't run on cresslet's `node` (missing loader features, native addons such as SWC and rollup's, `worker_threads`). The `vite` command is the built-in dev server and build; `tsc` is a no-op stub, though the real one runs through `node node_modules/typescript/bin/tsc` (tested with TypeScript 5.9; TypeScript 7's is a native executable). When `node` is asked to run the bin script of an installed `next` or `vite` (one whose real path is under `node_modules`; as `./node_modules/.bin/vite` does, not the built-in `vite`), however it's started (a package script, a `.bin` shim, `npx`, `node <path>`, `child_process`), it fails at once with an error saying so (exit 1), instead of failing late or, for `next`, exiting 0 with no output. `next --version` / `--help` alone still run on `node`, where they work.
+
+`boot({ fallbackRuntime })` runs them elsewhere instead (another runtime, a remote machine; every run, `--version` too): it's called with the command's context (`args` after the bin script, `cwd`, `env`, `stdout`, `stderr`, `stdin`, `signal`, `container` for the VFS and `servePort`) plus `{ package, bin, entry }` (`entry`: the package's bin script, also when given its `.bin` shim), and resolves to the exit code. Flags given to `node` before the script aren't passed on.
+
+```ts
+const c = await Container.boot({ fallbackRuntime: async (ctx) => runElsewhere(ctx.bin, ctx.args, ctx) })
+```
+
+No Node-in-WASM build fits as a built-in fallback today; Wasmer's Edge.js (open core, alpha) and Leaning's BrowserPod (proprietary, CDN-only) are the candidates for a host-supplied one. See [docs/research/wasm-node.md](docs/research/wasm-node.md) for the options (sizes, startup, fs/net bridges, licenses) and how real CLIs fail on cresslet's `node`.
+
 ## Limitations
 
-- Not real Node: real `vite`, `next`, `tsc`, native addons, raw sockets don't run (built-ins cover the common workflow); `child_process` reaches container commands only, not real binaries.
+- Not real Node: real `vite`, `next`, native addons, raw sockets don't run (built-ins cover the common workflow; see [Heavy CLIs](#heavy-clis) for a fallback hook); `child_process` reaches container commands only, not real binaries.
 - HMR: Refresh signatures (React and Preact) come from a light pass over esbuild output, not Babel: hook changes are detected per component, but unusual code shapes may remount or reload instead. No Stylus.
 - Vue/Svelte components: dev server only, not `build` yet. Vue: no `<style module>`, `<template lang>` (Pug), `src=` blocks, or types imported from other files in `defineProps<T>()`; SFC styles don't go through PostCSS/Tailwind. Svelte: no `.svelte.js`/`.svelte.ts` modules, `<style lang>` or other preprocessors (`svelte.config.js` isn't read).
 - CSS: PostCSS plugins must be pure JS (native addons, real binaries, workers don't run); `postcss-load-config`'s YAML/`.postcssrc` (no extension) and `package.json#postcss` aren't read. Tailwind v4 output isn't run through lightningcss (no `optimize`, nesting/`@property` left for the browser; minified by esbuild in `build`). Content detection ignores `.gitignore` (fixed skip list instead) and tokenizes generically (a superset of Tailwind's own candidates; classes assembled from string fragments are missed, as in Tailwind). Tailwind v3 works through PostCSS but is best-effort (tested: build + HMR of a React app).
@@ -237,7 +249,7 @@ pnpm demo        # http://localhost:4400 (+ preview origin http://127.0.0.1:4401
 
 ## Roadmap
 
-Vue/Svelte in `build`, git/`file:` deps, pnpm lockfiles, real Node via WASM for big CLIs, per-preview origins.
+Vue/Svelte in `build`, git/`file:` deps, pnpm lockfiles, a built-in runtime for `fallbackRuntime` (real Node via WASM for big CLIs), per-preview origins.
 
 ## License
 
