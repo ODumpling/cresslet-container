@@ -4,31 +4,54 @@ import { heavyCli, heavyCliError } from '../src/node/fallback'
 
 function project() {
   const v = new VFS()
-  const pkg = (dir: string, json: object) => v.writeFile(`${dir}/package.json`, JSON.stringify(json), { mkdirp: true })
+  const file = (p: string, s = '') => v.writeFile(p, s, { mkdirp: true })
+  const pkg = (dir: string, json: object) => file(`${dir}/package.json`, JSON.stringify(json))
   pkg('/p/node_modules/next', { name: 'next', bin: { next: './dist/bin/next' } })
-  v.writeFile('/p/node_modules/next/dist/bin/next', '', { mkdirp: true })
+  file('/p/node_modules/next/dist/bin/next')
+  file('/p/node_modules/next/dist/bin/next.js') // an unrelated sibling of the extensionless bin
   pkg('/p/node_modules/vite', { name: 'vite', bin: { vite: 'bin/vite.js' } })
+  file('/p/node_modules/vite/bin/vite.js')
   pkg('/p/node_modules/typescript', { name: 'typescript', bin: { tsc: './bin/tsc' } })
+  file('/p/node_modules/typescript/bin/tsc')
   pkg('/p/node_modules/foo/node_modules/next', { name: 'next', bin: 'dist/bin/next' })
+  file('/p/node_modules/foo/node_modules/next/dist/bin/next')
+  pkg('/p/node_modules/next-alt', { name: 'next', bin: { next: 'dist/bin/next' } }) // next-alt@npm:next
+  file('/p/node_modules/next-alt/dist/bin/next')
+  pkg('/p/node_modules/constructor', { name: 'constructor', bin: 'cli.js' })
+  file('/p/node_modules/constructor/cli.js')
+  pkg('/q/node_modules/vite', { name: 'not-vite', bin: { vite: 'bin/vite.js' } }) // another package in a `vite` dir
+  file('/q/node_modules/vite/bin/vite.js')
+  const shim = (name: string, target: string) => file(`/p/node_modules/.bin/${name}`, `#!/usr/bin/env node\n// cresslet-bin -> ${target}\nrequire(${JSON.stringify(target)})\n`)
+  shim('next', '../next/dist/bin/next')
+  shim('vite', '../vite/bin/vite.js')
+  shim('tsc', '../typescript/bin/tsc')
   return v
 }
 
 describe('heavyCli', () => {
   const v = project()
-  it("detects a heavy package's bin script, by its path", () => {
-    expect(heavyCli(v, '/p/node_modules/next/dist/bin/next')).toEqual({ package: 'next', bin: 'next' })
-    expect(heavyCli(v, '/p/node_modules/next/dist/bin/next.js')).toEqual({ package: 'next', bin: 'next' })
-    expect(heavyCli(v, '/p/node_modules/vite/bin/vite.js')).toEqual({ package: 'vite', bin: 'vite' })
-    // nested copy, string `bin`
-    expect(heavyCli(v, '/p/node_modules/foo/node_modules/next/dist/bin/next')).toEqual({ package: 'next', bin: 'next' })
+  const next = { package: 'next', bin: 'next', entry: '/p/node_modules/next/dist/bin/next' }
+  const vite = { package: 'vite', bin: 'vite', entry: '/p/node_modules/vite/bin/vite.js' }
+  it("detects a heavy package's bin script, by its path or its .bin shim", () => {
+    expect(heavyCli(v, '/p/node_modules/next/dist/bin/next')).toEqual(next)
+    expect(heavyCli(v, '/p/node_modules/vite/bin/vite.js')).toEqual(vite)
+    expect(heavyCli(v, '/p/node_modules/vite/bin/vite')).toEqual(vite) // node adds the .js
+    expect(heavyCli(v, '/p/node_modules/foo/node_modules/next/dist/bin/next')).toEqual({ ...next, entry: '/p/node_modules/foo/node_modules/next/dist/bin/next' }) // nested copy, string `bin`
+    expect(heavyCli(v, '/p/node_modules/next-alt/dist/bin/next')).toEqual({ ...next, entry: '/p/node_modules/next-alt/dist/bin/next' }) // by its package.json name
+    expect(heavyCli(v, '/p/node_modules/.bin/next')).toEqual(next) // `node node_modules/.bin/next`
+    expect(heavyCli(v, '/p/node_modules/.bin/vite')).toEqual(vite)
   })
   it('leaves everything else to node', () => {
-    expect(heavyCli(v, '/p/node_modules/next/dist/server/next.js')).toBeNull() // not a bin (e.g. a custom server's import)
+    expect(heavyCli(v, '/p/node_modules/next/dist/bin/next.js')).toBeNull() // not the bin
+    expect(heavyCli(v, '/p/node_modules/next/dist/server/next.js')).toBeNull() // e.g. a custom server's import
     expect(heavyCli(v, '/p/node_modules/vite/dist/node/cli.js')).toBeNull()
-    expect(heavyCli(v, '/p/node_modules/typescript/bin/tsc')).toBeNull() // real tsc runs on cresslet's node
+    expect(heavyCli(v, '/p/node_modules/typescript/bin/tsc')).toBeNull() // real tsc (≤ 6) runs on cresslet's node
+    expect(heavyCli(v, '/p/node_modules/.bin/tsc')).toBeNull()
+    expect(heavyCli(v, '/p/node_modules/constructor/cli.js')).toBeNull()
+    expect(heavyCli(v, '/q/node_modules/vite/bin/vite.js')).toBeNull()
     expect(heavyCli(v, '/p/next/dist/bin/next')).toBeNull()
     expect(heavyCli(v, '/p/server.js')).toBeNull()
-    expect(heavyCli(v, '/q/node_modules/next/dist/bin/next')).toBeNull() // no package.json
+    expect(heavyCli(v, '/r/node_modules/next/dist/bin/next')).toBeNull() // no package.json
   })
   it('names the CLI and the hook in its error', () => {
     expect(heavyCliError('next', 'next')).toMatch(/^next: next's CLI doesn't run on cresslet's node\. .*boot\(\{ fallbackRuntime \}\)/)

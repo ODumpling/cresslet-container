@@ -49,6 +49,8 @@ test('heavy CLIs go to boot({ fallbackRuntime }) with their args, cwd and the VF
     ['npx next dev --port 3001', 'dev --port 3001'],
     ['./node_modules/.bin/next lint', 'lint'],
     ['node node_modules/next/dist/bin/next start', 'start'],
+    ['node node_modules/.bin/next info', 'info'],
+    ['npx next --version', '--version'], // with a fallback, it gets these too
   ]) {
     const r = await sh(page, line)
     expect(r.out, line).toContain(`fallback next next [${args}] cwd=/home/project ${entry}`)
@@ -64,10 +66,15 @@ test('heavy CLIs go to boot({ fallbackRuntime }) with their args, cwd and the VF
 
 test('without a fallbackRuntime, heavy CLIs fail saying so', async ({ page }) => {
   await boot(page, false)
-  for (const line of ['npm run build', 'node node_modules/next/dist/bin/next build']) {
+  for (const line of ['npm run build', 'node node_modules/next/dist/bin/next build', 'node node_modules/.bin/next build']) {
     const r = await sh(page, line)
     expect(r.out, line).toContain("next: next's CLI doesn't run on cresslet's node. A host can run it elsewhere with boot({ fallbackRuntime }).")
     expect(r.out, line).not.toContain('node ran next')
     expect(r.code, line).toBe(1)
+  }
+  // `--version` / `--help` alone still run on node (they work there)
+  for (const line of ['./node_modules/.bin/next --version', 'node node_modules/next/dist/bin/next --help']) {
+    const r = await sh(page, line)
+    expect(r, line).toEqual({ code: 0, out: 'node ran next\n' })
   }
 })

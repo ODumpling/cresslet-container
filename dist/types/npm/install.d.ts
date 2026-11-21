@@ -40,6 +40,8 @@ export declare function install(vfs: VFS, registry: Registry, o: InstallOptions)
  * else a workspace dir); symlinks map to `link:<target>` and aren't descended into.
  */
 export declare function listInstalled(vfs: VFS, cwd: string, roots?: string[]): Map<string, string>;
+/** The script a `.bin` shim (as linkBins writes it) runs, relative to the shim's directory; null for other files. */
+export declare function binShimTarget(text: string): string | null;
 export declare function binEntries(name: string, bin: Manifest['bin']): [string, string][];
 type Manifest = Placement['manifest'];
 export {};

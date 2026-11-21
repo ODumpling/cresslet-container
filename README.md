@@ -200,15 +200,15 @@ Parses `index.html`, bundles each `<script type="module" src>` and local stylesh
 
 ## Heavy CLIs
 
-Real `next`, and vite's own CLI, don't run on cresslet's `node` (missing loader features, native addons such as SWC and rollup's, `worker_threads`). The `vite` command is the built-in dev server and build; `tsc` is a no-op stub, though the real one runs through `node node_modules/typescript/bin/tsc` with TypeScript ≤ 6 (TypeScript 7's is a native executable). When `node` is asked to run one of those CLIs' bin scripts, however it's started (a package script or `.bin` shim, `npx`, `node <path>`, `child_process`), it fails at once with an error saying so (exit 1), instead of failing late or exiting 0 with no output. `next`, and vite's bin scripts (as `./node_modules/.bin/vite` runs them; not the built-in `vite`), are the ones detected.
+Real `next`, and vite's own CLI, don't run on cresslet's `node` (missing loader features, native addons such as SWC and rollup's, `worker_threads`). The `vite` command is the built-in dev server and build; `tsc` is a no-op stub, though the real one runs through `node node_modules/typescript/bin/tsc` (tested with TypeScript 5.9; TypeScript 7's is a native executable). When `node` is asked to run `next`'s or vite's bin script (as `./node_modules/.bin/vite` does; not the built-in `vite`), however it's started (a package script, a `.bin` shim, `npx`, `node <path>`, `child_process`), it fails at once with an error saying so (exit 1), instead of failing late or, for `next`, exiting 0 with no output. `--version` / `--help` alone still run on `node`.
 
-`boot({ fallbackRuntime })` runs them elsewhere instead (another runtime, a remote machine): it's called with the command's context (`args` after the bin script, `cwd`, `env`, `stdout`, `stderr`, `stdin`, `signal`, `container` for the VFS and `servePort`) plus `{ package, bin, entry }`, and resolves to the exit code.
+`boot({ fallbackRuntime })` runs them elsewhere instead (another runtime, a remote machine; every run, `--version` too): it's called with the command's context (`args` after the bin script, `cwd`, `env`, `stdout`, `stderr`, `stdin`, `signal`, `container` for the VFS and `servePort`) plus `{ package, bin, entry }` (`entry`: the package's bin script, also when given its `.bin` shim), and resolves to the exit code. Flags given to `node` before the script aren't passed on.
 
 ```ts
 const c = await Container.boot({ fallbackRuntime: async (ctx) => runElsewhere(ctx.bin, ctx.args, ctx) })
 ```
 
-No Node-in-WASM build fits as a built-in fallback today; Wasmer's Edge.js is the closest candidate for a host-supplied one. See [docs/research/wasm-node.md](docs/research/wasm-node.md) for the options (sizes, startup, fs/net bridges, licenses) and how real CLIs fail on cresslet's `node`.
+No Node-in-WASM build fits as a built-in fallback today; Wasmer's Edge.js (open core, alpha) and Leaning's BrowserPod (proprietary, CDN-only) are the candidates for a host-supplied one. See [docs/research/wasm-node.md](docs/research/wasm-node.md) for the options (sizes, startup, fs/net bridges, licenses) and how real CLIs fail on cresslet's `node`.
 
 ## Limitations
 

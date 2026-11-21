@@ -2,8 +2,8 @@
 // `boot({ fallbackRuntime })`, or refused with an error (they'd otherwise fail late, or exit 0 with no output).
 import type { CommandContext } from '../process'
 import type { VFS } from '../vfs'
-import { join, normalize } from '../path'
-import { binEntries, readPkg } from '../npm/install'
+import { dirname, join, normalize, resolve } from '../path'
+import { binEntries, binShimTarget, readPkg } from '../npm/install'
 
 /** What a `fallbackRuntime` is called with: the command's context, plus which CLI it is. */
 export interface FallbackContext extends CommandContext {
@@ -11,7 +11,7 @@ export interface FallbackContext extends CommandContext {
   package: string
   /** The bin name, e.g. 'next'. */
   bin: string
-  /** Absolute VFS path of the bin script `node` was asked to run. `args` are the arguments after it. */
+  /** Absolute VFS path of the package's bin script (also when `node` was given its `.bin` shim). `args` are the arguments after it. */
   entry: string
 }
 
@@ -21,26 +21,30 @@ export type FallbackRuntime = (ctx: FallbackContext) => Promise<number>
 /** Packages whose CLIs don't run on cresslet's `node`, and what to say about it. */
 const HEAVY_CLIS: Record<string, string> = {
   next: '',
-  vite: ' (the `vite` command is cresslet’s built-in dev server and build: run that instead)',
+  vite: " (the `vite` command is cresslet's built-in dev server and build: run that instead)",
 }
 
-/** The heavy CLI `entry` is the bin script of (in a `node_modules/<pkg>/` of HEAVY_CLIS), else null. */
-export function heavyCli(vfs: VFS, entry: string): { package: string; bin: string } | null {
-  const m = /^(.*\/node_modules\/)((?:@[^/]+\/)?[^/]+)\//.exec(entry)
-  // the last node_modules segment is the package's own dir (the greedy `.*` takes every earlier one)
-  if (!m || !(m[2] in HEAVY_CLIS)) return null
-  const dir = m[1] + m[2]
-  let bins: [string, string][]
+/**
+ * The heavy CLI `entry` (as `node` was given it) runs: the bin script of a HEAVY_CLIS package (by its package.json
+ * name, in the last `node_modules/<pkg>/` of the path), directly or through its `.bin` shim. Else null.
+ */
+export function heavyCli(vfs: VFS, entry: string): Pick<FallbackContext, 'package' | 'bin' | 'entry'> | null {
+  // as node resolves a main script: the path itself, else with .js
+  const main = (p: string) => (!vfs.isFile(p) && vfs.isFile(p + '.js') ? p + '.js' : p)
+  let file = main(normalize(entry))
+  const shim = vfs.isFile(file) ? binShimTarget(vfs.readText(file).slice(0, 512)) : null
+  if (shim) file = main(resolve(dirname(file), shim))
+  // the greedy `.*` takes every earlier node_modules segment, so this is the package's own dir
+  const m = /^(.*\/node_modules\/(?:@[^/]+\/)?[^/]+)\//.exec(file)
+  if (!m) return null
+  let name: unknown, bin: unknown
   try {
-    bins = binEntries(m[2], readPkg(vfs, dir)?.bin as never)
+    ;({ name, bin } = readPkg(vfs, m[1]) ?? {})
   } catch {
-    return null
+    return null // unreadable package.json
   }
-  const target = normalize(entry)
-  for (const [bin, rel] of bins) {
-    const p = normalize(join(dir, rel))
-    if (target === p || target === p + '.js') return { package: m[2], bin }
-  }
+  if (typeof name !== 'string' || !Object.hasOwn(HEAVY_CLIS, name)) return null
+  for (const [b, rel] of binEntries(name, bin as never)) if (normalize(join(m[1], String(rel))) === file) return { package: name, bin: b, entry: file }
   return null
 }
 

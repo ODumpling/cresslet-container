@@ -7,6 +7,7 @@ import { builtins } from './shell/builtins'
 import { COMMANDS } from './commands'
 import { dropLegacyCache, HttpRegistry, type Registry } from './npm/registry'
 import { sharedIdbCache } from './npm/cache'
+import { binShimTarget } from './npm/install'
 import { clearPackageCache, isBare, type ResolveFs } from './resolve'
 import { bundleVfs, DEFAULT_WASM_URL, type BuildOptions as EsbuildOptions, type OutputFile } from './esbuild'
 import { createDevServer, type DevServerHandle, type DevServerOptions } from './dev/server'
@@ -74,7 +75,8 @@ export interface BootOptions {
    * Runs the CLIs cresslet's `node` can't (`next`, and vite's own bin rather than the built-in `vite` command): when
    * `node` is asked to run one's bin script (a `node_modules/.bin` shim, `npx`, a package script, `node <path>`), this
    * is called instead, with the command's context plus `{ package, bin, entry }`, and its result is the exit code.
-   * Unset: those fail with an error saying so. See docs/research/wasm-node.md.
+   * Unset: those fail with an error saying so (`--version` / `--help` alone still run on `node`). See
+   * docs/research/wasm-node.md.
    */
   fallbackRuntime?: FallbackRuntime
 }
@@ -404,8 +406,8 @@ export class Container {
 
   private runFile(file: string, ctx: CommandContext): Promise<number> {
     const head = this.vfs.readText(file).slice(0, 512)
-    const shim = /^#!\/usr\/bin\/env node\n\/\/ cresslet-bin -> (.+)\n/.exec(head) // only an npm .bin shim's own header line
-    if (shim) return COMMANDS.node({ ...ctx, args: [resolve(dirname(file), shim[1]), ...ctx.args] })
+    const shim = binShimTarget(head)
+    if (shim) return COMMANDS.node({ ...ctx, args: [resolve(dirname(file), shim), ...ctx.args] })
     const shebang = head.startsWith('#!') ? head.slice(2, head.indexOf('\n')) : ''
     if (/\b(sh|bash|jsh|zsh)\b/.test(shebang)) return COMMANDS.jsh({ ...ctx, args: [file, ...ctx.args] })
     return COMMANDS.node({ ...ctx, args: [file, ...ctx.args] })

@@ -7,11 +7,12 @@ State as of 2026-11-21. Primary sources only: repos, docs, npm registry metadata
 ## TL;DR
 
 - **Nobody ships upstream Node.js compiled to WASM.** I found no official effort in nodejs/node. V8 inside wasm would have to run jitless, and jitless V8 is about 80% slower on the Web Tooling Benchmark and has no WebAssembly support ([v8-jitless]).
-- **The one serious "real Node in the browser" today is Wasmer's Edge.js on `@wasmer/sdk`.** Edge.js is Node's own `lib/` and `src/`, ported so its bindings go through N-API. Its libuv/syscall layer is a WASIX module, and in the browser the JS runs on the page's own engine through a host-provided N-API, so it keeps the JIT ([edge-readme], [edge-arch], [edge-sec]). Wasmer's browser shell runs real `next dev --webpack` and Vite 8 on it ([sdk-next], [sdk-vinext]). The costs: about 78 MB (25 MB gzip) of package, alpha status, JSPI and COOP/COEP required, and a "Modified MIT" SDK license with an attribution clause ([sdk-license]).
+- **There are two serious "real Node in the browser" runtimes today. The one with an open core is Wasmer's Edge.js on `@wasmer/sdk`.** Edge.js is Node's own `lib/` and `src/`, ported so its bindings go through N-API. Its libuv/syscall layer is a WASIX module, and in the browser the JS runs on the page's own engine through a host-provided N-API, so it keeps the JIT ([edge-readme], [edge-arch], [edge-sec]). Wasmer's browser shell runs real `next dev --webpack` on it (tested), and ships a Vite 8 example (vinext, untested) ([sdk-next], [sdk-vinext]). The costs: a 78 MB package served uncompressed (about 25 MB if gzipped, measured locally), alpha status, JSPI and COOP/COEP required, and a "Modified MIT" SDK license with an attribution clause ([sdk-license]).
+- **Leaning Technologies' BrowserPod is the other one:** Node 22 compiled to Wasm, JS on the page's engine, about 15 MB to first `node` output (measured). It's proprietary: CDN-only, with a required "Powered by BrowserPod" credit, and its servers are reachable only through Leaning's metered network ([bp-node], [bp-license], [bp-net]).
 - **StackBlitz WebContainers runs vite and next, but it is a hosted, proprietary runtime.** The client package is MIT, but the runtime loads from stackblitz.com, and production for-profit use needs a commercial license ([wc-enterprise]). It can't be embedded as an MIT library's built-in.
 - **x86 emulators (CheerpX/WebVM, v86, container2wasm, JSLinux) run real Linux `node` binaries, but they don't fit.** CheerpX and v86 are 32-bit only (the last i386 Node build is v21.7.3). CheerpX is proprietary. Networking needs a VPN or a proxy. Their filesystems are block or 9p devices, not a JS VFS.
 - **QuickJS-based runtimes (quickjs-emscripten, wasmedge-quickjs, LLRT) aren't Node** and are slower than the browser's own engine.
-- **The cheaper path is pieces that already ship as wasm, run on cresslet's own `node`.** These are TypeScript 7's experimental `tsc.wasm` (wasip1, with a JS file-system callback API), `@next/swc-wasm-nodejs`, `@rolldown/binding-wasm32-wasi` and esbuild-wasm. Rolldown and Next already special-case WebContainers to load them ([rolldown-wc], [next-swc]). The JS `tsc` (TypeScript ≤ 6.0) needs only `fs`/`path`/`os`/`crypto` ([ts6-sys]).
+- **The cheaper path is pieces that already ship as wasm, run on cresslet's own `node`.** These are TypeScript 7's experimental `tsc.wasm` (wasip1, with a JS file-system callback API), `@next/swc-wasm-nodejs`, `@rolldown/binding-wasm32-wasi` and esbuild-wasm. Rolldown and Next already special-case WebContainers to load them ([rolldown-wc], [next-swc]). The JS `tsc` (TypeScript ≤ 6.0) needs only `fs`/`path`/`os`/`crypto` ([ts6-sys]); 5.9.3 was measured working on cresslet's `node` (below), 6.x is expected to from its `sys.ts`.
 
 ## Measured: real CLIs on cresslet's own `node`
 
@@ -21,18 +22,18 @@ Run in headless Chromium on 2026-11-21, against `main` at b41308a, after `npm in
 |---|---|
 | `node node_modules/typescript/bin/tsc -p .` (5.9.3) | **Works**: reports TS2322 and exits 2, in about 350 ms warm. |
 | `node node_modules/typescript/bin/tsc -v` (7.0.2) | Fails loudly with exit 1: `Unable to resolve @typescript/typescript-linux-x64` (its bin runs a native executable). |
-| `node node_modules/vite/bin/vite.js --version` | Exit 1: `SyntaxError` (the ESM bin isn't loaded as ESM). |
-| `node node_modules/vite/dist/node/cli.js build` | **Exit 0 with no output** after about 1 s. Kept alive with a `setInterval`, it shows the error: `Identifier '__dirname' has already been declared` in `chunks/build.js`. |
+| `node node_modules/vite/bin/vite.js --version` | Exit 1: `SyntaxError` (the ESM bin isn't loaded as ESM). This is what `./node_modules/.bin/vite` runs. |
+| `node node_modules/vite/dist/node/cli.js build` (not a bin, so not detected by this change) | **Exit 0 with no output** after about 1 s. Kept alive with a `setInterval`, it shows the error: `Identifier '__dirname' has already been declared` in `chunks/build.js`. |
 | `node node_modules/next/dist/bin/next build` / `dev` | **Exit 0 with no output** in about 50 ms. Kept alive, it shows `Failed to fetch dynamically imported module: …/cli/next-build.js` (a native `import()` that the CJS loader doesn't route to the VFS). |
 | `vite build` (the built-in command) | Works. |
 
-So the polyfilled `node` doesn't just fail on heavy CLIs: it can **exit 0 silently**, because the worker exits when nothing holds it open, before the rejected import surfaces. Getting past these loader gaps would still hit the native-addon wall: rollup's or rolldown's native binding for vite, SWC for next (see §9).
+So the polyfilled `node` doesn't just fail on heavy CLIs: it can **exit 0 silently**, because the worker exits when nothing holds it open, before the rejected import surfaces. Getting past these loader gaps would still hit the native-addon wall: rollup's or rolldown's native binding for vite, SWC for next (see §10).
 
 ## What this change ships
 
 Not a runtime, given the findings below: a detection path and a hook.
 
-- When `node` is asked to run a heavy CLI's bin script (`next`, and vite's own bins), it fails at once with an error naming the CLI and `boot({ fallbackRuntime })`, instead of the late failures or silent exit 0 above. This applies however it starts: a package script, a `.bin` shim, `npx`, `node <path>` or `child_process`. The built-in `vite` and `tsc` commands are unchanged.
+- When `node` is asked to run a heavy CLI's bin script (`next`, and vite's own bins), it fails at once with an error naming the CLI and `boot({ fallbackRuntime })`. For `next` that replaces the silent exit 0 above; for vite's bin, the `SyntaxError`. This applies however it starts: a package script, a `.bin` shim (also `node node_modules/.bin/next`), `npx`, `node <path>` or `child_process`. `--version` / `--help` alone still run on `node`, as they work there. The built-in `vite` and `tsc` commands are unchanged.
 - `boot({ fallbackRuntime })` gets those runs instead, with the command's context (`args`, `cwd`, `env`, stdio, `signal`, `container`) plus `{ package, bin, entry }`, and returns the exit code. A host can plug in Edge.js, WebContainers or a remote machine there. The extras listed at the end of this doc (prepare step, TTY resize, two-way file sync) are left until an adapter needs them.
 
 ## Why JIT matters
@@ -60,7 +61,19 @@ V8's `--jitless` mode runs Ignition (the interpreter) only and interprets regexp
 - **vite/next/tsc:** Next.js 16.3.3 via `next dev --webpack` (Turbopack needs native bindings) ([sdk-next-pkg], [next-swc]). The Vinext example uses `vite@8.2.0` ([sdk-vinext]). I found no browser test for plain vite: **unverified**. `tsc` (TS 7) spawns a native exe ([ts7-tsc]), so it would need `tsc.wasm` instead (**unverified**).
 - **WinterJS:** Archived (2026-03), "deprecated in favor of the Edge.js JS runtime". It was a SpiderMonkey WinterCG server, not Node ([winterjs]).
 
-### 3. StackBlitz WebContainers (`@webcontainer/api`)
+### 3. BrowserPod (Leaning Technologies)
+
+- **What:** "Node.js 22 compiled from its own C++ source to WebAssembly, with JavaScript running on the browser's engine" ([bp-node]). V8 API calls go to "our custom implementation, based on native browser capabilities" ([bp-beta]), so JS keeps the page's JIT ([bp-deep]). It runs on a Wasm Linux-like kernel split out of CheerpX's syscall layer, without CheerpX's x86 JIT ([bp-beta], [bp-deep]). npm, pnpm, bash and git are included ([bp-docs]). A run reported `process.version` v22.15.0 and `process.arch` `wasm32` (measured). Version 4.1.0 ([bp-npm]).
+- **How it runs:** `@leaningtech/browserpod@4.1.0` is a 35 kB stub that `import()`s `https://rt.browserpod.io/4.1.0/browserpod.js`; disk images stream in blocks over `wss://disks.browserpod.io` ([bp-npm], [bp-lod]). Self-hosting needs an Enterprise licence ([bp-lic]). The page must be cross-origin isolated ([bp-coi]). Each process runs in its own Worker ([bp-deep]). Chrome, Edge, Firefox and Safari 27+; JSPI isn't required ([bp-docs], [bp-deep]).
+- **Size / startup:** First-party claims are qualitative only ("start near-instantly") ([bp-docs], [bp-lod]). `bpnode.wasm` is 30.6 MB raw, 12.0 MB gzip, 7.95 MB brotli ([bp-rt]). One headless Chromium cold run against the 4.1.0 CDN (measured): `boot()` 1.0–1.5 s, the first `node -v` 0.9 s, about 15.5 MB transferred to first output, about 1 s per later `node -e`.
+- **fs bridge:** Async file handles only: `createDirectory`, `createFile`/`openFile`, `read`, `write`, `getSize`, `close`. No readdir, stat, rename or watch, so files are copied in and out ([bp-ref], [bp-dts]). Optional persistence via `storageKey` (OPFS, else IndexedDB) ([bp-fs]).
+- **net bridge:** Outbound HTTP(S)/WebSocket through a host-supplied `fetch` hook, subject to CORS (free) ([bp-net], [bp-fetchnet]). Inbound access to a pod's server only through metered Edge "Portals" at `<id>-<port>.browserportal.io` ([bp-portals], [bp-net]); there's no service-worker preview ([bp-docs]). So its servers wouldn't show in cresslet's previews without a tunnel (**unverified**).
+- **Threads/processes:** A Worker per process or thread, with shared memory ([bp-deep]). `pod.run` is execve-like and returns an exit code ([bp-run]). Native npm binaries need wasm overrides (esbuild-wasm, `@rollup/wasm-node`, `@next/swc-wasm-nodejs`) ([bp-native]).
+- **License:** Proprietary "BrowserPod Community Licence": free including commercial use, but it requires a visible "Powered by BrowserPod" credit, and the files may load only from the official CDN (no hosting, mirroring, proxying or bundling) ([bp-license]). Edge Pro ($20/month) drops the credit; Enterprise is quoted ([bp-lic]). An MIT library can't bundle it; a host could plug it in through `fallbackRuntime` and take on those terms.
+- **vite/next/tsc:** Changelog: "Support Vite 8", "Initial support for Next.js 16" ([bp-changelog]). Measured on 4.1.0: `npm i typescript vite` 30 s, `tsc a.ts` works, `vite build` works with the esbuild/rollup wasm overrides (4.5 s). `vite dev`, `next dev` and `next build`: not tested.
+- **Verdict:** Technically the most complete option (real Node 22, about 15 MB cold, no JSPI, out of beta), but closed, CDN-only, with a required credit, and its server previews go through Leaning's metered network. A host-supplied adapter at most.
+
+### 4. StackBlitz WebContainers (`@webcontainer/api`)
 
 - **What:** "A browser-based runtime for executing Node.js applications and operating system commands", "entirely client-side" ([wc-intro]). The 2021 launch post describes a WebAssembly-based OS and a "virtualized TCP network stack" mapped to Service Workers ([wc-blog]). Whether JS runs on the browser engine: **unverified** (not documented). Other projects' code shows it reports `process.versions.webcontainer`. Next.js loads SWC's wasm bindings first when it sees it ([next-swc]). Rolldown downloads `@rolldown/binding-wasm32-wasi` "on WebContainer" ([rolldown-wc]). So it runs neither native addons nor Turbopack.
 - **How it runs:** `@webcontainer/api@1.6.4` is a 181 KB MIT client ([npm-wc]). The runtime itself loads from StackBlitz (`editorOrigin` default `https://stackblitz.com`) ([wc-dts]). The page must be cross-origin isolated (COEP `require-corp` or `credentialless`) ([wc-headers]). Projects run on StackBlitz subdomains with their own service worker, and third-party cookies for `*.stackblitz.io`/`*.webcontainer.io` may need allowing ([wc-browser]). Only one instance can boot at a time ([wc-dts]).
@@ -71,7 +84,7 @@ V8's `--jitless` mode runs Ignition (the interpreter) only and interprets regexp
 - **vite/next/tsc:** Vite and webpack are named ([wc-intro]), Next.js since launch ([wc-blog]). TS 7 `tsc`: **unverified** (it spawns a native binary ([ts7-tsc])).
 - **Verdict:** It works, but it's proprietary, hosted and licensed. A *user* could plug it in through `fallbackRuntime`, but cresslet can't bundle it.
 
-### 4. CodeSandbox Nodebox (`@codesandbox/nodebox`) / Sandpack
+### 5. CodeSandbox Nodebox (`@codesandbox/nodebox`) / Sandpack
 
 - **What:** "Nodebox does not emulate Node.js but is, instead, a Node.js-compatible runtime": it "implement[s] as much of the Node.js API as possible", module by module ([nodebox-readme]). It's the same approach as cresslet. Limitations: no N-API modules, no sockets to external IPs, no sync exec/spawn ([nodebox-readme]).
 - **How it runs:** The runtime runs in an iframe hosted by CodeSandbox by default; self-hosting is possible ([nodebox-readme]). The client is 102 KB ([npm-nodebox]). Runtime size: **unverified**.
@@ -79,7 +92,7 @@ V8's `--jitless` mode runs Ignition (the interpreter) only and interprets regexp
 - **Maintenance:** The repo was last pushed 2023-11-29 ([nodebox-repo]). Effectively dormant.
 - **vite/next/tsc:** Its tutorial runs a Next.js example ([nodebox-readme]). Current versions: **unverified**. It doesn't help cresslet: same class of runtime, weaker license.
 
-### 5. CheerpX / WebVM (Leaning Technologies)
+### 6. CheerpX / WebVM (Leaning Technologies)
 
 - **What:** An x86-to-WebAssembly JIT for "user-mode code on top of a Linux-compatible system call interface" ([cx-overview]). It runs real Linux binaries, so it would run a real `node`. "Currently, only 32-bit x86 binaries are supported" ([cx-meta]). WebVM's Debian image is `i386/debian:buster` with apt's `nodejs` ([webvm-docker]). Buster's nodejs is v10: **unverified**. Official 32-bit Linux x86 Node builds stopped at v9.11.2, and unofficial `linux-x86` builds at v21.7.3 ([node-dist], [node-unofficial]). Current vite needs `^20.19.0 || >=22.12.0`, next `>=20.9.0` ([npm-vite], [npm-next]). On top of that, rolldown and next have no `linux-ia32` native bindings, so they would need the wasm ones. Running them is **unverified**.
 - **Size:** The core files I fetched from `cxrtnc.leaningtech.com/1.4.0/` (`cx_esm.js`, `cxcore.wasm`, `cxcore.js`, `cheerpOS.js`, `cxbridge.js`) are about 0.62 MB brotli on the wire (measured). Disk images stream on demand ("2GB complete Debian system" streamed) ([cx-overview]). WebVM's default disk is `wss://disks.webvm.io/debian_buster_large_…ext2` ([webvm-config]).
@@ -89,25 +102,25 @@ V8's `--jitless` mode runs Ignition (the interpreter) only and interprets regexp
 - **License:** Proprietary. Free for individuals, FOSS and evaluation. Business use, redistribution, OEM and **self-hosting** require a commercial license ([cx-license], [cx-meta]). WebVM's own UI is Apache-2.0 ([webvm-repo]).
 - **Verdict:** Not viable: proprietary, CDN-bound, 32-bit only, old Node.
 
-### 6. v86, container2wasm, JSLinux/TinyEMU (full-system emulators)
+### 7. v86, container2wasm, JSLinux/TinyEMU (full-system emulators)
 
 - **v86:** An x86 PC emulator with an x86-to-wasm JIT. It has no multicore and no 64-bit extensions ("64-bit kernels are not supported") ([v86-readme]). BSD-2-Clause, active ([v86-readme], [npm-v86]). `v86.wasm` is 2.0 MB (0.38 MB gzip, measured) plus a kernel/disk image. The fs bridge is a virtio 9p filesystem (jor1k's), and network backends are `wsproxy`, `wisp` or `fetch` ([v86-readme], [v86-net]). It has the same 32-bit Node ceiling as CheerpX (v21.7.3 ([node-unofficial])). Startup: **none published**. v86 supports saving and restoring state ([v86-readme]).
 - **container2wasm:** Converts a container image to wasm using Bochs (x86_64), TinyEMU (riscv64) or QEMU ([c2w-readme]). It runs in the browser via WASI + browser_wasi_shim, or as emscripten QEMU-wasm "with JIT compilation (TCG)". Its demo includes `node` ([c2w-readme]). Host directories reach the guest "via virtio-9p". Networking goes through a gvisor-tap-vsock stack, either in-browser over Fetch (CORS-limited) or delegated over WebSocket. The kernel is pre-booted with wizer "to minimize the startup latency (for WASI only)" ([c2w-readme]). Apache-2.0, active ([c2w-repo]). Real 64-bit `node` should work, but x86_64 runs through Bochs (an interpreter) or QEMU TCG. Performance numbers: **none published**, expected to be far below native (**unverified**).
 - **JSLinux/TinyEMU:** JSLinux now lists x86_64 Alpine 3.23.2 "with AVX-512 and APX support", plus x86 and riscv64 systems ([jslinux]). TinyEMU is MIT, with its last release 2019-12-21. It supports VirtIO net and 9P ([tinyemu]). The license of the current JSLinux x86_64 emulator: **unverified**. It's a demo site, not an embeddable library.
 - **Verdict:** These run a *real* `node`, but at emulator speed, with a block or 9p filesystem and proxy networking. Not a practical vite/next fallback.
 
-### 7. QuickJS-based runtimes
+### 8. QuickJS-based runtimes
 
 - **quickjs-emscripten:** QuickJS in wasm (sync variant `emscripten-module.wasm` 503 KB / 232 KB gzip, measured), MIT ([npm-qjs]). It's for sandboxed eval, with no Node APIs ([qjs-readme]). It would interpret JS inside wasm, so it's slower than the browser's JIT.
 - **wasmedge-quickjs:** Supports "only part of the Node.js API" (querystring, buffer, encoding, http, …), and compatibility is "a work in progress" ([wasmedge-node]). It targets WasmEdge, not browsers. Last push 2024-10 ([wasmedge-repo]).
 - **LLRT (AWS):** Native Rust + QuickJS, not wasm. "**NOT** a drop in replacement for Node.js, nor will it ever be" ([llrt-readme]).
 - **Edge.js + QuickJS:** Edge.js can also embed QuickJS in wasm (`quickjs-wasm/`) ([edge-readme]). Wasmer reports Next.js rendering at about 100 ms/page on QuickJS vs about 10 ms with V8 JIT ([edge-node-post]). In the browser, the host-napi mode (§2) is the one to use.
 
-### 8. Other "Node in the browser" projects
+### 9. Other "Node in the browser" projects
 
 - **almostnode** (MIT, macaly): "40+ shimmed modules" over a VFS, with "built-in Vite and Next.js development servers". It's the same class as cresslet and Nodebox, not real Node ([almostnode]). Last push 2026-02.
 
-### 9. Browser-native pieces heavy CLIs need anyway
+### 10. Browser-native pieces heavy CLIs need anyway
 
 These ship as wasm today. Several CLIs fall back to them automatically.
 
@@ -128,7 +141,8 @@ Important for cresslet's stub: `typescript@latest` is **7.0.2**. Its `bin/tsc` r
 | Runtime | Real Node? | Size (download) | Startup | fs bridge | net bridge | License | vite / next / tsc |
 |---|---|---|---|---|---|---|---|
 | Node → wasm (upstream) | — (doesn't exist) | — | — | — | — | MIT (Node) | — |
-| Edge.js + `@wasmer/sdk` (host N-API) | Yes: Node's lib/src ported to N-API; JS on the browser's JIT | edge webc 78.4 MB (≈25 MB gz) + SDK 4.8 MB (1.8 MB gz) + bash; next adds 6.8 MB gz SWC | browser: none published (native 60–102 ms V8) | in-memory guest FS; async `sandbox.fs` copy; experimental SAB `mountHost` | WISP WebSocket relay out; `ports.expose` via SW, 1 server per origin | Edge.js MIT; SDK Modified MIT (attribution > 1M MAU / $1M/mo) | vite 8 (example), next `--webpack` (tested); tsc 7 no (native) |
+| Edge.js + `@wasmer/sdk` (host N-API) | Yes: Node's lib/src ported to N-API; JS on the browser's JIT | edge webc 78.4 MB served uncompressed (≈25 MB if gzipped) + SDK 4.8 MB (1.8 MB gz) + bash; next adds 30.8 MB SWC wasm (6.8 MB gz) | browser: none published (native 60–102 ms V8) | in-memory guest FS; async `sandbox.fs` copy; experimental SAB `mountHost` | WISP WebSocket relay out; `ports.expose` via SW, 1 server per origin | Edge.js MIT; SDK Modified MIT (attribution > 1M MAU / $1M/mo) | vite 8 (example, untested), next `--webpack` (tested); tsc 7 no (native) |
+| BrowserPod | Yes: Node 22.15.0 C++ → wasm; JS on the browser's JIT | stub 35 kB; `bpnode.wasm` 30.6 MB raw / 12.0 MB gz; ≈15.5 MB cold to first `node` (measured) | boot 1–1.5 s, first `node` 0.9 s (measured) | async file handles (no readdir/watch); copy in/out | outbound via host `fetch` hook (CORS); inbound only via metered Edge Portals | proprietary Community Licence: free incl. commercial, credit required, CDN-only | vite build ✓, tsc ✓ (measured); next 16 "initial support" (vendor) |
 | WebContainers | Node-compatible (internals undocumented) | unverified (hosted) | "milliseconds" (no numbers) | in-memory; mount/export/watch API | virtual TCP → StackBlitz SW | client MIT; runtime proprietary, commercial licence for prod | vite, next (wasm SWC, webpack); tsc 7 unverified |
 | Nodebox | No (reimplemented APIs) | unverified (hosted) | none | in-memory | no external sockets | Sustainable Use (non-commercial) | next example; dormant |
 | CheerpX / WebVM | Yes (i386 Linux binary) | ≈0.62 MB br core + streamed ext2 disk | none | ext2/IDB/Web/Data devices | Tailscale (WebSocket VPN) | proprietary; self-host = commercial | Node ≤ 21 (i386) → current vite no; next unverified |
@@ -142,11 +156,11 @@ Important for cresslet's stub: `typescript@latest` is **7.0.2**. Its `bin/tsc` r
 
 ## Viability for cresslet now
 
-**As a built-in fallback inside an MIT library, nothing is viable today.** Upstream Node-in-wasm doesn't exist. WebContainers, Nodebox and CheerpX are proprietary or non-commercial. The emulators are too slow and too far from a JS VFS.
+**As a built-in fallback inside an MIT library, nothing is viable today.** Upstream Node-in-wasm doesn't exist. BrowserPod, WebContainers, Nodebox and CheerpX are proprietary, hosted or non-commercial. The emulators are too slow and too far from a JS VFS.
 
-**The closest option to a pluggable fallback is Edge.js on `@wasmer/sdk/browser`.** It should be an optional, user-installed adapter, not bundled. It runs Node's real JS on the page's JIT and already runs `next dev --webpack` in the browser. It fits cresslet's constraints (cross-origin isolated page, SAB, service-worker previews). Its costs:
+**Two real-Node options could back a pluggable fallback.** BrowserPod is the more complete one today (§3), but its licence (CDN-only, required credit) and its previews on Leaning's network make it a host's choice, not something cresslet can ship or document as the default. The one with an open core is Edge.js on `@wasmer/sdk/browser`. It should be an optional, user-installed adapter, not bundled. It runs Node's real JS on the page's JIT and already runs `next dev --webpack` in the browser. It fits cresslet's constraints (cross-origin isolated page, SAB, service-worker previews). Its costs:
 
-1. A download of about 30 MB+ gzip before the first command.
+1. A download before the first command: the 78.4 MB Edge webc as served today (about 25 MB if a host serves it gzipped) plus the 4.8 MB SDK, and for Next.js another 30.8 MB of SWC wasm (6.8 MB gzipped).
 2. The SDK's attribution clause for large users.
 3. Alpha status, and a host realm that isn't a security boundary ([edge-sec]).
 4. JSPI-capable browsers only ([sdk-compat]).
@@ -173,7 +187,7 @@ Outputs:
 - (shipped) The exit code.
 - (shipped through `container.servePort`) Server ports: either `ports.onListen(port)`, with the adapter calling `container.servePort(port, req => Response)`, or the runtime's own preview URL/origin reported through the `server-ready`/`port` events.
 - Optionally, outbound network policy: a WISP or WebSocket relay URL that the host supplies.
-- Lifecycle: `prepare()` (download and cache the runtime, with progress events) separate from `run()`, so the first command doesn't silently spend 30 MB. Plus `teardown()`.
+- Lifecycle: `prepare()` (download and cache the runtime, with progress events) separate from `run()`, so the first command doesn't silently download tens of MB. Plus `teardown()`.
 
 ## Sources
 
@@ -206,6 +220,25 @@ Outputs:
 [sdk-next-test]: https://github.com/wasmerio/wasmer-sdk/blob/main/wasmer-sh/tests/next-browser.mjs
 [sdk-compat]: https://github.com/wasmerio/wasmer-sdk/blob/main/wasmer-sh/src/browser-compatibility.ts
 [winterjs]: https://github.com/wasmerio/winterjs
+[bp-node]: https://browserpod.io/runtimes/node/
+[bp-lic]: https://browserpod.io/docs/more/licensing
+[bp-license]: https://browserpod.io/license
+[bp-docs]: https://browserpod.io/docs/overview
+[bp-npm]: https://www.npmjs.com/package/@leaningtech/browserpod
+[bp-dts]: https://registry.npmjs.org/@leaningtech/browserpod/-/browserpod-4.1.0.tgz
+[bp-rt]: https://rt.browserpod.io/4.1.0/browserpod.js
+[bp-ref]: https://browserpod.io/docs/reference/BrowserPod/createFile
+[bp-run]: https://browserpod.io/docs/reference/BrowserPod/run
+[bp-fs]: https://browserpod.io/docs/understanding-browserpod/filesystem
+[bp-coi]: https://browserpod.io/docs/understanding-browserpod/cross-origin-isolation
+[bp-net]: https://browserpod.io/docs/understanding-browserpod/networking
+[bp-fetchnet]: https://browserpod.io/docs/reference/BrowserPod/createFetchNetwork
+[bp-portals]: https://browserpod.io/features/portals/
+[bp-lod]: https://browserpod.io/features/loads-on-demand/
+[bp-native]: https://browserpod.io/docs/guides/working-around-native-npm-dependencies
+[bp-changelog]: https://browserpod.io/docs/more/changelog
+[bp-deep]: https://labs.leaningtech.com/blog/browserpod-deep-dive
+[bp-beta]: https://labs.leaningtech.com/blog/browserpod-beta-announcement
 [wc-intro]: https://webcontainers.io/guides/introduction
 [wc-enterprise]: https://webcontainers.io/enterprise
 [wc-headers]: https://webcontainers.io/guides/configuring-headers
