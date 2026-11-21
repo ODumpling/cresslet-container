@@ -1,12 +1,13 @@
 // Production build of an index.html app: bundle module scripts with esbuild-wasm, hash assets, rewrite html.
 import type { Plugin } from 'esbuild-wasm'
 import type { Container } from '../container'
-import { bundleVfs, formatErrors } from '../esbuild'
+import { bundleVfs, formatErrors, splitQuery } from '../esbuild'
 import { basename, dirname, extname, join, normalize } from '../path'
 import { BROWSER_OPTS, resolveModule } from '../resolve'
 import { envDefines, jsxOptions, loadEnv, matchPaths, readProjectConfig, type ProjectConfig } from '../dev/project'
 import { contentHash, findTags, isLocalRef, rewriteHtmlForBuild } from './html'
 import { CssPipeline, STYLE_RE } from '../css/pipeline'
+import { sfcBuildPlugin } from '../css/sfc'
 
 export interface BuildOptions {
   root?: string
@@ -17,7 +18,7 @@ export interface BuildOptions {
 
 const PROD_RESOLVE = { ...BROWSER_OPTS, conditions: ['browser', 'import', 'module', 'production', 'default'] }
 
-export function pathsPlugin(c: Container, cfg: ProjectConfig): Plugin {
+export function pathsPlugin(c: Container, cfg: ProjectConfig, resolve = PROD_RESOLVE): Plugin {
   return {
     name: 'cresslet-tsconfig-paths',
     setup(build) {
@@ -27,13 +28,28 @@ export function pathsPlugin(c: Container, cfg: ProjectConfig): Plugin {
         if (!cands) return undefined
         for (const cand of cands) {
           try {
-            const r = resolveModule(c.resolveFs, cand, '/', PROD_RESOLVE)
+            const r = resolveModule(c.resolveFs, cand, '/', resolve)
             if (r) return { path: r, namespace: 'cresslet-vfs' }
           } catch {
             /* next */
           }
         }
         return undefined
+      })
+    },
+  }
+}
+
+/** `url(/src/logo.svg)` in a stylesheet: a project file, from the root (as the dev server serves it); public/ ones stay URLs. */
+function rootUrlsPlugin(c: Container, root: string): Plugin {
+  return {
+    name: 'cresslet-root-urls',
+    setup(build) {
+      build.onResolve({ filter: /^\// }, (a) => {
+        if (a.kind !== 'url-token') return undefined
+        const [clean, query] = splitQuery(a.path)
+        const abs = join(root, clean)
+        return !c.vfs.isFile(join(root, 'public', clean)) && c.vfs.isFile(abs) ? { path: abs, namespace: 'cresslet-vfs', suffix: query } : undefined
       })
     },
   }
@@ -46,6 +62,14 @@ export async function build(c: Container, o: BuildOptions = {}): Promise<{ files
   const htmlPath = join(root, 'index.html')
   if (!vfs.isFile(htmlPath)) throw new Error(`build: ${htmlPath} not found`)
   const cfg = readProjectConfig(vfs, root)
+  // a Svelte project resolves packages' `svelte` export condition (component libraries ship .svelte sources there)
+  let pkg: { dependencies?: Record<string, string>; devDependencies?: Record<string, string> } = {}
+  try {
+    pkg = JSON.parse(vfs.tryReadText(join(root, 'package.json')) ?? '{}')
+  } catch {
+    /* no package.json */
+  }
+  const resolve = pkg.dependencies?.svelte || pkg.devDependencies?.svelte ? { ...PROD_RESOLVE, conditions: ['svelte', ...PROD_RESOLVE.conditions] } : PROD_RESOLVE
   const env = loadEnv(vfs, root, 'production')
   let html = vfs.readText(htmlPath).replace(/%(\w+)%/g, (m, k) => (k in env ? String(env[k]) : m))
 
@@ -81,15 +105,18 @@ export async function build(c: Container, o: BuildOptions = {}): Promise<{ files
       metafile: true,
       ...jsxOptions(cfg),
       tsconfigRaw: cfg.tsconfigRaw as never,
-      define: { ...envDefines(env), 'process.env.NODE_ENV': '"production"', global: 'globalThis' },
+      // Vue's compile-time flags, as @vitejs/plugin-vue sets them (unset, its esm-bundler build warns)
+      define: { ...envDefines(env), 'process.env.NODE_ENV': '"production"', global: 'globalThis', __VUE_OPTIONS_API__: 'true', __VUE_PROD_DEVTOOLS__: 'false', __VUE_PROD_HYDRATION_MISMATCH_DETAILS__: 'false' },
       // Sass/Less are compiled to CSS by transformCss (the pipeline), then bundled as CSS
       loader: { '.scss': 'css', '.sass': 'css', '.less': 'css', '.module.css': 'local-css', '.module.scss': 'local-css', '.module.sass': 'local-css', '.module.less': 'local-css' },
-      plugins: [pathsPlugin(c, cfg)],
+      // .vue / .svelte / .svelte.js: compiled by the project's compiler, their styles bundled as CSS
+      plugins: [pathsPlugin(c, cfg, resolve), rootUrlsPlugin(c, root), sfcBuildPlugin(c, root, css, cfg.tsconfigRaw)],
       vfsPlugin: {
-        resolve: PROD_RESOLVE,
+        resolve,
         transformCss: async (p, text) => (await css.process(p, text)).css,
         // `url(/icon.svg#x)` in a stylesheet, for a file in public/ (copied to the output root): left as written
-        external: (spec, _importer, kind) => (kind === 'url-token' && spec.startsWith('/') && vfs.isFile(join(root, 'public', spec.replace(/[?#].*$/s, ''))) ? spec : undefined),
+        // and `url(#filter)` (a fragment of the document): left as written
+        external: (spec, _importer, kind) => (kind === 'url-token' && (spec.startsWith('#') || (spec.startsWith('/') && vfs.isFile(join(root, 'public', spec.replace(/[?#].*$/s, ''))))) ? spec : undefined),
       },
     })
   } catch (e) {

@@ -36,6 +36,4 @@ export declare function jsxOptions(cfg: ProjectConfig): {
 };
 export declare const mimeType: (p: string) => string;
 export declare const SCRIPT_EXT: RegExp;
-/** Single-file components the dev server compiles (with the project's own `vue` / `svelte` compiler). */
-export declare const SFC_EXT: RegExp;
 export declare const ASSET_EXT: RegExp;

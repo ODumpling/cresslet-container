@@ -3,7 +3,7 @@ import * as esbuild from 'esbuild'
 import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { analyzeHot, HOT_ID, hotBanner } from '../src/dev/hot'
 import { splitQuery } from '../src/esbuild'
@@ -172,15 +172,46 @@ function project(packages: string[]): string {
   writeFileSync(join(dir, 'package.json'), '{}')
   return dir
 }
+function files(root: string, tree: Record<string, string>): void {
+  for (const [f, s] of Object.entries(tree)) {
+    mkdirSync(dirname(join(root, f)), { recursive: true })
+    writeFileSync(join(root, f), s)
+  }
+}
 
 describe('single-file components (worker)', () => {
-  it('Svelte 5: client code with its own import.meta.hot accept and injected CSS', async () => {
+  it('Svelte 5: client code with its own import.meta.hot accept; its CSS returned', async () => {
     const root = project(['svelte'])
     const r = await worker.compileSfc({ root, file: join(root, 'src/App.svelte'), hmrId: 'x', source: '<script lang="ts">let n: number = $state(0)</script><button onclick={() => n++}>{n}</button><style>button{color:red}</style>' })
     expect(r.lang).toBe('js')
     expect(r.code).toContain("from 'svelte/internal/client'")
     expect(r.code).toMatch(/import\.meta\.hot\.accept\(/)
-    expect(r.code).toContain('color:red')
+    expect(r.styles).toHaveLength(1)
+    expect(r.styles[0]).toMatch(/button\.svelte-\w+\s*\{\s*color:\s*red/)
+  })
+
+  it('Svelte: production output, <style lang="scss">, @imports inlined after scoping (a package one too)', async () => {
+    const root = project(['svelte', 'sass'])
+    files(root, { 'src/theme.css': '.theme { background: url(./img/a.png) }', 'node_modules/ui/package.json': '{"name":"ui","style":"ui.css"}', 'node_modules/ui/ui.css': '.ui { color: blue }' })
+    const source = '<p class="a">hi</p>\n<style lang="scss">@import "./theme.css"; @import "ui/ui.css"; $c: red; .a { color: $c; }</style>'
+    const r = await worker.compileSfc({ root, file: join(root, 'src/A.svelte'), hmrId: 'x', source, env: 'production' })
+    expect(r.code).not.toMatch(/import\.meta\.hot|\$\.add_locations|HMR/)
+    const css = r.styles.join('\n')
+    expect(css).toMatch(/\.a\.svelte-\w+\s*\{\s*color:\s*red/)
+    expect(css).toContain('.theme { background: url(./img/a.png) }') // global (as vite-plugin-svelte), url() relative to the component
+    expect(css).toContain('.ui { color: blue }')
+    expect(css).not.toContain('@import')
+    expect(r.deps.sort()).toEqual([join(root, 'node_modules/ui/ui.css'), join(root, 'src/theme.css')])
+    const dev = await worker.compileSfc({ root, file: join(root, 'src/A.svelte'), hmrId: 'x', source })
+    expect(dev.styles[0]).toContain('url(/src/img/a.png)') // dev: root-relative, for a <style> on the page
+  })
+
+  it('Svelte: .svelte.js rune modules compile with compileModule', async () => {
+    const root = project(['svelte'])
+    const r = await worker.compileSfc({ root, file: join(root, 'src/count.svelte.js'), hmrId: 'x', source: 'let c = $state(0)\nexport const get = () => c\nexport const inc = () => c++\n', env: 'production' })
+    expect(r.code).toContain("from 'svelte/internal/client'")
+    expect(r.code).toMatch(/\$\.state\(0\)/)
+    expect(r.styles).toEqual([])
   })
 
   it('Svelte: a compile error carries its location', async () => {
@@ -195,21 +226,176 @@ describe('single-file components (worker)', () => {
     expect(a.lang).toBe('ts')
     expect(a.code).toContain('_sfc_main.render = _sfc_render')
     expect(a.code).toContain('_sfc_main.__scopeId = "data-v-abc"')
-    expect(a.code).toContain('button[data-v-abc]')
-    expect(a.code).toContain('color: red')
+    expect(a.styles).toHaveLength(2) // one sheet per block: an @import must start one
+    const [scss, plain] = a.styles
+    expect(scss).toContain('button[data-v-abc]')
+    expect(scss).toContain('color: red')
     // relative url()s resolve from the component, not the page
-    expect(a.code).toContain('url(/src/icon.svg?x#y)')
-    expect(a.code).toContain('url(\\"/up.png\\")') // (Sass prints double quotes; JSON-escaped in the module)
-    expect(a.code).toContain('url(/abs.png) url(data:x)')
-    expect(a.code).toContain('url(\\"/src/a b.svg\\")')
-    expect(a.code).toContain('content: \\"url(text)\\"')
-    expect(a.code).toContain('","@import \\"/src/theme.css\\"') // its own sheet: an @import must start one
+    expect(scss).toContain('url(/src/icon.svg?x#y)')
+    expect(scss).toContain('url("/up.png")') // (Sass prints double quotes)
+    expect(scss).toContain('url(/abs.png) url(data:x)')
+    expect(scss).toContain('url("/src/a b.svg")')
+    expect(scss).toContain('content: "url(text)"')
+    expect(plain.trim()).toBe('@import "/src/theme.css";') // not found: left to the browser (rebased)
     expect(a.code).toContain('__VUE_HMR_RUNTIME__.rerender(')
     const hashOf = (code: string) => /__cressletScript = "(\w+)"/.exec(code)![1]
     const b = await worker.compileSfc({ root, file: join(root, 'src/App.vue'), hmrId: 'abc', source: sfc('b') })
     expect(hashOf(b.code)).toBe(hashOf(a.code)) // template-only edit: same script
     const c = await worker.compileSfc({ root, file: join(root, 'src/App.vue'), hmrId: 'abc', source: sfc('a', '\nconst x = 1') })
     expect(hashOf(c.code)).not.toBe(hashOf(a.code))
+  })
+
+  it('Vue: a scoped style scopes its @imported sheets (relative and package ones), which are deps', async () => {
+    const root = project(['vue'])
+    files(root, {
+      'src/theme.css': '@import "./deep.css" screen and (min-width: 1px); @import url(https://example.com/f.css); .theme { background: url(./img/a.png) }',
+      'src/deep.css': '.deep { color: green }',
+      'src/styles/cycle.css': '@import "../cyc.css"; .c2 { color: red }',
+      'src/cyc.css': '@import "./styles/cycle.css"; .c1 { color: red }',
+      'node_modules/ui/package.json': '{"name":"ui","exports":{".":{"style":"./dist/ui.css"}}}',
+      'node_modules/ui/dist/ui.css': '.ui { background: url(./ui.png) }',
+    })
+    const source = '<template><p class="theme">x</p></template>\n<style scoped>@import "./theme.css" layer(base); @import "ui"; @import "./cyc.css" supports(display: grid); @import "tailwindcss"; p { color: red }</style>'
+    const r = await worker.compileSfc({ root, file: join(root, 'src/App.vue'), hmrId: 'abc', source, env: 'production' })
+    const [css] = r.styles
+    // the remote import and Tailwind's stay, hoisted (an @import must start the sheet), with the conditions it was under
+    expect(css.indexOf('@import url("https://example.com/f.css") layer(base);')).toBe(0)
+    expect(css).toContain('@import "tailwindcss";')
+    const flat = css.replace(/\s+/g, ' ')
+    expect(flat).toContain('@layer base { @media screen and (min-width: 1px) { .deep[data-v-abc] { color: green } } .theme[data-v-abc] { background: url(./img/a.png) } }')
+    expect(flat).toContain('.ui[data-v-abc] { background: url(../node_modules/ui/dist/ui.png) }') // relative to the component (production)
+    expect(flat).toContain('@supports (display: grid) { .c2[data-v-abc] { color: red } .c1[data-v-abc] { color: red } }') // (a cycle: each file once)
+    expect(flat).toContain('p[data-v-abc] { color: red }')
+    expect(r.deps.sort()).toEqual(['node_modules/ui/dist/ui.css', 'src/cyc.css', 'src/deep.css', 'src/styles/cycle.css', 'src/theme.css'].map((f) => join(root, f)))
+    // production: no HMR, no file path
+    expect(r.code).not.toMatch(/__hmrId|__file|import\.meta\.hot/)
+    expect(r.code).toContain('export default _sfc_main')
+  })
+
+  it('style @imports: comments and queries allowed, each file once, a remote import under conditions keeps them', async () => {
+    const root = project(['vue'])
+    files(root, {
+      'src/a.css': '@import "./shared.css"; .a { color: red }',
+      'src/b.css': '@import "./shared.css"; .b { color: red }',
+      'src/shared.css': '.shared { color: blue }',
+      'src/remote.css': '@import url(https://example.com/r.css); .r { color: red }',
+      'src/remote2.css': '@import url(https://example.com/r2.css) screen; .r2 { color: red }',
+    })
+    const source = '<template><p/></template>\n<style scoped>@import /* x */ "./a.css?v=1"; @import "./b.css"; @import "./remote.css" print; @import "./remote2.css" print; p { color: red }</style>'
+    const [css] = (await worker.compileSfc({ root, file: join(root, 'src/App.vue'), hmrId: 'abc', source, env: 'production' })).styles
+    expect(css.match(/\.shared\[data-v-abc\]/g)).toHaveLength(1)
+    expect(css).toContain('.a[data-v-abc]')
+    expect(css).toContain('@import url("https://example.com/r.css") print;')
+    expect(css).toMatch(/@media print \{\s*\.r\[data-v-abc\]/)
+    expect(css).toContain('@import "./remote2.css" print;') // both conditional: not inlined
+    expect(css).not.toContain('.r2')
+    // the same file under other conditions is inlined again; a discarded expansion doesn't count as inlined
+    files(root, { 'src/c.css': '@import "./shared.css"; @import url(https://example.com/c.css) screen;' })
+    const again = '<template><p/></template>\n<style scoped>@import "./a.css" screen; @import "./b.css" print; @import "./c.css" print; @import "./shared.css";</style>'
+    const flat = (await worker.compileSfc({ root, file: join(root, 'src/App.vue'), hmrId: 'abc', source: again, env: 'production' })).styles[0].replace(/\s+/g, ' ')
+    expect(flat).toMatch(/@media screen \{ \.shared\[data-v-abc\][^}]*\} \.a\[/)
+    expect(flat).toMatch(/@media print \{ \.shared\[data-v-abc\][^}]*\} \.b\[/)
+    expect(flat).toContain('@import "./c.css" print;')
+    expect(flat.trim()).toMatch(/\} \.shared\[data-v-abc\] \{ color: blue \}$/) // the direct import, after c.css was left out
+    // a diamond under the same conditions: once (postcss-import), so a.css's later rule still wins
+    files(root, { 'src/d.css': '@import "./shared.css"; .shared { color: red }' })
+    const diamond = (await worker.compileSfc({ root, file: join(root, 'src/App.vue'), hmrId: 'abc', source: '<template><p/></template>\n<style scoped>@import "./d.css"; @import "./shared.css";</style>', env: 'production' })).styles[0]
+    expect(diamond.replace(/\s+/g, ' ').trim()).toBe('.shared[data-v-abc] { color: blue } .shared[data-v-abc] { color: red }')
+    // a `@layer` statement after an import stays after the rules inlined for it (layer order)
+    files(root, { 'src/reset.css': '.card { color: red }' })
+    const layered = (await worker.compileSfc({ root, file: join(root, 'src/App.vue'), hmrId: 'abc', source: '<template><p/></template>\n<style>@import "./reset.css" layer(reset); @layer app; @layer app { .card { color: blue } }</style>', env: 'production' })).styles[0]
+    expect(layered.indexOf('@layer reset')).toBeLessThan(layered.indexOf('@layer app;'))
+  })
+
+  it('Vue: a src= stylesheet keeps one base: Tailwind directives rebased to the component; composes resolve beside it', async () => {
+    const root = project(['vue'])
+    files(root, { 'styles/use.css': '@reference "./theme/palette.css"; @source "../content"; .x { @apply bg-brand; background: url(./img.png) }', 'styles/card.css': '.card { composes: base from "./base.css"; color: red }', 'styles/base.css': '.base { margin: 0 }' })
+    const r = await worker.compileSfc({ root, file: join(root, 'src/App.vue'), hmrId: 'abc', source: '<template><p/></template>\n<style src="../styles/use.css"></style>\n<style module src="../styles/card.css"></style>', env: 'production' })
+    expect(r.styles[0]).toContain('@reference "../styles/theme/palette.css"')
+    expect(r.styles[0]).toContain('@source "../content"')
+    expect(r.styles[0]).toContain('url(../styles/img.png)')
+    expect(r.code).toMatch(/"card":"card_\w+ base_\w+"/)
+    // an @imported sheet's directives too
+    files(root, { 'styles/shared.css': '@reference "./theme/palette.css"; .s { background: url(./s.png) }' })
+    const imported = await worker.compileSfc({ root, file: join(root, 'src/B.vue'), hmrId: 'b', source: '<template><p/></template>\n<style>@import "../styles/shared.css";</style>', env: 'production' })
+    expect(imported.styles[0]).toContain('@reference "../styles/theme/palette.css"')
+    expect(imported.styles[0]).toContain('url(../styles/s.png)')
+  })
+
+  it('Vue production: root-relative template assets are bundled, public/ ones stay URLs; Tailwind import options stay', async () => {
+    const root = project(['vue'])
+    files(root, { 'public/vite.svg': '<svg/>', 'src/logo.svg': '<svg/>', 'src/x.css': '.x { color: red }' })
+    const source = '<template><img src="/vite.svg"><img src="/src/logo.svg"></template>\n<style>@import "./x.css" theme(reference);</style>'
+    const prod = await worker.compileSfc({ root, file: join(root, 'src/App.vue'), hmrId: 'a', source, env: 'production' })
+    expect(prod.code).toContain('const _imports_0 = "/vite.svg"')
+    expect(prod.code).toContain('import _imports_1 from "./logo.svg"')
+    // left for Tailwind, by its absolute path (in dev too: a root-relative URL isn't a file Tailwind can open)
+    expect(prod.styles[0]).toContain(`@import "${join(root, 'src/x.css')}" theme(reference);`)
+    const dev = await worker.compileSfc({ root, file: join(root, 'src/App.vue'), hmrId: 'a', source })
+    expect(dev.code).toContain('src: "/src/logo.svg"') // dev: the page loads it from the server
+    expect(dev.styles[0]).toContain(`@import "${join(root, 'src/x.css')}" theme(reference);`)
+    // a missing relative sheet is a dep: creating it recompiles the component
+    const missing = await worker.compileSfc({ root, file: join(root, 'src/App.vue'), hmrId: 'a', source: '<template><p/></template>\n<style scoped>@import "./fresh.css";</style>' })
+    expect(missing.deps).toEqual([join(root, 'src/fresh.css')])
+  })
+
+  it('Vue: a src= template resolves its includes and asset URLs from its own file', async () => {
+    const root = project(['vue', 'pug'])
+    files(root, { 'src/parts/view.pug': 'div\n  include ./nested.pug\n  img(src="./logo.svg")\n', 'src/parts/nested.pug': 'p.nested nested\n', 'src/parts/view.html': '<img src="./logo.svg"><img src="../top.svg">' })
+    const pug = await worker.compileSfc({ root, file: join(root, 'src/A.vue'), hmrId: 'a', source: '<template src="./parts/view.pug"></template>' })
+    expect(pug.code).toContain('class: "nested"')
+    expect(pug.code).toContain('import _imports_0 from "./parts/logo.svg"')
+    const html = await worker.compileSfc({ root, file: join(root, 'src/B.vue'), hmrId: 'b', source: '<template src="./parts/view.html"></template>' })
+    expect(html.code).toContain('import _imports_0 from "./parts/logo.svg"')
+    expect(html.code).toContain('import _imports_1 from "./top.svg"')
+  })
+
+  it('Vue: <style module>, src= blocks, <template lang="pug">, prop types imported from another file', async () => {
+    const root = project(['vue', 'pug', 'sass'])
+    files(root, {
+      'src/types.ts': 'export interface Props { msg: string; count?: number }\n',
+      'src/parts/tpl.html': '<h1 :class="$style.big">{{ msg }}</h1>',
+      'src/parts/look.scss': '$c: blue; .look { color: $c; background: url(./bg.png) }',
+      'src/parts/script.ts': 'export default { name: "FromSrc" }\n',
+    })
+    const typed = await worker.compileSfc({
+      root,
+      file: join(root, 'src/A.vue'),
+      hmrId: 'abc',
+      source: '<script setup lang="ts">\nimport type { Props } from \'./types\'\ndefineProps<Props>()\n</script>\n<template src="./parts/tpl.html"></template>\n<style module>.big { font-size: 2em }</style>\n<style module="extra">.big { color: red }</style>\n<style src="./parts/look.scss" scoped></style>\n',
+    })
+    expect(typed.code).toMatch(/msg: \{ type: String, required: true \}/)
+    expect(typed.code).toMatch(/count: \{ type: Number, required: false \}/)
+    expect(typed.code).toContain('_ctx.$style.big')
+    const mods = JSON.parse(/__cssModules = (.*)\n/.exec(typed.code)![1])
+    expect(Object.keys(mods)).toEqual(['$style', 'extra'])
+    expect(mods.$style.big).not.toBe(mods.extra.big) // per block
+    expect(typed.styles[0].replace(/\s+/g, ' ')).toContain(`.${mods.$style.big} { font-size: 2em }`)
+    expect(typed.styles[2]).toMatch(/\.look\[data-v-abc\] \{\s*color: blue;\s*background: url\("?\/src\/parts\/bg\.png"?\)/) // from its own dir
+    expect(typed.deps.sort()).toEqual(['src/parts/look.scss', 'src/parts/tpl.html', 'src/types.ts'].map((f) => join(root, f)))
+    // the class map is part of the script revision: a new one reloads, the same one re-renders
+    const hashOf = (code: string) => /__cressletScript = "(\w+)"/.exec(code)![1]
+    const again = await worker.compileSfc({ root, file: join(root, 'src/A.vue'), hmrId: 'abc', source: '<script setup lang="ts">\nimport type { Props } from \'./types\'\ndefineProps<Props>()\n</script>\n<template src="./parts/tpl.html"></template>\n<style module>.big { font-size: 3em }</style>\n<style module="extra">.big { color: red }</style>\n<style src="./parts/look.scss" scoped></style>\n' })
+    expect(hashOf(again.code)).toBe(hashOf(typed.code))
+    // an edited type file is read again
+    writeFileSync(join(root, 'src/types.ts'), 'export interface Props { msg: number }\n')
+    expect((await worker.compileSfc({ root, file: join(root, 'src/A.vue'), hmrId: 'abc', source: '<script setup lang="ts">\nimport type { Props } from \'./types\'\ndefineProps<Props>()\n</script>\n<template><p/></template>' })).code).toMatch(/msg: \{ type: Number, required: true \}/)
+    // a type from a package: the project's TypeScript resolves it (loaded only then)
+    const withTs = project(['vue', 'typescript'])
+    files(withTs, { 'node_modules/shapes/package.json': '{"name":"shapes","types":"index.d.ts"}', 'node_modules/shapes/index.d.ts': 'export interface Shape { sides: number }\n' })
+    const pkgTyped = await worker.compileSfc({ root: withTs, file: join(withTs, 'src/T.vue'), hmrId: 't', source: '<script setup lang="ts">\nimport type { Shape } from \'shapes\'\ndefineProps<Shape>()\n</script>\n<template><p/></template>' })
+    expect(pkgTyped.code).toMatch(/sides: \{ type: Number, required: true \}/)
+    const pug = await worker.compileSfc({ root, file: join(root, 'src/P.vue'), hmrId: 'p', source: '<template lang="pug">\np.hi(:title="t") {{ t }}\n  input(disabled)\n</template>\n<script>export default { data: () => ({ t: 1 }) }</script>' })
+    expect(pug.code).toMatch(/_createElementBlock\("p", \{\s*class: "hi",\s*title: _ctx\.t/)
+    expect(pug.code).toContain('disabled: ""') // doctype html: a boolean attribute, not disabled="disabled"
+    const src = await worker.compileSfc({ root, file: join(root, 'src/S.vue'), hmrId: 's', source: '<script src="./parts/script.ts"></script>\n<template><p>x</p></template>' })
+    // a copy (components sharing it don't clash), its named exports too; TypeScript template expressions
+    expect(src.code).toContain('import _sfc_src from "./parts/script.ts"\nexport * from "./parts/script.ts"\nconst _sfc_main = typeof _sfc_src')
+    const srcTs = await worker.compileSfc({ root, file: join(root, 'src/S.vue'), hmrId: 's', source: '<script lang="ts" src="./parts/script.ts"></script>\n<template><p>{{ (1 as number) + 1 }}</p></template>' })
+    expect(srcTs.lang).toBe('ts')
+    expect(src.deps).toEqual([]) // an import (its edits reload the component, as its other imports' do)
+    await expect(worker.compileSfc({ root: project(['vue']), file: '/src/Q.vue', hmrId: 'q', source: '<template lang="pug">p hi</template>' })).rejects.toThrow(/npm install pug/)
+    await expect(worker.compileSfc({ root, file: join(root, 'src/M.vue'), hmrId: 'm', source: '<template src="./nope.html"></template>' })).rejects.toThrow(/<template src="\.\/nope\.html">: file not found/)
   })
 
   it('Vue: a template error carries its location; a missing compiler says what to install', async () => {
