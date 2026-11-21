@@ -9,6 +9,7 @@ import { type DevServerHandle, type DevServerOptions } from './dev/server';
 import { type BuildOptions } from './build/build';
 import { type CssBackend } from './css/pipeline';
 import { type NodeChannel, type ProjectWorker } from './node/channel';
+import type { FallbackRuntime } from './node/fallback';
 import { type PersistOptions, type Persistence } from './persist';
 export interface BootOptions {
     /** Service worker URL served by the host at its origin root. Default '/cresslet-sw.js'. `false` disables previews. */
@@ -61,6 +62,13 @@ export interface BootOptions {
      * Default off. `true` uses key 'default'; give each project its own `key`.
      */
     persist?: boolean | PersistOptions;
+    /**
+     * Runs the CLIs cresslet's `node` can't (`next`, and vite's own bin rather than the built-in `vite` command): when
+     * `node` is asked to run one's bin script (a `node_modules/.bin` shim, `npx`, a package script, `node <path>`), this
+     * is called instead, with the command's context plus `{ package, bin, entry }`, and its result is the exit code.
+     * Unset: those fail with an error saying so. See docs/research/wasm-node.md.
+     */
+    fallbackRuntime?: FallbackRuntime;
 }
 export interface ContainerEvents {
     'server-ready': (port: number, url: string) => void;
@@ -135,6 +143,8 @@ export declare class Container {
     readonly cssPlugins: boolean;
     /** Workdir snapshots (`boot({ persist })`), else null. */
     readonly persistence: Persistence | null;
+    /** Where heavy CLIs run (`boot({ fallbackRuntime })`), else null. */
+    readonly fallbackRuntime: FallbackRuntime | null;
     private persist;
     /** Origin `node` processes and project workers run on (by its relay), when not this page's. */
     private workersOrigin;

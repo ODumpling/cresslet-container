@@ -12,6 +12,7 @@ import type { NodeChannel } from './channel'
 import { zlibOp } from './brotli'
 import { ChildHost, parseSpec } from './child'
 import type { ZFormat, ZMode } from './codec'
+import { heavyCli, heavyCliError } from './fallback'
 
 const HASHES: Record<string, string> = { sha1: 'SHA-1', sha256: 'SHA-256', sha384: 'SHA-384', sha512: 'SHA-512' }
 
@@ -219,6 +220,12 @@ export async function nodeCommand(ctx: CommandContext): Promise<number> {
       return 1
     }
     entry = resolvePath(ctx.cwd, args.shift()!)
+    const heavy = heavyCli(c.vfs, entry)
+    if (heavy) {
+      if (c.fallbackRuntime) return c.fallbackRuntime({ ...ctx, args, ...heavy, entry })
+      ctx.stderr.write(heavyCliError(heavy.package, heavy.bin))
+      return 1
+    }
   }
   try {
     return await runNode(ctx, entry, args)
