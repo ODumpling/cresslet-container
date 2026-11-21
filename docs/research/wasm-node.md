@@ -6,7 +6,7 @@ State as of 2026-11-21. Primary sources only: repos, docs, npm registry metadata
 
 ## TL;DR
 
-- **Nobody ships upstream Node.js compiled to WASM.** I found no official effort in nodejs/node. V8 inside wasm would have to run jitless, and jitless V8 is about 80% slower on the Web Tooling Benchmark and has no WebAssembly support ([v8-jitless]).
+- **Nobody ships upstream Node.js compiled to WASM.** I found no official effort in nodejs/node. V8 inside wasm would have to run jitless, and jitless V8 was about 80% slower on the Web Tooling Benchmark when V8 measured it in 2019 ([v8-jitless]).
 - **There are two serious "real Node in the browser" runtimes today. The one with an open core is Wasmer's Edge.js on `@wasmer/sdk`.** Edge.js is Node's own `lib/` and `src/`, ported so its bindings go through N-API. Its libuv/syscall layer is a WASIX module, and in the browser the JS runs on the page's own engine through a host-provided N-API, so it keeps the JIT ([edge-readme], [edge-arch], [edge-sec]). Wasmer's browser shell runs real `next dev --webpack` on it (tested), and ships a Vite 8 example (vinext, untested) ([sdk-next], [sdk-vinext]). The costs: a 78 MB package served uncompressed (about 25 MB if gzipped, measured locally), alpha status, JSPI and COOP/COEP required, and a "Modified MIT" SDK license with an attribution clause ([sdk-license]).
 - **Leaning Technologies' BrowserPod is the other one:** Node 22 compiled to Wasm, JS on the page's engine, about 15 MB to first `node` output (measured). It's proprietary: CDN-only, with a required "Powered by BrowserPod" credit, and its servers are reachable only through Leaning's metered network ([bp-node], [bp-license], [bp-net]).
 - **StackBlitz WebContainers runs vite and next, but it is a hosted, proprietary runtime.** The client package is MIT, but the runtime loads from stackblitz.com, and production for-profit use needs a commercial license ([wc-enterprise]). It can't be embedded as an MIT library's built-in.
@@ -33,12 +33,12 @@ So the polyfilled `node` doesn't just fail on heavy CLIs: it can **exit 0 silent
 
 Not a runtime, given the findings below: a detection path and a hook.
 
-- When `node` is asked to run a heavy CLI's bin script (`next`, and vite's own bins), it fails at once with an error naming the CLI and `boot({ fallbackRuntime })`. For `next` that replaces the silent exit 0 above; for vite's bin, the `SyntaxError`. This applies however it starts: a package script, a `.bin` shim (also `node node_modules/.bin/next`), `npx`, `node <path>` or `child_process`. `--version` / `--help` alone still run on `node`, as they work there. The built-in `vite` and `tsc` commands are unchanged.
+- When `node` is asked to run a heavy CLI's bin script (`next`, and vite's own bins), it fails at once with an error naming the CLI and `boot({ fallbackRuntime })`. For `next` that replaces the silent exit 0 above; for vite's bin, the `SyntaxError`. This applies however it starts: a package script, a `.bin` shim (also `node node_modules/.bin/next`), `npx`, `node <path>` or `child_process`. `next --version` / `--help` alone still run on `node`, as they work there (vite's don't, so they get the error too). The built-in `vite` and `tsc` commands are unchanged.
 - `boot({ fallbackRuntime })` gets those runs instead, with the command's context (`args`, `cwd`, `env`, stdio, `signal`, `container`) plus `{ package, bin, entry }`, and returns the exit code. A host can plug in Edge.js, WebContainers or a remote machine there. The extras listed at the end of this doc (prepare step, TTY resize, two-way file sync) are left until an adapter needs them.
 
 ## Why JIT matters
 
-V8's `--jitless` mode runs Ignition (the interpreter) only and interprets regexps too. V8 measured Speedometer 2.0 about 40% slower and the **Web Tooling Benchmark 80% slower**, and "WebAssembly is currently unsupported" in that mode ([v8-jitless]). Wasm code can't generate and run new machine code in place. A JS engine compiled to wasm is therefore an interpreter, unless it emits new wasm modules at runtime (as v86 and CheerpX do for x86 code ([v86-readme], [cx-overview])). Bundlers and type-checkers are exactly the code the Web Tooling Benchmark measures. A good fallback should run JS on the browser's own JIT and put only the OS layer in wasm. Edge.js host-napi mode and WebContainers do this (WebContainers' internals are unverified).
+V8's `--jitless` mode runs Ignition (the interpreter) only and interprets regexps too. V8 measured Speedometer 2.0 about 40% slower and the **Web Tooling Benchmark 80% slower**, and "WebAssembly is currently unsupported" in that mode ([v8-jitless]); these are 2019 numbers. V8 has since added an optional Wasm interpreter, DrumBrake, which a Node issue asked to enable for jitless builds ([node-drumbrake]), but it's a build option, not stock Node. Wasm code can't generate and run new machine code in place. A JS engine compiled to wasm is therefore an interpreter, unless it emits new wasm modules at runtime (as v86 and CheerpX do for x86 code ([v86-readme], [cx-overview])). Bundlers and type-checkers are exactly the code the Web Tooling Benchmark measures. A good fallback should run JS on the browser's own JIT and put only the OS layer in wasm. Edge.js host-napi mode and WebContainers do this (WebContainers' internals are unverified).
 
 ## Candidates
 
@@ -185,7 +185,7 @@ A prototype adapter is worth one spike. It should not be a dependency.
 Outputs:
 
 - (shipped) The exit code.
-- (shipped through `container.servePort`) Server ports: either `ports.onListen(port)`, with the adapter calling `container.servePort(port, req => Response)`, or the runtime's own preview URL/origin reported through the `server-ready`/`port` events.
+- Server ports. Shipped: the adapter calls `container.servePort(port, req => Response)` for each server it starts, which opens a preview and fires `server-ready`/`port` as any port does. Not shipped: publishing a URL the runtime serves itself (e.g. BrowserPod's Portals) through those events; the host handles that.
 - Optionally, outbound network policy: a WISP or WebSocket relay URL that the host supplies.
 - Lifecycle: `prepare()` (download and cache the runtime, with progress events) separate from `run()`, so the first command doesn't silently download tens of MB. Plus `teardown()`.
 
@@ -193,6 +193,7 @@ Outputs:
 
 [issue]: https://github.com/ODumpling/cresslet-container/issues/12
 [v8-jitless]: https://v8.dev/blog/jitless
+[node-drumbrake]: https://github.com/nodejs/node/issues/61166
 [node-issues-search]: https://github.com/nodejs/node/issues?q=wasm32
 [node-pr-48248]: https://github.com/nodejs/node/pull/48248
 [node-28800]: https://github.com/nodejs/node/issues/28800

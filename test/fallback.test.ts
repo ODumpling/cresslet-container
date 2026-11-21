@@ -25,6 +25,11 @@ function project() {
   shim('next', '../next/dist/bin/next')
   shim('vite', '../vite/bin/vite.js')
   shim('tsc', '../typescript/bin/tsc')
+  // npm-style links (e.g. a mounted node_modules): a .bin symlink, and a package dir linked from elsewhere
+  v.symlink('../vite/bin/vite.js', '/p/node_modules/.bin/vite-link')
+  pkg('/s/node_modules/.pnpm/next@15/node_modules/next', { name: 'next', bin: { next: 'dist/bin/next' } })
+  file('/s/node_modules/.pnpm/next@15/node_modules/next/dist/bin/next')
+  v.symlink('.pnpm/next@15/node_modules/next', '/s/node_modules/next')
   return v
 }
 
@@ -40,6 +45,8 @@ describe('heavyCli', () => {
     expect(heavyCli(v, '/p/node_modules/next-alt/dist/bin/next')).toEqual({ ...next, entry: '/p/node_modules/next-alt/dist/bin/next' }) // by its package.json name
     expect(heavyCli(v, '/p/node_modules/.bin/next')).toEqual(next) // `node node_modules/.bin/next`
     expect(heavyCli(v, '/p/node_modules/.bin/vite')).toEqual(vite)
+    expect(heavyCli(v, '/p/node_modules/.bin/vite-link')).toEqual(vite)
+    expect(heavyCli(v, '/s/node_modules/next/dist/bin/next')).toEqual({ ...next, entry: '/s/node_modules/.pnpm/next@15/node_modules/next/dist/bin/next' })
   })
   it('leaves everything else to node', () => {
     expect(heavyCli(v, '/p/node_modules/next/dist/bin/next.js')).toBeNull() // not the bin
@@ -54,7 +61,14 @@ describe('heavyCli', () => {
     expect(heavyCli(v, '/r/node_modules/next/dist/bin/next')).toBeNull() // no package.json
   })
   it('names the CLI and the hook in its error', () => {
-    expect(heavyCliError('next', 'next')).toMatch(/^next: next's CLI doesn't run on cresslet's node\. .*boot\(\{ fallbackRuntime \}\)/)
-    expect(heavyCliError('vite', 'vite')).toContain('built-in dev server')
+    expect(heavyCliError(next, ['build'])).toMatch(/^next: next's CLI doesn't run on cresslet's node\. .*boot\(\{ fallbackRuntime \}\)/)
+    expect(heavyCliError(vite, [])).toContain('built-in dev server')
+  })
+  it("lets next's --version / --help alone run on node (they work there), not vite's", () => {
+    for (const a of ['-v', '--version', '-h', '--help']) {
+      expect(heavyCliError(next, [a]), a).toBeNull()
+      expect(heavyCliError(vite, [a]), a).toContain("vite's CLI doesn't run")
+    }
+    expect(heavyCliError(next, ['build', '--help'])).not.toBeNull()
   })
 })

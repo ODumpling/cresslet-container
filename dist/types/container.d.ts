@@ -66,7 +66,7 @@ export interface BootOptions {
      * Runs the CLIs cresslet's `node` can't (`next`, and vite's own bin rather than the built-in `vite` command): when
      * `node` is asked to run one's bin script (a `node_modules/.bin` shim, `npx`, a package script, `node <path>`), this
      * is called instead, with the command's context plus `{ package, bin, entry }`, and its result is the exit code.
-     * Unset: those fail with an error saying so (`--version` / `--help` alone still run on `node`). See
+     * Unset: those fail with an error saying so (`next --version` / `--help` alone still run on `node`). See
      * docs/research/wasm-node.md.
      */
     fallbackRuntime?: FallbackRuntime;

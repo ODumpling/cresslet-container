@@ -222,9 +222,9 @@ export async function nodeCommand(ctx: CommandContext): Promise<number> {
     entry = resolvePath(ctx.cwd, args.shift()!)
     const heavy = heavyCli(c.vfs, entry)
     if (heavy && c.fallbackRuntime) return c.fallbackRuntime({ ...ctx, args, ...heavy })
-    // (`--version` / `--help` alone work on node: they still run there)
-    if (heavy && !(args.length === 1 && /^(-v|--version|-h|--help)$/.test(args[0]))) {
-      ctx.stderr.write(heavyCliError(heavy.package, heavy.bin))
+    const refused = heavy && heavyCliError(heavy, args)
+    if (refused) {
+      ctx.stderr.write(refused)
       return 1
     }
   }

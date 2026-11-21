@@ -18,22 +18,31 @@ export interface FallbackContext extends CommandContext {
 /** Runs a CLI cresslet's `node` can't (`boot({ fallbackRuntime })`); resolves to its exit code. */
 export type FallbackRuntime = (ctx: FallbackContext) => Promise<number>
 
-/** Packages whose CLIs don't run on cresslet's `node`, and what to say about it. */
-const HEAVY_CLIS: Record<string, string> = {
-  next: '',
-  vite: " (the `vite` command is cresslet's built-in dev server and build: run that instead)",
+/** Packages whose CLIs don't run on cresslet's `node`: a hint for the error, and whether `--version` / `--help` alone work there. */
+const HEAVY_CLIS: Record<string, { hint: string; infoOnNode?: boolean }> = {
+  next: { hint: '', infoOnNode: true },
+  vite: { hint: " (the `vite` command is cresslet's built-in dev server and build: run that instead)" },
 }
 
 /**
  * The heavy CLI `entry` (as `node` was given it) runs: the bin script of a HEAVY_CLIS package (by its package.json
- * name, in the last `node_modules/<pkg>/` of the path), directly or through its `.bin` shim. Else null.
+ * name, in the last `node_modules/<pkg>/` of its real path), directly or through its `.bin` shim. Else null.
  */
 export function heavyCli(vfs: VFS, entry: string): Pick<FallbackContext, 'package' | 'bin' | 'entry'> | null {
-  // as node resolves a main script: the path itself, else with .js
-  const main = (p: string) => (!vfs.isFile(p) && vfs.isFile(p + '.js') ? p + '.js' : p)
+  // as node resolves a main script: the path itself, else with .js; then its real path
+  const main = (p: string) => {
+    const f = !vfs.isFile(p) && vfs.isFile(p + '.js') ? p + '.js' : p
+    try {
+      return vfs.realpath(f)
+    } catch {
+      return f // missing: node reports it
+    }
+  }
   let file = main(normalize(entry))
-  const shim = vfs.isFile(file) ? binShimTarget(vfs.readText(file).slice(0, 512)) : null
-  if (shim) file = main(resolve(dirname(file), shim))
+  if (file.includes('/node_modules/.bin/') && vfs.isFile(file)) {
+    const shim = binShimTarget(new TextDecoder().decode(vfs.readFile(file).subarray(0, 512)))
+    if (shim) file = main(resolve(dirname(file), shim))
+  }
   // the greedy `.*` takes every earlier node_modules segment, so this is the package's own dir
   const m = /^(.*\/node_modules\/(?:@[^/]+\/)?[^/]+)\//.exec(file)
   if (!m) return null
@@ -44,10 +53,13 @@ export function heavyCli(vfs: VFS, entry: string): Pick<FallbackContext, 'packag
     return null // unreadable package.json
   }
   if (typeof name !== 'string' || !Object.hasOwn(HEAVY_CLIS, name)) return null
-  for (const [b, rel] of binEntries(name, bin as never)) if (normalize(join(m[1], String(rel))) === file) return { package: name, bin: b, entry: file }
+  for (const [b, rel] of binEntries(name, bin as never)) if (main(normalize(join(m[1], String(rel)))) === file) return { package: name, bin: b, entry: file }
   return null
 }
 
-export function heavyCliError(pkg: string, bin: string): string {
-  return `${bin}: ${pkg}'s CLI doesn't run on cresslet's node${HEAVY_CLIS[pkg] ?? ''}. A host can run it elsewhere with boot({ fallbackRuntime }).\n`
+/** The error for running `cli` on `node` with `args`, or null when it runs there anyway (`next --version`). */
+export function heavyCliError(cli: { package: string; bin: string }, args: string[]): string | null {
+  const { hint, infoOnNode } = HEAVY_CLIS[cli.package] ?? { hint: '' }
+  if (infoOnNode && args.length === 1 && /^(-v|--version|-h|--help)$/.test(args[0])) return null
+  return `${cli.bin}: ${cli.package}'s CLI doesn't run on cresslet's node${hint}. A host can run it elsewhere with boot({ fallbackRuntime }).\n`
 }

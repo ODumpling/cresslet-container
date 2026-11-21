@@ -13,7 +13,11 @@ export interface FallbackContext extends CommandContext {
 export type FallbackRuntime = (ctx: FallbackContext) => Promise<number>;
 /**
  * The heavy CLI `entry` (as `node` was given it) runs: the bin script of a HEAVY_CLIS package (by its package.json
- * name, in the last `node_modules/<pkg>/` of the path), directly or through its `.bin` shim. Else null.
+ * name, in the last `node_modules/<pkg>/` of its real path), directly or through its `.bin` shim. Else null.
  */
 export declare function heavyCli(vfs: VFS, entry: string): Pick<FallbackContext, 'package' | 'bin' | 'entry'> | null;
-export declare function heavyCliError(pkg: string, bin: string): string;
+/** The error for running `cli` on `node` with `args`, or null when it runs there anyway (`next --version`). */
+export declare function heavyCliError(cli: {
+    package: string;
+    bin: string;
+}, args: string[]): string | null;

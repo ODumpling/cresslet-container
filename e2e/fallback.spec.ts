@@ -27,6 +27,9 @@ async function boot(page: Page, fallback: boolean) {
     await w('node_modules/next/package.json', JSON.stringify({ name: 'next', version: '15.0.0', bin: { next: './dist/bin/next' } }))
     await w('node_modules/next/dist/bin/next', 'console.log("node ran next")')
     await w('node_modules/.bin/next', '#!/usr/bin/env node\n// cresslet-bin -> ../next/dist/bin/next\nrequire("../next/dist/bin/next")\n')
+    await w('node_modules/vite/package.json', JSON.stringify({ name: 'vite', version: '7.0.0', bin: { vite: 'bin/vite.js' } }))
+    await w('node_modules/vite/bin/vite.js', 'console.log("node ran vite")')
+    await w('node_modules/.bin/vite', '#!/usr/bin/env node\n// cresslet-bin -> ../vite/bin/vite.js\nrequire("../vite/bin/vite.js")\n')
     await w('spawn.js', 'const r = require("child_process").spawnSync("node", ["node_modules/next/dist/bin/next", "dev"], { encoding: "utf8" }); console.log("child", r.status, JSON.stringify(r.stdout + r.stderr))')
   }, fallback)
 }
@@ -72,9 +75,11 @@ test('without a fallbackRuntime, heavy CLIs fail saying so', async ({ page }) =>
     expect(r.out, line).not.toContain('node ran next')
     expect(r.code, line).toBe(1)
   }
-  // `--version` / `--help` alone still run on node (they work there)
+  // next's `--version` / `--help` alone still run on node (they work there); vite's don't
   for (const line of ['./node_modules/.bin/next --version', 'node node_modules/next/dist/bin/next --help']) {
     const r = await sh(page, line)
     expect(r, line).toEqual({ code: 0, out: 'node ran next\n' })
   }
+  const r = await sh(page, './node_modules/.bin/vite --version')
+  expect(r).toEqual({ code: 1, out: "vite: vite's CLI doesn't run on cresslet's node (the `vite` command is cresslet's built-in dev server and build: run that instead). A host can run it elsewhere with boot({ fallbackRuntime }).\n" })
 })
