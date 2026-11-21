@@ -648,7 +648,7 @@ async function handle(req) {
   }
 }
 
-// ---- single-file components (the dev server's .vue / .svelte modules), with the project's own compiler ----
+// ---- single-file components (.vue / .svelte / .svelte.js modules), with the project's own compiler ----
 
 const hash = (s) => {
   let h = 0x811c9dc5
@@ -666,26 +666,179 @@ function located(e, file) {
   }
   return e
 }
-/**
- * A component's styles go in `<style>`s it owns, one per block (an `@import` must start its sheet), in order; extra
- * ones from its previous copy are removed. Relative `url()`s / `@import`s are made root-relative (the page isn't in
- * the component's dir).
- */
-function injectStyle(req, id, sheets) {
-  const urlOf = (p) => (p.startsWith(req.root + '/') ? p.slice(req.root.length) : '/@fs' + p)
-  const css = sheets.filter(Boolean).map((s) => rebaseUrls(s, path.dirname(req.file), null, { cssImports: true, toUrl: urlOf }))
-  return `{ const sheets = ${JSON.stringify(css)}, have = [...document.querySelectorAll(${JSON.stringify(`style[data-cresslet-id="${id}"]`)})]
-  sheets.forEach((css, i) => { let el = have[i]; if (!el) { el = document.createElement('style'); el.setAttribute('data-cresslet-id', ${JSON.stringify(id)}); document.head.appendChild(el) } el.textContent = css })
-  for (const el of have.slice(sheets.length)) el.remove() }\n`
-}
 const missing = (pkg, e) => (e && e.code === 'MODULE_NOT_FOUND' && String(e.message).includes(pkg) ? new Error(`compiling this file needs the \`${pkg.split('/')[0]}\` package: npm install ${pkg.split('/')[0]}`) : e)
 
 /**
- * Svelte: the project's `svelte/compiler`, client output in dev mode; its CSS goes in a `<style>` the module updates
- * (so a failed update leaves the old one). Svelte 5 emits its own `import.meta.hot` code (`hmr: true`); Svelte 4
- * compiles without (its components full-reload).
+ * A stylesheet's leading statements (`@charset`, `@layer a, b;`, `@import`s; comments between them dropped), then the
+ * rest. A statement ends at its `;` outside strings and parentheses.
  */
-function compileSvelte(req) {
+function leadingStatements(css) {
+  const items = []
+  const n = css.length
+  let i = 0
+  for (;;) {
+    let j = i
+    while (j < n) {
+      if (/\s/.test(css[j])) j++
+      else if (css[j] === '/' && css[j + 1] === '*') j = css.indexOf('*/', j + 2) < 0 ? n : css.indexOf('*/', j + 2) + 2
+      else break
+    }
+    const m = /^@(import|charset|layer)\b/i.exec(css.slice(j, j + 9))
+    if (!m) break
+    let k = j + m[0].length
+    for (let depth = 0; k < n; k++) {
+      const ch = css[k]
+      if (ch === '"' || ch === "'") k = skipString(css, k) - 1
+      else if (ch === '(') depth++
+      else if (ch === ')') depth--
+      else if (depth <= 0 && (ch === ';' || ch === '{' || ch === '}')) break
+    }
+    if (css[k] !== ';') break // `@layer x { ... }`: a block, not a statement
+    items.push({ name: m[1].toLowerCase(), text: css.slice(j, k + 1), prelude: css.slice(j + m[0].length, k).trim() })
+    i = k + 1
+  }
+  return { items, rest: css.slice(i) }
+}
+
+/** An `@import` prelude: its URL, then `layer` / `layer(name)`, `supports(...)` and a media query list. */
+function parseImport(prelude) {
+  prelude = prelude.replace(/\/\*[\s\S]*?\*\//g, ' ').trim()
+  const m = /^(?:url\(\s*(?:"((?:[^"\\]|\\[\s\S])*)"|'((?:[^'\\]|\\[\s\S])*)'|([^)\s"']*))\s*\)|"((?:[^"\\]|\\[\s\S])*)"|'((?:[^'\\]|\\[\s\S])*)')\s*/i.exec(prelude)
+  if (!m) return null
+  const spec = unescapeCss(m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5])
+  let rest = prelude.slice(m[0].length)
+  let layer = null
+  let supports = null
+  const l = /^layer(?:\(\s*([^)]*?)\s*\)|(?![\w(-]))\s*/i.exec(rest)
+  if (l) {
+    layer = l[1] || ''
+    rest = rest.slice(l[0].length)
+  }
+  if (/^supports\(/i.test(rest)) {
+    let k = 'supports'.length
+    for (let depth = 0; k < rest.length; k++) {
+      if (rest[k] === '(') depth++
+      else if (rest[k] === ')' && --depth === 0) break
+    }
+    supports = rest.slice('supports'.length, k + 1) // `supports(display: grid)` -> `@supports (display: grid)`
+    rest = rest.slice(k + 1).trim()
+  }
+  return { spec, layer, supports, media: rest.trim() }
+}
+
+/** The local stylesheet an SFC style's `@import` names (beside it first, then root-relative / a package), or null to leave it. */
+function importTarget(spec, dir, root) {
+  // remote, or Tailwind's own (`tailwindcss`, `tailwindcss/theme.css`: Tailwind resolves those); a query is dropped
+  spec = spec.replace(/[?#].*$/s, '')
+  if (!spec || /^(?:[a-z][a-z\d+.-]*:|\/\/)/i.test(spec) || /^tailwindcss(?:\/|$)/.test(spec)) return null
+  let p
+  try {
+    if (spec.startsWith('/')) p = stylesheetPaths(path.join(root, spec)).find(isFile)
+    else p = stylesheetPaths(path.resolve(dir, spec)).find(isFile) || (/^\.\.?\//.test(spec) ? null : resolveStylesheet(spec, dir))
+  } catch {
+    return null
+  }
+  return p && /\.css$/i.test(p) && isFile(p) ? p : null
+}
+
+/** An import's conditions as written after its URL (`layer(x) supports(...) screen`), or '' for none. */
+const conditions = (imp) => [imp.layer === null ? '' : imp.layer ? `layer(${imp.layer})` : 'layer', imp.supports ? `supports${imp.supports}` : '', imp.media].filter(Boolean).join(' ')
+
+/**
+ * Inline a component style's local and package `@import`s (recursively), as vite's postcss-import does: a Vue scoped
+ * style scopes their rules, the build bundles them, and each file is a dependency (`out.deps`). Their `url()`s are
+ * rebased to `dir`; a media query / `supports()` / `layer()` wraps the rules. A file is inlined once (a repeat or a
+ * cycle is skipped). Remote and unresolved imports, and Tailwind's, stay (hoisted to the top: an `@import` must start
+ * its sheet; one under a conditional import gets its conditions, or, when both have some, that import isn't inlined).
+ */
+function inlineImports(css, dir, root, out, seen = [], done = new Set(), scope = '') {
+  const { items, rest } = leadingStatements(css)
+  if (!items.some((it) => it.name === 'import')) return css
+  const head = []
+  const body = []
+  for (const it of items) {
+    if (it.name !== 'import') {
+      // a `@layer a, b;` after an import stays after the rules inlined for it (layer order); a nested `@charset` goes
+      if (it.name === 'layer') (body.length ? body : head).push(it.text)
+      else if (!seen.length) head.push(it.text)
+      continue
+    }
+    const imp = parseImport(it.prelude)
+    const p = imp && importTarget(imp.spec, dir, root)
+    // Tailwind's import options (`theme(reference)`, `prefix(tw)`, `source(...)`): left for Tailwind, with the file's
+    // absolute path (in dev the sheet's relative URLs become the page's, which Tailwind can't open)
+    if (p && /\b(?:theme|prefix|source)\(/i.test(imp.media)) {
+      out.deps.add(p)
+      head.push(`@import "${escapeString(p, '"')}" ${conditions(imp)};`)
+      continue
+    }
+    if (!p) {
+      // a missing relative sheet: creating it recompiles the component (which then inlines it)
+      const miss = imp && /^\.\.?\//.test(imp.spec) && path.resolve(dir, imp.spec.replace(/[?#].*$/s, ''))
+      if (miss) for (const f of path.extname(miss) ? [miss] : stylesheetPaths(miss)) out.deps.add(f)
+      head.push(it.text)
+      continue
+    }
+    const cond = conditions(imp)
+    // under the conditions of every import above it (the same file under other ones is inlined again)
+    const eff = [scope, cond].filter(Boolean).join('\0')
+    const key = `${p}\0${eff}`
+    if (seen.includes(p) || done.has(key)) continue // a cycle, or already inlined
+    out.deps.add(p)
+    const mine = new Set(done) // what this expansion inlines counts only if it is kept
+    const inner = leadingStatements(rebaseDirectives(rebaseUrls(inlineImports(fs.readFileSync(p, 'utf8'), path.dirname(p), root, out, [...seen, p], mine, eff), path.dirname(p), dir, { cssImports: true }), path.dirname(p), dir))
+    const kept = []
+    for (const x of inner.items) {
+      if (x.name !== 'import') continue
+      const ix = cond && parseImport(x.prelude)
+      if (!cond) kept.push(x.text)
+      else if (ix && !conditions(ix)) kept.push(`@import url("${escapeString(ix.spec, '"')}") ${cond};`)
+      else kept.push(null)
+    }
+    if (kept.includes(null)) {
+      head.push(it.text) // both conditional: left to the browser / bundler
+      continue
+    }
+    for (const k of mine) done.add(k)
+    done.add(key)
+    head.push(...kept)
+    let block = inner.items.filter((x) => x.name === 'layer').map((x) => x.text + '\n').join('') + inner.rest
+    if (imp.media) block = `@media ${imp.media} {\n${block}\n}`
+    if (imp.supports) block = `@supports ${imp.supports} {\n${block}\n}`
+    if (imp.layer !== null) block = `@layer${imp.layer ? ' ' + imp.layer : ''} {\n${block}\n}`
+    body.push(block)
+  }
+  return [...head, ...body, rest].join('\n')
+}
+
+/**
+ * An inlined or `src=` stylesheet's relative Tailwind directives (`@reference`, `@source`, `@config`, `@plugin`) made
+ * relative to the component, which the pipeline compiles it as (like its `url()`s): one base for everything in it.
+ */
+function rebaseDirectives(css, fromDir, toDir) {
+  return css.replace(/(@(?:reference|source|config|plugin)\s+(?:not\s+)?)(["'])(\.\.?\/[^"'\n]*)\2/g, (_, pre, q, ref) => {
+    let rel = path.relative(toDir, path.resolve(fromDir, ref))
+    if (!rel.startsWith('.')) rel = './' + rel
+    return pre + q + rel + q
+  })
+}
+
+/** Sass/Less for a component's `<style lang>` (plain CSS and PostCSS pass through). */
+async function styleLang(req, lang, source, file, out) {
+  if (/^(css|postcss|pcss)$/.test(lang)) return source
+  if (!/^(scss|sass|less)$/.test(lang)) throw new Error(`${req.file}: <style lang="${lang}"> is not supported (Sass and Less are)`)
+  return preprocess({ root: req.root, file: file.endsWith('.' + lang) ? file : `${file}.${lang}`, css: source, plugins: req.plugins }, out)
+}
+
+const sfcOut = () => ({ deps: new Set(), dirs: new Set(), tailwind: [], warnings: [], attempted: new Set() })
+
+/**
+ * Svelte: the project's `svelte/compiler`, client output (dev mode with HMR in the dev server). `<style lang="scss">` /
+ * Less go through the project's preprocessor first; the CSS is returned (`styles`) for the caller to inject or bundle.
+ * Svelte 5 emits its own `import.meta.hot` code (`hmr: true`); Svelte 4 compiles without (its components full-reload).
+ * `.svelte.js` / `.svelte.ts` modules (runes outside components; the caller strips TypeScript) use `compileModule`.
+ */
+async function compileSvelte(req) {
   let svelte
   try {
     svelte = projectRequire(req.root)('svelte/compiler')
@@ -693,21 +846,78 @@ function compileSvelte(req) {
     throw missing('svelte/compiler', e)
   }
   const v5 = parseInt(svelte.VERSION, 10) >= 5
+  const prod = req.env === 'production'
+  if (!req.file.endsWith('.svelte')) {
+    if (!v5 || !svelte.compileModule) throw new Error(`${req.file}: .svelte.js modules need Svelte 5`)
+    let r
+    try {
+      r = svelte.compileModule(req.source, { filename: req.file, generate: 'client', dev: !prod })
+    } catch (e) {
+      throw located(e, req.file)
+    }
+    return { code: r.js.code, lang: 'js', deps: [], styles: [], warnings: (r.warnings || []).map((w) => w.message) }
+  }
+  const out = sfcOut()
+  let source = req.source
+  if (/<style\b[^>]*\slang\s*=/i.test(source)) {
+    try {
+      const style = async ({ content, attributes }) => (typeof attributes.lang === 'string' ? { code: await styleLang(req, attributes.lang, content, req.file, out) } : undefined)
+      source = (await svelte.preprocess(source, { style }, { filename: req.file })).code
+    } catch (e) {
+      throw located(e, req.file)
+    }
+  }
   let r
   try {
-    r = svelte.compile(req.source, v5 ? { filename: req.file, generate: 'client', dev: true, hmr: true, css: 'external' } : { filename: req.file, generate: 'dom', dev: true, css: 'external' })
+    r = svelte.compile(source, v5 ? { filename: req.file, generate: 'client', dev: !prod, hmr: !prod, css: 'external' } : { filename: req.file, generate: 'dom', dev: !prod, css: 'external' })
   } catch (e) {
     throw located(e, req.file)
   }
-  // the style after the module body: a module that throws as it runs leaves the old one
-  return { code: r.js.code + '\n' + injectStyle(req, req.hmrId, [r.css ? r.css.code : '']), lang: 'js', deps: [], warnings: (r.warnings || []).map((w) => w.message) }
+  // (after scoping: imported rules stay global, as with vite-plugin-svelte)
+  const css = r.css && r.css.code ? inlineImports(r.css.code, path.dirname(req.file), req.root, out) : ''
+  return { code: r.js.code, lang: 'js', deps: [...out.deps], styles: css ? [css] : [], warnings: [...out.warnings, ...(r.warnings || []).map((w) => w.message)] }
+}
+
+/**
+ * compiler-sfc instance -> whether it may load TypeScript. `vue/compiler-sfc` registers `require('typescript')`,
+ * which it then loads for any imported type; ours loads the project's only once a type imported from a package needs
+ * its resolver (relative ones are read through `typeFs`).
+ */
+const vueTs = new WeakMap()
+function vueTypescript(sfc, root) {
+  let st = vueTs.get(sfc)
+  if (!st) {
+    vueTs.set(sfc, (st = { load: false, root }))
+    sfc.registerTS(() => (st.load ? projectRequire(st.root)('typescript') : undefined))
+  }
+  st.root = root // (one compiler-sfc may serve projects that share it)
+  return st
+}
+const typeFs = {
+  fileExists: isFile,
+  readFile: (f) => {
+    try {
+      return fs.readFileSync(f, 'utf8')
+    } catch {
+      return undefined
+    }
+  },
+  realpath: (f) => {
+    try {
+      return fs.realpathSync(f)
+    } catch {
+      return f
+    }
+  },
 }
 
 /**
  * Vue: the project's `vue/compiler-sfc`. Script (incl. `<script setup>`) and template are compiled separately (the
- * render function reads setup bindings through `$setup`), so a template-only edit re-renders the component in place
- * (state kept); any other edit reloads it through Vue's HMR runtime. `<style>` / `<style scoped>` (Sass/Less via the
- * project's `sass` / `less`) are injected by the module.
+ * render function reads setup bindings through `$setup`), so in the dev server a template-only edit re-renders the
+ * component in place (state kept); any other edit reloads it through Vue's HMR runtime. `<style>` blocks (scoped,
+ * `module`, Sass/Less) are returned (`styles`), their `@import`s inlined first. `src=` blocks, `<template lang="pug">`
+ * (the project's preprocessor) and types imported from other files in `defineProps<T>()` work; the files they read are
+ * `deps`. `env: 'production'`: no HMR code, `isProd` output.
  */
 async function compileVue(req) {
   let sfc
@@ -716,45 +926,128 @@ async function compileVue(req) {
   } catch (e) {
     throw missing('vue/compiler-sfc', e)
   }
+  const prod = req.env === 'production'
+  const dir = path.dirname(req.file)
   const { descriptor, errors } = sfc.parse(req.source, { filename: req.file, sourceMap: false })
   if (errors.length) throw located(errors[0], req.file)
   const id = req.hmrId
+  const out = sfcOut()
+  /** A `src=` block's file: relative to the component, or a package's. (The parsed descriptor is cached: not changed.) */
+  const srcFile = (block, tag) => {
+    let p
+    try {
+      p = tag === 'style' ? resolveStylesheet(block.src, dir) : /^\.{0,2}\//.test(block.src) ? path.resolve(dir, block.src) : projectRequire(req.root).resolve(block.src)
+    } catch {}
+    if (!p || !isFile(p)) throw new Error(`${req.file}: <${tag} src="${block.src}">: file not found`)
+    if (tag !== 'script') out.deps.add(p) // (a script is an import: its edits reload the component, like its imports')
+    return p
+  }
   const scoped = descriptor.styles.some((s) => s.scoped)
-  const blocks = [descriptor.script, descriptor.scriptSetup].filter(Boolean)
-  const ts = blocks.some((b) => b.lang === 'ts')
+  const { script, scriptSetup } = descriptor
+  let ts = [script, scriptSetup].some((b) => b && b.lang === 'ts')
   let code = 'const _sfc_main = {}'
   let bindings
-  if (blocks.length) {
+  if (script && script.src) {
+    if (scriptSetup) throw new Error(`${req.file}: <script src> can't be combined with <script setup>`)
+    srcFile(script, 'script')
+    // a copy (components sharing one script file each get their own render / scope id), its named exports too
+    const spec = JSON.stringify(script.src)
+    code = `import _sfc_src from ${spec}\nexport * from ${spec}\nconst _sfc_main = typeof _sfc_src === 'function' ? _sfc_src : Object.assign({}, _sfc_src)`
+    ts = script.lang === 'ts' || /\.[cm]?ts$/.test(script.src) // (TypeScript in the template's expressions)
+  } else if (script || scriptSetup) {
+    const compile = () => sfc.compileScript(descriptor, { id, isProd: prod, inlineTemplate: false, genDefaultAs: '_sfc_main', sourceMap: false, fs: typeFs })
+    const tsState = vueTypescript(sfc, req.root)
+    let s
     try {
-      const s = sfc.compileScript(descriptor, { id, isProd: false, inlineTemplate: false, genDefaultAs: '_sfc_main', sourceMap: false })
-      code = s.content
-      bindings = s.bindings
+      try {
+        s = compile()
+      } catch (e) {
+        // a type imported from a package needs TypeScript's resolver: the project's `typescript`, loaded only then
+        if (tsState.load || !/TypeScript is required/.test(String(e && e.message))) throw e
+        tsState.load = true
+        s = compile()
+      }
     } catch (e) {
       throw located(e, req.file)
     }
+    code = s.content
+    bindings = s.bindings
+    // type files are re-read on the next compile (compiler-sfc caches them by name)
+    for (const d of s.deps || []) out.deps.add(d), sfc.invalidateTypeCache && sfc.invalidateTypeCache(d)
   }
-  // (a removed <template> must reload: re-rendering with no render function keeps the old one)
-  const scriptHash = hash(code + (scoped ? '\0scoped' : '') + (descriptor.template ? '\0template' : ''))
-  if (descriptor.template) {
-    const t = sfc.compileTemplate({ source: descriptor.template.content, filename: req.file, id, scoped, slotted: descriptor.slotted, isProd: false, compilerOptions: { bindingMetadata: bindings, scopeId: scoped ? `data-v-${id}` : undefined, expressionPlugins: ts ? ['typescript'] : undefined } })
-    if (t.errors.length) throw typeof t.errors[0] === 'string' ? new Error(`${req.file}: ${t.errors[0]}`) : located(t.errors[0], req.file)
-    code += '\n' + t.code.replace(/\nexport (function|const) render\b/, '\n$1 _sfc_render') + '\n_sfc_main.render = _sfc_render'
-  }
-  const out = { deps: new Set(), dirs: new Set(), tailwind: [], warnings: [], attempted: new Set() }
-  const css = []
-  for (const st of descriptor.styles) {
-    if (st.module) throw new Error(`${req.file}: <style module> is not supported by the dev server yet`)
-    const lang = st.lang || 'css'
-    const source = lang === 'css' ? st.content : await preprocess({ root: req.root, file: `${req.file}.${lang}`, css: st.content, plugins: req.plugins }, out)
-    const r = await sfc.compileStyleAsync({ source, filename: req.file, id: `data-v-${id}`, scoped: !!st.scoped, isProd: false })
+  const styles = []
+  const modules = {}
+  for (let i = 0; i < descriptor.styles.length; i++) {
+    const st = descriptor.styles[i]
+    const from = st.src ? srcFile(st, 'style') : req.file
+    const lang = st.lang || (st.src && (/\.(s[ac]ss|less)$/.exec(from) || [])[1]) || 'css'
+    const fromDir = path.dirname(from)
+    let css = await styleLang(req, lang, st.src ? fs.readFileSync(from, 'utf8') : st.content, from, out)
+    css = inlineImports(css, fromDir, req.root, out) // before scoping: an imported sheet's rules are scoped too
+    if (fromDir !== dir) css = rebaseDirectives(rebaseUrls(css, fromDir, dir, { cssImports: true }), fromDir, dir)
+    const name = st.module ? (typeof st.module === 'string' ? st.module : '$style') : null
+    const r = await sfc.compileStyleAsync({
+      source: css,
+      filename: from, // (a `<style module src>`'s `composes: x from "./y.css"` resolves beside it)
+      id: `data-v-${id}`,
+      scoped: !!st.scoped,
+      isProd: prod,
+      modules: !!name,
+      // stable per component and block: an edit that keeps the class names keeps the map (re-render, not reload)
+      modulesOptions: name ? { generateScopedName: (local) => `${local}_${hash(`${id}:${i}`)}` } : undefined,
+    })
     if (r.errors.length) throw located(r.errors[0], req.file)
-    css.push(r.code)
+    if (name) modules[name] = { ...modules[name], ...r.modules }
+    styles.push(r.code)
   }
-  code += `
-_sfc_main.__hmrId = ${JSON.stringify(id)}
+  const cssModules = Object.keys(modules).length ? `_sfc_main.__cssModules = ${JSON.stringify(modules)}\n` : ''
+  // (a removed <template> must reload: re-rendering with no render function keeps the old one; a new class map too)
+  const scriptHash = hash(code + (scoped ? '\0scoped' : '') + (descriptor.template ? '\0template' : '') + '\0' + cssModules)
+  const tpl = descriptor.template
+  if (tpl) {
+    const tplFile = tpl.src ? srcFile(tpl, 'template') : null
+    const lang = tpl.lang || (tplFile && /\.pug$/.test(tplFile) ? 'pug' : undefined)
+    const pre =
+      lang && lang !== 'html'
+        ? {
+            preprocessLang: lang,
+            preprocessCustomRequire: (m) => {
+              try {
+                return projectRequire(req.root)(m)
+              } catch (e) {
+                throw missing(m, e)
+              }
+            },
+            // (an `include` resolves from the template's own file)
+            preprocessOptions: { ...(lang === 'pug' ? { doctype: 'html' } : {}), filename: tplFile || req.file },
+          }
+        : {}
+    // production: root-relative asset URLs (`<img src="/src/logo.svg">`) are bundled too, as @vitejs/plugin-vue does
+    const assets = prod ? { transformAssetUrls: { includeAbsolute: true } } : {}
+    const t = sfc.compileTemplate({ source: tplFile ? fs.readFileSync(tplFile, 'utf8') : tpl.content, filename: req.file, id, scoped, slotted: descriptor.slotted, isProd: prod, ...pre, ...assets, compilerOptions: { bindingMetadata: bindings, scopeId: scoped ? `data-v-${id}` : undefined, expressionPlugins: ts ? ['typescript'] : undefined } })
+    if (t.errors.length) throw typeof t.errors[0] === 'string' ? new Error(`${req.file}: ${t.errors[0]}`) : located(t.errors[0], req.file)
+    const relTo = (abs) => {
+      const rel = path.relative(dir, abs)
+      return rel.startsWith('.') ? rel : './' + rel
+    }
+    // asset URLs the template imports: a `src=` template's relative ones are relative to its own file; a root-relative
+    // one is a project file (bundled), or one in public/ (left as the URL: it is copied to the output root)
+    const render = t.code
+      .replace(/\nexport (function|const) render\b/, '\n$1 _sfc_render')
+      .replace(/^import (_imports_\d+) from (['"])((?:\.\.?)?\/[^'"]*)\2/gm, (m, name, q, ref) => {
+        if (!ref.startsWith('/')) return tplFile && path.dirname(tplFile) !== dir ? `import ${name} from ${JSON.stringify(relTo(path.resolve(path.dirname(tplFile), ref)))}` : m
+        const clean = ref.replace(/[?#].*$/s, '')
+        if (isFile(path.join(req.root, 'public', clean))) return `const ${name} = ${JSON.stringify(ref)}`
+        return isFile(path.join(req.root, clean)) ? `import ${name} from ${JSON.stringify(relTo(path.join(req.root, clean)) + ref.slice(clean.length))}` : m
+      })
+    code += '\n' + render + '\n_sfc_main.render = _sfc_render'
+  }
+  code += `\n${scoped ? `_sfc_main.__scopeId = ${JSON.stringify(`data-v-${id}`)}\n` : ''}${cssModules}`
+  if (!prod)
+    code += `_sfc_main.__hmrId = ${JSON.stringify(id)}
 _sfc_main.__file = ${JSON.stringify(req.file)}
 _sfc_main.__cressletScript = ${JSON.stringify(scriptHash)}
-${scoped ? `_sfc_main.__scopeId = ${JSON.stringify(`data-v-${id}`)}\n` : ''}${injectStyle(req, id, css)}if (import.meta.hot && typeof __VUE_HMR_RUNTIME__ !== 'undefined') {
+if (import.meta.hot && typeof __VUE_HMR_RUNTIME__ !== 'undefined') {
   __VUE_HMR_RUNTIME__.createRecord(_sfc_main.__hmrId, _sfc_main)
   import.meta.hot.accept((mod) => {
     const next = mod && mod.default
@@ -763,15 +1056,25 @@ ${scoped ? `_sfc_main.__scopeId = ${JSON.stringify(`data-v-${id}`)}\n` : ''}${in
     else __VUE_HMR_RUNTIME__.reload(next.__hmrId, next)
   })
 }
-export default _sfc_main
 `
-  return { code, lang: ts ? 'ts' : 'js', deps: [...out.deps], warnings: out.warnings }
+  code += 'export default _sfc_main\n'
+  return { code, lang: ts ? 'ts' : 'js', deps: [...out.deps], styles, warnings: out.warnings }
 }
 
-/** req: { op: 'sfc', root, file, source, hmrId } -> { code, lang: 'js' | 'ts', deps: files it read besides itself, warnings } */
+/**
+ * req: { op: 'sfc', root, file, source, hmrId, env?: 'development' | 'production' }
+ * -> { code, lang: 'js' | 'ts', deps: files it read besides itself, styles: CSS of its style blocks, warnings }
+ * Development: the styles' relative `url()`s / `@import`s are made root-relative (they go in `<style>`s on the page);
+ * production: they stay relative to the component (the build bundles them).
+ */
 async function compileSfc(req) {
   try {
-    return req.file.endsWith('.svelte') ? compileSvelte(req) : await compileVue(req)
+    const r = /\.svelte(?:\.[cm]?[jt]s)?$/.test(req.file) ? await compileSvelte(req) : await compileVue(req)
+    if (req.env !== 'production') {
+      const urlOf = (p) => (p.startsWith(req.root + '/') ? p.slice(req.root.length) : '/@fs' + p)
+      r.styles = r.styles.map((s) => rebaseUrls(s, path.dirname(req.file), null, { cssImports: true, toUrl: urlOf }))
+    }
+    return r
   } catch (e) {
     throw Object.assign(e && typeof e === 'object' ? e : new Error(String(e)), { deps: [], dirs: [] })
   }
@@ -819,5 +1122,5 @@ function formatError(e) {
   return plugin + (e.message || String(e))
 }
 
-module.exports = { handle, compileSfc, release, resolveStylesheet, exportTarget, rebaseUrls, sassTiers, formatError, MARK, TAILWIND_RE, PREPROCESSED_RE }
+module.exports = { handle, compileSfc, inlineImports, release, resolveStylesheet, exportTarget, rebaseUrls, sassTiers, formatError, MARK, TAILWIND_RE, PREPROCESSED_RE }
 if (require.main === module) serve()

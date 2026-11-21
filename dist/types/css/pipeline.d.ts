@@ -50,7 +50,7 @@ export type CssError = Error & {
     dirs?: string[];
     restarted?: boolean;
 };
-/** A `.vue` / `.svelte` module for the dev server, compiled by the same worker with the project's own compiler. */
+/** A `.vue` / `.svelte` / `.svelte.js` module for the dev server or build, compiled by the same worker with the project's own compiler. */
 export interface SfcRequest {
     root: string;
     file: string;
@@ -60,13 +60,17 @@ export interface SfcRequest {
     session?: string;
     /** false: `boot({ cssPlugins: false })` (Less `@plugin` in a `<style lang="less">` block is refused) */
     plugins?: boolean;
+    /** 'production' (build): no HMR code, production output, style `url()`s left relative to the component */
+    env?: 'development' | 'production';
 }
 export interface SfcResult {
-    /** ES module code (TypeScript when `lang` is 'ts'), with `import.meta.hot` handling */
+    /** ES module code (TypeScript when `lang` is 'ts'), with `import.meta.hot` handling in development */
     code: string;
     lang: 'js' | 'ts';
-    /** other files the output depends on (Sass/Less imports of `<style>` blocks) */
+    /** other files the output depends on (`@import`ed / Sass / Less sheets, `src=` blocks, imported prop types) */
     deps: string[];
+    /** the CSS of its style blocks, in order (scoped / CSS modules applied), for the caller to inject or bundle */
+    styles: string[];
     warnings: string[];
 }
 /** Where requests run: the node worker in the container; in-process in tests. */

@@ -436,6 +436,136 @@ describe('dev server CSS processing', () => {
     expect(upd(await s.next())).toEqual(['/src/App.tsx'])
   })
 
+  it('SFC style blocks go through the pipeline; a source that grows their candidates hot-updates the component', async () => {
+    const tw = fakeTailwind()
+    const sfcReqs: string[] = []
+    const css: CssBackend = { ...tw.backend, compile: async (r) => (sfcReqs.push(r.env!), { code: 'export default {}\nimport.meta.hot.accept()\n', lang: 'js', deps: [], styles: ['@import "tailwindcss";'], warnings: [] }) }
+    const s = await devServer({ 'src/main.ts': "import App from './App.vue'\nimport Other from './Other'\n", 'src/App.vue': '<template><p class="flex"></p></template>\n', 'src/Other.tsx': comp('Other') }, { deps: { tailwindcss: '^4' }, css })
+    await s.get('/src/main.ts')
+    await s.get('/src/Other.tsx')
+    const first = await s.get('/src/App.vue')
+    expect(first).toContain('.flex{}')
+    expect(first).not.toContain('.underline{}')
+    expect(sfcReqs).toEqual(['development'])
+    s.write('src/Other.tsx', comp('Other', 'return "underline"'))
+    expect(upd(await s.next())).toEqual(expect.arrayContaining(['/src/App.vue', '/src/Other.tsx']))
+    expect(await s.get('/src/App.vue')).toContain('.underline{}')
+  })
+
+  it('a Vue prop types file that is also a runtime import reloads the component (new setup), not just re-renders', async () => {
+    const files_: string[] = []
+    const process: CssBackend['process'] = async (r) => (files_.push(r.file), { css: r.css, deps: [], dirs: [], warnings: [], tailwind: [] })
+    const compile: CssBackend['compile'] = async () => ({ code: "import { step } from './model'\nconst _sfc_main = { step }\n_sfc_main.__cressletScript = \"h\"\nimport.meta.hot.accept()\nexport default _sfc_main\n", lang: 'js', deps: [join(ROOT, 'src/model.ts')], styles: ['p { color: red }'], warnings: [] })
+    const s = await devServer({ 'postcss.config.js': 'export default { plugins: [] }\n', 'src/main.ts': "import App from './App.vue'\n", 'src/App.vue': '<template><p/></template>\n', 'src/model.ts': 'export type Props = { n: number }\nexport const step = 1\n' }, { css: { restart() {}, process, compile } })
+    await s.get('/src/main.ts')
+    expect(await s.get('/src/App.vue')).toContain('__cressletScript = "0:h"')
+    expect(files_).toEqual([join(ROOT, 'src/App.vue.0.css')])
+    await s.get('/src/model.ts')
+    s.write('src/model.ts', 'export type Props = { n: number }\nexport const step = 2\n')
+    expect(upd(await s.next())).toEqual(['/src/App.vue'])
+    expect(await s.get('/src/App.vue')).toContain('__cressletScript = "1:h"')
+  })
+
+  it('relative url()s the pipeline adds to a component style are made root-relative for the page', async () => {
+    const process: CssBackend['process'] = async (r) => ({ css: r.css + '\n.t { background: url(./theme/a.svg?x) } .u { background: url(/abs.svg) }', deps: [], dirs: [], warnings: [], tailwind: [] })
+    const compile: CssBackend['compile'] = async () => ({ code: 'export default {}\nimport.meta.hot.accept()\n', lang: 'js', deps: [], styles: ['.a { background: url(/src/own.png) }'], warnings: [] })
+    const s = await devServer({ 'postcss.config.js': 'export default { plugins: [] }\n', 'src/main.ts': "import App from './App.vue'\n", 'src/App.vue': '<template><p/></template>\n' }, { css: { restart() {}, process, compile } })
+    await s.get('/src/main.ts')
+    const code = await s.get('/src/App.vue')
+    expect(code).toContain('url(/src/theme/a.svg?x)')
+    expect(code).toContain('url(/abs.svg)')
+    expect(code).toContain('url(/src/own.png)')
+  })
+
+  it('after a full reload a cached component keeps its pipeline subscriptions; a CSS config change recompiles it', async () => {
+    const tw = fakeTailwind()
+    let compiles = 0
+    const css: CssBackend = { ...tw.backend, compile: async () => (compiles++, { code: 'export default {}\nimport.meta.hot.accept()\n', lang: 'js', deps: [], styles: ['@import "tailwindcss";'], warnings: [] }) }
+    const s = await devServer({ 'index.html': '<script type="module" src="/src/main.ts"></script>', 'src/main.ts': "import App from './App.vue'\nimport Other from './Other'\n", 'src/App.vue': '<template><p class="flex"></p></template>\n', 'src/Other.tsx': comp('Other') }, { deps: { tailwindcss: '^4' }, css })
+    const load = async () => {
+      await s.get('/')
+      await s.get('/src/main.ts')
+      await s.get('/src/Other.tsx')
+      return s.get('/src/App.vue')
+    }
+    await load()
+    s.write('index.html', '<script type="module" src="/src/main.ts"></script>\n')
+    expect(upd(await s.next())).toBe('reload')
+    await load() // (served from the cache)
+    expect(compiles).toBe(1)
+    s.write('src/Other.tsx', comp('Other', 'return "underline"'))
+    expect(upd(await s.next())).toEqual(expect.arrayContaining(['/src/App.vue']))
+  })
+
+  it('a PostCSS config change recompiles cached components (their styles went through it)', async () => {
+    let version = 1
+    const process: CssBackend['process'] = async (r) => ({ css: `${r.css} /*config v${version}*/`, deps: [], dirs: [], warnings: [], tailwind: [] })
+    const compile: CssBackend['compile'] = async () => ({ code: 'export default {}\nimport.meta.hot.accept()\n', lang: 'js', deps: [], styles: ['p { color: red }'], warnings: [] })
+    const s = await devServer({ 'postcss.config.js': 'export default { plugins: [] }\n', 'src/main.ts': "import App from './App.vue'\n", 'src/App.vue': '<template><p/></template>\n' }, { css: { restart() {}, process, compile } })
+    await s.get('/src/main.ts')
+    expect(await s.get('/src/App.vue')).toContain('config v1')
+    version = 2
+    s.write('postcss.config.js', 'export default { plugins: [] } // v2\n')
+    expect(upd(await s.next())).toBe('reload')
+    await s.get('/src/main.ts')
+    expect(await s.get('/src/App.vue')).toContain('config v2')
+  })
+
+  it("deleting a component's src= template reloads into a fresh compile (not the cached one)", async () => {
+    let compiles = 0
+    const compile: CssBackend['compile'] = async () => (compiles++, { code: 'export default {}\nimport.meta.hot.accept()\n', lang: 'js', deps: [join(ROOT, 'src/view.html')], styles: [], warnings: [] })
+    const s = await devServer({ 'src/main.ts': "import App from './App.vue'\n", 'src/App.vue': '<template src="./view.html"></template>\n', 'src/view.html': '<p>v1</p>' }, { css: { ...noCss, compile } })
+    await s.get('/src/main.ts')
+    await s.get('/src/App.vue')
+    s.rm('src/view.html')
+    expect(upd(await s.next())).toBe('reload')
+    await s.get('/src/main.ts')
+    await s.get('/src/App.vue')
+    expect(compiles).toBe(2)
+  })
+
+  it("a component's dep edited during its first compile (before anything knew it was a dep) still updates it", async () => {
+    let release!: () => void
+    const held = new Promise<void>((r) => (release = r))
+    let n = 0
+    const compile: CssBackend['compile'] = async () => (++n === 1 && (await held), { code: 'export default {}\nimport.meta.hot.accept()\n', lang: 'js', deps: [join(ROOT, 'src/theme.css')], styles: [], warnings: [] })
+    const s = await devServer({ 'src/main.ts': "import App from './App.vue'\n", 'src/App.vue': '<template><p/></template>\n', 'src/theme.css': '.t { color: red }' }, { css: { ...noCss, compile } })
+    await s.get('/src/main.ts')
+    const first = s.get('/src/App.vue')
+    await new Promise((r) => setTimeout(r, 20))
+    s.write('src/theme.css', '.t { color: blue }')
+    await new Promise((r) => setTimeout(r, 150)) // the flush runs before the compile finishes
+    release()
+    await first
+    expect(upd(await s.next())).toEqual(['/src/App.vue'])
+  })
+
+  it('a component re-serves on grown candidates only when its styles change (a Svelte re-run remounts it)', async () => {
+    const tw = fakeTailwind()
+    let compiles = 0
+    const css: CssBackend = { ...tw.backend, compile: async () => (compiles++, { code: 'export default {}\nimport.meta.hot.accept()\n', lang: 'js', deps: [], styles: ['@import "tailwindcss";'], warnings: [] }) }
+    const s = await devServer({ 'src/main.ts': "import App from './App.svelte'\nimport Other from './Other'\n", 'src/App.svelte': '<p class="flex"></p>\n', 'src/Other.tsx': comp('Other') }, { deps: { tailwindcss: '^4' }, css })
+    await s.get('/src/main.ts')
+    await s.get('/src/Other.tsx')
+    await s.get('/src/App.svelte')
+    s.write('src/Other.tsx', comp('Other', 'return "nothing-known"')) // a new candidate, no new utility
+    expect(upd(await s.next())).toEqual(['/src/Other.tsx'])
+    expect(await s.quiet()).toEqual([])
+    expect(compiles).toBe(1)
+  })
+
+  it("a component's non-import deps update it: a sheet it inlines (also imported by the page), a src= .html template", async () => {
+    const compile: CssBackend['compile'] = async (r) => ({ code: 'export default {}\nimport.meta.hot.accept()\n', lang: 'js', deps: [join(ROOT, 'src/theme.css'), join(ROOT, 'src/view.html')], styles: [], warnings: [] })
+    const s = await devServer({ 'src/main.ts': "import './theme.css'\nimport App from './App.vue'\n", 'src/App.vue': '<template src="./view.html"></template>\n', 'src/view.html': '<p>v1</p>', 'src/theme.css': '.t { color: red }' }, { css: { ...noCss, compile } })
+    await s.get('/src/main.ts')
+    await s.get('/src/App.vue')
+    await s.get('/src/theme.css?import')
+    s.write('src/theme.css', '.t { color: blue }')
+    expect(upd(await s.next())).toEqual(expect.arrayContaining(['/src/theme.css?import', '/src/App.vue']))
+    s.write('src/view.html', '<p>v2</p>')
+    expect(upd(await s.next())).toEqual(['/src/App.vue']) // not a page reload
+  })
+
   it('non-CSS deps (configs) and content dirs (PostCSS dir-dependency, e.g. Tailwind v3) re-serve the stylesheet', async () => {
     const ROOT_ = '/__cresslet_test__/p'
     const backend: CssBackend = {

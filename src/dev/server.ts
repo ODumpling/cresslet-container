@@ -6,10 +6,11 @@ import { dirname, extname, join, normalize } from '../path'
 import { BROWSER_OPTS, isBare, resolveModule } from '../resolve'
 import { clientCode, errorModule, styleModule } from './client'
 import { DepOptimizer, scanImports } from './deps'
-import { ASSET_EXT, envDefines, jsxOptions, loadEnv, matchPaths, mimeType, readProjectConfig, SCRIPT_EXT, SFC_EXT, type ProjectConfig } from './project'
+import { ASSET_EXT, envDefines, jsxOptions, loadEnv, matchPaths, mimeType, readProjectConfig, SCRIPT_EXT, type ProjectConfig } from './project'
 import { findModuleScripts } from '../build/html'
 import { ModuleGraph, updateKey, type HmrUpdate } from './hmr'
 import { CSS_CONFIG_RE, CSS_MODULE_RE, CssPipeline, STYLE_RE, type CssError, type SfcResult } from '../css/pipeline'
+import { compileSfc as compileSfcFile, injectStyles, pageUrls, processSfcStyles, SFC_RE, sfcId } from '../css/sfc'
 import { prefreshCoreModule, prefreshUtilsCode, PREFRESH_CORE_URL, PREFRESH_UTILS_URL, refreshRuntimeModule, refreshTransform, refreshUtilsCode, REFRESH_RUNTIME_URL, REFRESH_UTILS_URL } from './refresh'
 import { analyzeHot, HOT_ID, hotBanner, usesHot } from './hot'
 import refreshRuntimeCjs from 'react-refresh/cjs/react-refresh-runtime.development.js?raw'
@@ -39,13 +40,7 @@ const newUses = (): CssUses => ({ scanners: new Set(), files: new Set(), dirs: [
 
 const NO_CACHE = { 'cache-control': 'no-cache, no-store' }
 /** Modules the dev server transforms: scripts and single-file components. */
-const isModule = (p: string) => SCRIPT_EXT.test(p) || SFC_EXT.test(p)
-/** A short stable id for a component file (Vue's HMR / scope id). */
-const fileId = (s: string) => {
-  let h = 0x811c9dc5
-  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 0x01000193)
-  return (h >>> 0).toString(16).padStart(8, '0')
-}
+const isModule = (p: string) => SCRIPT_EXT.test(p) || SFC_RE.test(p)
 const JS = { 'content-type': 'text/javascript; charset=utf-8', ...NO_CACHE }
 
 export async function createDevServer(c: Container, o: DevServerOptions = {}): Promise<DevServerHandle> {
@@ -65,7 +60,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
    * Transformed scripts, with what the graph needs to re-learn them after a full reload resets it. Valid only for the
    * same mtime and source revision: two writes in one millisecond keep the mtime, the revision still moves.
    */
-  const transformCache = new Map<string, { mtime: number; gen: number; code: string; imports: Set<string>; boundary: boolean; hot?: Hot }>()
+  const transformCache = new Map<string, { mtime: number; gen: number; code: string; imports: Set<string>; boundary: boolean; hot?: Hot; uses?: CssUses; rev?: number }>()
   /** Bumped per module by each HMR flush: an in-flight transform from an older generation must not be cached or report errors. */
   const generation = new Map<string, number>()
   const bump = (f: string) => generation.set(f, (generation.get(f) ?? 0) + 1)
@@ -114,9 +109,26 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
    * own edit, not a `<style>` block's Sass/Less import): it then reloads rather than re-renders with the old setup state.
    */
   const vueRev = new Map<string, number>()
-  const vueStyleDeps = new Map<string, Set<string>>()
+  /**
+   * Components' non-import deps (`@import`ed / Sass sheets, `src=` template and styles, prop type files): an edit of one
+   * updates the component (even when the page also imports that sheet itself); a Vue one only re-renders for a style
+   * or template dep (a types file may be a runtime import too).
+   */
+  const sfcDeps = new Map<string, Set<string>>()
+  /** Components' style blocks before and after the pipeline: candidates that grew re-serve one only if its CSS changes. */
+  const sfcStyles = new Map<string, { raw: string[]; css: string[] }>()
   const bumpVue = (chain: Iterable<string>, changed: string) => {
-    for (const m of chain) if (m !== changed && m.endsWith('.vue') && !vueStyleDeps.get(m)?.has(changed)) vueRev.set(m, (vueRev.get(m) ?? 0) + 1)
+    // (a prop types file may be a runtime import too: a script dep still reloads; a type-only edit would anyway)
+    for (const m of chain) if (m !== changed && m.endsWith('.vue') && !(sfcDeps.get(m)?.has(changed) && !isModule(changed))) vueRev.set(m, (vueRev.get(m) ?? 0) + 1)
+  }
+  const isSfcDep = (f: string) => [...sfcDeps.values()].some((d) => d.has(f))
+  const recheckSfc = (f: string) => {
+    const last = sfcStyles.get(f)
+    if (!last) return scheduleHmr(f)
+    processSfcStyles(cssPipe, f, last.raw).then(
+      (r) => void (r.css.join('\0') !== last.css.join('\0') && scheduleHmr(f)),
+      () => scheduleHmr(f),
+    )
   }
   let reloadTimer: ReturnType<typeof setTimeout> | null = null
   let depsTimer: ReturnType<typeof setTimeout> | null = null
@@ -173,12 +185,14 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       transformCache.delete(f)
       unresolved.delete(f)
       if (f === lastErrorFile) lastError = lastErrorFile = ''
+      for (const [m, d] of sfcDeps) if (d.has(f)) transformCache.delete(m) // (the reloaded page compiles it again)
     }
     if (gone.length) return scheduleReload(gone[0])
     const updates = new Map<string, HmrUpdate>()
     const chain = new Set<string>()
     for (let i = 0; i < files.length; i++) {
       const f = files[i]
+      for (const [m, d] of sfcDeps) if (d.has(f) && !files.includes(m)) files.push(m)
       // a stylesheet whose first build (on this page) is in flight: that build redoes (or re-serves) it when it sees the
       // change; an importer's edge alone doesn't make it a published node
       if (STYLE_RE.test(f) && inflight.has(f) && !published.has(f)) continue
@@ -339,6 +353,7 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     if (/^(tsconfig.*\.json|jsconfig\.json|package\.json)$/.test(file)) cfg = readProjectConfig(vfs, root)
     if (file === 'package.json' || CSS_CONFIG_RE.test(file)) {
       cssPipe.reset()
+      for (const k of transformCache.keys()) if (SFC_RE.test(k)) transformCache.delete(k) // their styles went through it
       deps.invalidate() // the dependency bundle holds packages' Sass/Less, compiled through the pipeline
       return scheduleReload(file)
     }
@@ -347,9 +362,13 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       defines = { ...envDefines(env), 'process.env.NODE_ENV': '"development"' }
       transformCache.clear()
     }
-    if (/^(tsconfig.*\.json|jsconfig\.json|package\.json|\.env.*)$/.test(file) || /\.html?$/.test(file) || file.startsWith('public/')) return scheduleReload(file)
-    // a source that brings new class candidates re-serves the stylesheets built from them (configs/content dirs too)
-    for (const [f, u] of contentCss) if (grown.some((k) => u.scanners.has(k)) || u.files.has(abs) || u.dirs.some((d) => abs.startsWith(d + '/'))) scheduleHmr(f)
+    if (/^(tsconfig.*\.json|jsconfig\.json|package\.json|\.env.*)$/.test(file) || (/\.html?$/.test(file) && !isSfcDep(abs)) || file.startsWith('public/')) return scheduleReload(file)
+    // a source that brings new class candidates re-serves the stylesheets built from them (configs/content dirs too);
+    // a component, only if its styles' output changes (re-running a Svelte one remounts it)
+    for (const [f, u] of contentCss) {
+      if (u.files.has(abs) || u.dirs.some((d) => abs.startsWith(d + '/'))) scheduleHmr(f)
+      else if (grown.some((k) => u.scanners.has(k))) sfcStyles.has(f) && f !== abs ? recheckSfc(f) : scheduleHmr(f)
+    }
     scheduleHmr(abs)
   })
 
@@ -442,6 +461,11 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
     const hit = transformCache.get(abs)
     if (hit && hit.mtime === st.mtimeMs && hit.gen === gen) {
       publish(abs, hit.imports, hit.boundary, gen, page, hit.hot)
+      // a component's styles: re-subscribed (a full reload forgot them), and checked against candidates that grew since
+      if (hit.uses && page === pageGen) {
+        if (hit.uses.scanners.size || hit.uses.files.size || hit.uses.dirs.length) contentCss.set(abs, hit.uses)
+        if (hit.uses.scanners.size && hit.rev !== cssPipe.revision) recheckSfc(abs)
+      }
       return hit.code
     }
     inflight.set(abs, (inflight.get(abs) ?? 0) + 1)
@@ -452,25 +476,29 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       if (page === pageGen) k > 0 ? inflight.set(abs, k) : inflight.delete(abs) // a reset already cleared it
     }
   }
-  /** Compile a `.vue` / `.svelte` file in the CSS worker (retried once if a CSS config change restarted it). */
-  const compileSfc = async (abs: string): Promise<SfcResult> => {
-    const w = c.cssWorker()
-    if (!w.compile) throw new Error(`${abs}: no compiler for single-file components`)
-    const req = { root, file: abs, source: vfs.readText(abs), hmrId: fileId(toUrl(abs)), session: cssPipe.session, plugins: c.cssPlugins !== false }
-    try {
-      return await w.compile(req)
-    } catch (e) {
-      if (!(e as CssError).restarted) throw e
-      return w.compile(req)
-    }
-  }
+  /** Compile a `.vue` / `.svelte` / `.svelte.js` file in the CSS worker. */
+  const compileSfc = (abs: string): Promise<SfcResult> => compileSfcFile(c, { root, file: abs, hmrId: sfcId(toUrl(abs)), session: cssPipe.session, env: 'development', tsconfigRaw: cfg.tsconfigRaw })
   const buildScript = async (abs: string, mtime: number, gen: number, page: number): Promise<string> => {
     const es = await loadEsbuild(c.esbuildWasmUrl)
     const locals = new Set<string>()
     unresolved.delete(abs)
-    const sfc = SFC_EXT.test(abs) ? await compileSfc(abs) : null
-    for (const d of sfc?.deps ?? []) locals.add(d) // a <style lang="scss"> block's imports
-    const source = sfc ? sfc.code : vfs.readText(abs)
+    const seq = changeSeq
+    const knownDeps = sfcDeps.get(abs) // (an edit of one of these is already in a flush's updates)
+    const sfc = SFC_RE.test(abs) ? await compileSfc(abs) : null
+    // its style blocks through PostCSS / Tailwind; what they read (and its other deps) are its edges / content deps
+    const rev = cssPipe.revision
+    const styled = sfc && (await processSfcStyles(cssPipe, abs, sfc.styles))
+    const sfcUses = newUses()
+    const styleDeps = new Set(sfc?.deps)
+    for (const d of styled?.deps ?? []) if (d.startsWith(root + '/') && !d.includes('/node_modules/')) (/\.(css|pcss|postcss|s[ac]ss|less)$/.test(d) ? styleDeps : sfcUses.files).add(d)
+    for (const d of styleDeps) locals.add(d) // `@import`ed / Sass sheets, `src=` blocks, imported prop types
+    if (styled) {
+      for (const k of styled.scanners) sfcUses.scanners.add(k)
+      sfcUses.dirs.push(...styled.dirs.filter((d) => d === root || d.startsWith(root + '/')))
+    }
+    // (what the pipeline changed may have new relative url()s: made root-relative too)
+    const pageCss = styled ? await Promise.all(styled.css.map((css, i) => (css === sfc!.styles[i] ? css : pageUrls(css, dirname(abs), toUrl, c.esbuildWasmUrl)))) : []
+    const source = sfc ? sfc.code + (abs.endsWith('.vue') || abs.endsWith('.svelte') ? '\n' + injectStyles(sfcId(toUrl(abs)), pageCss) : '') : vfs.readText(abs)
     const loader = sfc ? sfc.lang : loaderOf(abs)
     // Preact: every script gets a hot context (component modules accept themselves after the refresh pass)
     const hot = usesHot(source) || (cfg.preactRefresh && !sfc)
@@ -524,15 +552,26 @@ export async function createDevServer(c: Container, o: DevServerOptions = {}): P
       if (cfg.preactRefresh && rr.boundary && components && hotInfo) hotInfo.auto = true
     }
     // Vue re-renders in place only when the component's script is unchanged, and wasn't re-run for an edited import
+    if (sfc) sfcDeps.set(abs, styleDeps)
     if (sfc && abs.endsWith('.vue')) {
-      vueStyleDeps.set(abs, new Set(sfc.deps))
       code = code.replace('__cressletScript = "', () => `__cressletScript = "${vueRev.get(abs) ?? 0}:`)
     }
     // the graph describes the code the page actually runs, even if the file changed meanwhile
     publish(abs, locals, boundary, gen, page, hotInfo)
+    if (sfc && page === pageGen && gen >= (published.get(abs) ?? -1)) {
+      // its styles' Tailwind sources / configs re-serve it, like a stylesheet's; candidates that grew meanwhile, now
+      if (sfcUses.scanners.size || sfcUses.files.size || sfcUses.dirs.length) contentCss.set(abs, sfcUses)
+      else contentCss.delete(abs)
+      if (styled) sfcStyles.set(abs, { raw: sfc.styles, css: styled.css })
+      if (sfcUses.scanners.size && cssPipe.revision !== rev) recheckSfc(abs)
+    }
+    // a dep it read (an @imported sheet...) changed while it compiled, before the flush could know it was one: the
+    // page gets a newer copy
+    const depChanged = !!sfc && (changes[0]?.seq > seq + 1 || changes.some((ch) => ch.seq > seq && styleDeps.has(ch.file) && !knownDeps?.has(ch.file)))
+    if (depChanged && page === pageGen) scheduleHmr(abs)
     // changed while this transform was in flight: serve it, but don't cache stale code
-    if (!fresh(abs, gen, page)) return code
-    transformCache.set(abs, { mtime, gen, code, imports: locals, boundary, hot: hotInfo })
+    if (!fresh(abs, gen, page) || depChanged) return code
+    transformCache.set(abs, { mtime, gen, code, imports: locals, boundary, hot: hotInfo, uses: sfc ? sfcUses : undefined, rev })
     return code
   }
   /**

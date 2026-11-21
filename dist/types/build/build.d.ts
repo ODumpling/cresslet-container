@@ -7,7 +7,12 @@ export interface BuildOptions {
     minify?: boolean;
     sourcemap?: boolean;
 }
-export declare function pathsPlugin(c: Container, cfg: ProjectConfig): Plugin;
+export declare function pathsPlugin(c: Container, cfg: ProjectConfig, resolve?: {
+    conditions: string[];
+    extensions: string[];
+    browser?: boolean;
+    mainFields: string[];
+}): Plugin;
 export declare function build(c: Container, o?: BuildOptions): Promise<{
     files: string[];
 }>;

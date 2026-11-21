@@ -194,6 +194,4 @@ const MIME: Record<string, string> = {
 export const mimeType = (p: string): string => MIME[extname(p).toLowerCase()] ?? 'application/octet-stream'
 
 export const SCRIPT_EXT = /\.(m?[jt]sx?|cjs|cts|mts)$/
-/** Single-file components the dev server compiles (with the project's own `vue` / `svelte` compiler). */
-export const SFC_EXT = /\.(vue|svelte)$/
 export const ASSET_EXT = /\.(svg|png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf|eot|mp4|webm|mp3|wav|ogg|pdf|wasm|txt)$/i
