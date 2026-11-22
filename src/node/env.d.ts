@@ -1,8 +1,9 @@
-// Loose typings for the bundled node polyfill packages (events, readable-stream, string_decoder).
+// Loose typings for the bundled node polyfill packages (events, readable-stream, string_decoder): untyped JS, typed
+// only as far as the node modules use them. The `any`s are that boundary (listener/stream arguments are whatever the
+// emitting code passes, as in @types/node). The worker's global `process` is in globals.d.ts.
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type BufferEncoding = 'utf8' | 'utf-8' | 'hex' | 'base64' | 'base64url' | 'latin1' | 'binary' | 'ascii' | 'ucs2' | 'ucs-2' | 'utf16le' | 'utf-16le'
 
-declare var process: any
 declare var Buffer: typeof import('buffer').Buffer
 
 declare module 'events' {
