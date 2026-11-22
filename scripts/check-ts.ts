@@ -35,7 +35,7 @@ function check(files: string[], read: (f: string) => string): string[] {
     if (JS.test(f) && !allowed(f, Object.keys(JS_ALLOWLIST))) problems.push(`${f}: JavaScript outside the allowlist (write it in TypeScript, or add it to JS_ALLOWLIST in scripts/check-ts.ts with a reason)`)
     if (!(TS.test(f) || CHECKED_JS.test(f)) || allowed(f, NOT_OWNED)) continue
     read(f)
-      .split('\n')
+      .split(/\r?\n/)
       .forEach((line, i) => {
         const m = DIRECTIVE.exec(line)
         if (m) problems.push(`${f}:${i + 1}: @ts-${m[1]} is not allowed (fix the type, or @ts-expect-error with a reason)`)
