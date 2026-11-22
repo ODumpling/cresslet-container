@@ -1,0 +1,11 @@
+{
+  // Tests and tool configs: vitest (test/), Playwright (e2e/*.spec.ts) and their configs; also checks the src they import.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"],
+    // e2e page code imports the built library by URL: type it as the source it's built from
+    "paths": { "/dist/cresslet-container.js": ["./src/index.ts"] }
+  },
+  "include": ["src/types.d.ts", "src/node/env.d.ts", "test", "e2e/*.ts", "vitest.config.ts", "playwright.config.ts"]
+}

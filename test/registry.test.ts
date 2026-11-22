@@ -272,7 +272,7 @@ describe('HttpRegistry persistent cache', () => {
     mockFetch({ [url]: () => new Response(body) })
     let release!: () => void
     const slow = new (class extends MemoryCache {
-      async put(store: CacheStore, key: string, value: unknown) {
+      override async put(store: CacheStore, key: string, value: unknown) {
         await new Promise<void>((r) => (release = r))
         await super.put(store, key, value)
       }

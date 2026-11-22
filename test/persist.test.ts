@@ -116,7 +116,8 @@ describe('VfsPersistence', () => {
     for (const p of started.splice(0)) p.close() // unregisters them (clearPersisted goes through live instances)
   })
 
-  async function setup(opts = {}, store: SnapshotStore = new MemoryStore(), other: SnapshotStore | null = new MemoryStore('indexeddb'), dir = W) {
+  async function setup<S extends SnapshotStore = MemoryStore>(opts = {}, given?: S, other: SnapshotStore | null = new MemoryStore('indexeddb'), dir = W) {
+    const store = given ?? new MemoryStore()
     const fs = new VFS()
     fs.mkdir(W, { recursive: true })
     const errors: string[] = []
