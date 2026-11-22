@@ -49,7 +49,7 @@
   "scripts": {
     "build": "node scripts/build.ts",
     "dev": "node scripts/build.ts --watch",
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json && tsc -p tsconfig.test.json && tsc -p tsconfig.js.json",
+    "typecheck": "node scripts/check-ts.ts && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json && tsc -p tsconfig.test.json && tsc -p tsconfig.js.json",
     "test": "vitest run",
     "test:e2e": "playwright test --project=chromium",
     "demo": "node scripts/serve.ts",
