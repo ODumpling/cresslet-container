@@ -241,8 +241,12 @@ host page ───────────────────────�
 
 ## Development
 
+TypeScript throughout, checked by `pnpm typecheck` (and CI): see [docs/typescript.md](docs/typescript.md) for how each
+kind of file runs, the tsconfig layout, the short JS allowlist and the rules.
+
 ```sh
 pnpm install
+pnpm typecheck   # check-ts guard (no new JS, no @ts-ignore) + tsc over src, scripts, tests, e2e
 pnpm build       # dist/: cresslet-container.js, node-worker.js, cresslet-sw.js, cresslet-relay.{html,js}, index.d.ts (+ types/)
 pnpm test        # vitest: VFS, parser, resolver/hoisting, lockfile + workspace installs, tar, html, module resolution, relay message validation, CSS scanning + worker (real tailwindcss/postcss/autoprefixer/sass/less), import.meta.hot + SFC compile (real vue/svelte), zlib/child_process host side, VFS snapshots
 pnpm test:e2e    # Playwright (chromium); test:e2e:all adds firefox + webkit
