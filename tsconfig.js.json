@@ -13,5 +13,6 @@
     "skipLibCheck": true,
     "noEmit": true
   },
+  // Keep in step with CHECKED_JS in scripts/check-ts.ts (it scans these for opt-out comments).
   "include": ["src/css/worker.cjs", "src/node/shims/*.cjs"]
 }

@@ -22,9 +22,9 @@ const NOT_OWNED = ['dist/', 'e2e/fixtures/']
 /** The JS that tsconfig.js.json checks in place: an opt-out comment would switch that off. */
 const CHECKED_JS = /^src\/(css\/worker|node\/shims\/[^/]+)\.cjs$/
 
-// directives only (a comment starting with one), not prose that mentions them
-const DIRECTIVE = /(?:\/\/\/?|\/\*+)\s*@ts-(ignore|nocheck)\b/
-const BARE_EXPECT_ERROR = /(?:\/\/\/?|\/\*+)\s*@ts-expect-error\s*(?:\*+\/\s*)?$/
+// directives only (a comment, or a block comment's line, starting with one), not prose that mentions them
+const DIRECTIVE = /(?:\/\/\/?|\/\*+|^\s*\*+)\s*@ts-(ignore|nocheck)\b/
+const BARE_EXPECT_ERROR = /(?:\/\/\/?|\/\*+|^\s*\*+)\s*@ts-expect-error\s*(?:\*+\/\s*)?$/
 
 const allowed = (f: string, list: Iterable<string>) => [...list].some((p) => (p.endsWith('/') ? f.startsWith(p) : f === p))
 
