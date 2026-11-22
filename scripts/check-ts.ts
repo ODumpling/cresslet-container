@@ -1,6 +1,6 @@
 // TypeScript guard (run by `pnpm typecheck`): fails when
 //  - a JS file (.js/.mjs/.cjs/.jsx) exists outside the allowlist below, or
-//  - owned TypeScript uses @ts-ignore / @ts-nocheck, or @ts-expect-error without a reason after it.
+//  - owned TypeScript (or the JS checked in place) uses @ts-ignore / @ts-nocheck, or @ts-expect-error without a reason.
 // Looks at tracked files plus untracked ones that aren't gitignored. See docs/typescript.md.
 import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
@@ -19,10 +19,12 @@ const JS = /\.(js|mjs|cjs|jsx)$/
 const TS = /\.(ts|mts|cts|tsx)$/
 /** TS that isn't ours to police: project content, and generated declarations. */
 const NOT_OWNED = ['dist/', 'e2e/fixtures/']
+/** The JS that tsconfig.js.json checks in place: an opt-out comment would switch that off. */
+const CHECKED_JS = /^src\/(css\/worker|node\/shims\/[^/]+)\.cjs$/
 
 // directives only (a comment starting with one), not prose that mentions them
 const DIRECTIVE = /(?:\/\/\/?|\/\*+)\s*@ts-(ignore|nocheck)\b/
-const BARE_EXPECT_ERROR = /(?:\/\/\/?|\/\*+)\s*@ts-expect-error\s*$/
+const BARE_EXPECT_ERROR = /(?:\/\/\/?|\/\*+)\s*@ts-expect-error\s*(?:\*+\/\s*)?$/
 
 const allowed = (f: string, list: Iterable<string>) => [...list].some((p) => (p.endsWith('/') ? f.startsWith(p) : f === p))
 
@@ -30,7 +32,7 @@ function check(files: string[], read: (f: string) => string): string[] {
   const problems: string[] = []
   for (const f of files) {
     if (JS.test(f) && !allowed(f, Object.keys(JS_ALLOWLIST))) problems.push(`${f}: JavaScript outside the allowlist (write it in TypeScript, or add it to JS_ALLOWLIST in scripts/check-ts.ts with a reason)`)
-    if (!TS.test(f) || allowed(f, NOT_OWNED)) continue
+    if (!(TS.test(f) || CHECKED_JS.test(f)) || allowed(f, NOT_OWNED)) continue
     read(f)
       .split('\n')
       .forEach((line, i) => {
