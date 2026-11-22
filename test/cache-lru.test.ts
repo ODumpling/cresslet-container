@@ -207,11 +207,11 @@ describe('cap configuration', () => {
 
   it('boot({ npmCache: { maxBytes } }) uses that cap', async () => {
     const c = await Container.boot({ serviceWorkerUrl: false, npmCache: { maxBytes: 1234 } })
-    expect((c.registry as { cache: IdbCache }).cache.maxBytes).toBe(1234)
+    expect((c.registry as unknown as { cache: IdbCache }).cache.maxBytes).toBe(1234)
     const d = await Container.boot({ serviceWorkerUrl: false, npmCache: { maxBytes: Infinity } })
-    expect((d.registry as { cache: IdbCache }).cache.maxBytes).toBe(Infinity)
+    expect((d.registry as unknown as { cache: IdbCache }).cache.maxBytes).toBe(Infinity)
     const e = await Container.boot({ serviceWorkerUrl: false })
-    expect((e.registry as { cache: IdbCache }).cache).toBe(sharedIdbCache())
+    expect((e.registry as unknown as { cache: IdbCache }).cache).toBe(sharedIdbCache())
     for (const x of [c, d, e]) x.teardown()
   })
 })

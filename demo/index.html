@@ -54,7 +54,7 @@
       fit.fit()
       addEventListener('resize', () => fit.fit())
 
-      // ?previewOrigin=http://127.0.0.1:4401 serves previews from a separate origin (see scripts/serve.mjs);
+      // ?previewOrigin=http://127.0.0.1:4401 serves previews from a separate origin (see scripts/serve.ts);
       // ?previewOrigins=http://{id}-{port}.localhost:4401 gives each preview its own
       const q = new URLSearchParams(location.search)
       const c = await Container.boot({ previewOrigin: q.get('previewOrigin') ?? undefined, previewOrigins: q.get('previewOrigins') ?? undefined })

@@ -3,7 +3,7 @@ import { expect, test, type Frame, type Page } from '@playwright/test'
 type Win = Window & { container: import('../src/container').Container; previewUrl?: string; __marker?: number }
 
 // Previews on a separate origin (`boot({ previewOrigin })`): the demo host is http://localhost:4401 (playwright
-// webServer), scripts/serve.mjs serves the preview origin on port 4402. 127.0.0.1 is cross-site to localhost; for the
+// webServer), scripts/serve.ts serves the preview origin on port 4402. 127.0.0.1 is cross-site to localhost; for the
 // top-level tab test the preview origin must be same-site with the host (see README), so it uses localhost:4402.
 // Playwright launches Chromium with third-party storage partitioning disabled (microsoft/playwright#32230); real Chrome
 // partitions, so re-enable it here. `storage is partitioned` below fails if Playwright's flags change and this stops working.

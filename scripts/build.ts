@@ -1,4 +1,5 @@
 // Build dist/: library (ESM), node worker (ESM), service worker + preview relay (IIFE, + relay HTML), then .d.ts via tsc.
+// Run by Node directly (type stripping): erasable TypeScript only (see docs/typescript.md).
 import * as esbuild from 'esbuild'
 import { execSync } from 'node:child_process'
 import { copyFileSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -9,7 +10,7 @@ const root = fileURLToPath(new URL('..', import.meta.url))
 const watch = process.argv.includes('--watch')
 rmSync(`${root}dist`, { recursive: true, force: true })
 
-const shims = {
+const shims: esbuild.Plugin = {
   name: 'cresslet-shims',
   setup(b) {
     // readable-stream & friends expect browserify-style globals
@@ -18,25 +19,27 @@ const shims = {
     b.onResolve({ filter: /^cjs-lexer-js$/ }, () => ({ path: `${root}node_modules/cjs-module-lexer/lexer.js` }))
     // brotli-wasm's `web` glue (its package exports don't expose it); the .wasm loads at runtime (boot({ brotliWasmUrl }))
     b.onResolve({ filter: /^brotli-wasm-web$/ }, () => ({ path: `${root}node_modules/brotli-wasm/pkg.web/brotli_wasm.js` }))
-    // `import text from 'pkg/file.js?raw'` (as in vite/vitest): embed a file's source as a minified string
-    b.onResolve({ filter: /\?raw$/ }, (a) => ({ path: a.path.startsWith('.') ? join(a.resolveDir, a.path.slice(0, -4)) : `${root}node_modules/${a.path.slice(0, -4)}`, namespace: 'raw' }))
+    // `import text from 'pkg/file.js?raw'` (as in vite/vitest): embed a file's source as a minified string; a .ts file's
+    // compiled JS (vitest.config.ts does the same). Paths are kept root-relative so sourcemaps don't depend on the checkout.
+    b.onResolve({ filter: /\?raw$/ }, (a) => ({ path: relative(root, a.path.startsWith('.') ? join(a.resolveDir, a.path.slice(0, -4)) : `${root}node_modules/${a.path.slice(0, -4)}`), namespace: 'raw' }))
     // `import text from 'pkg?bundle'`: a browser package bundled to one ES module string, its peer `preact` external
     b.onResolve({ filter: /\?bundle$/ }, (a) => ({ path: a.path.slice(0, -7), namespace: 'bundle' }))
     b.onLoad({ filter: /.*/, namespace: 'bundle' }, async (a) => ({ contents: await bundleText(a.path), loader: 'text' }))
     b.onLoad({ filter: /.*/, namespace: 'raw' }, async (a) => {
-      const { code } = await esbuild.transform(readFileSync(a.path, 'utf8'), { minify: true, legalComments: 'inline' })
+      const loader = a.path.endsWith('.ts') ? 'ts' : 'js'
+      const { code } = await esbuild.transform(readFileSync(join(root, a.path), 'utf8'), { loader, minify: true, legalComments: 'inline' })
       return { contents: code, loader: 'text' }
     })
   },
 }
 
 /** Keep in sync with vitest.config.ts. */
-async function bundleText(pkg) {
+async function bundleText(pkg: string): Promise<string> {
   const r = await esbuild.build({ entryPoints: [pkg], absWorkingDir: root, bundle: true, write: false, format: 'esm', minify: true, legalComments: 'inline', external: ['preact', 'preact/*'], logLevel: 'silent' })
   return r.outputFiles[0].text
 }
 
-const common = {
+const common: esbuild.BuildOptions = {
   bundle: true,
   target: 'es2022',
   platform: 'browser',
@@ -47,7 +50,7 @@ const common = {
   define: { 'process.env.NODE_ENV': '"production"' },
 }
 
-const configs = [
+const configs: esbuild.BuildOptions[] = [
   { ...common, entryPoints: { 'cresslet-container': 'src/index.ts' }, format: 'esm', outdir: 'dist', minify: true },
   { ...common, entryPoints: { 'node-worker': 'src/node/worker.ts' }, format: 'esm', outdir: 'dist', minify: true, define: {} },
   { ...common, entryPoints: { 'cresslet-sw': 'src/sw.ts' }, format: 'iife', outdir: 'dist', minify: true },
@@ -71,7 +74,7 @@ function vendorTypes() {
   const types = `${root}dist/types`
   mkdirSync(`${types}/vendor`, { recursive: true })
   copyFileSync(`${root}node_modules/esbuild-wasm/esm/browser.d.ts`, `${types}/vendor/esbuild-wasm.d.ts`)
-  const walk = (d) => readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(join(d, e.name)) : [join(d, e.name)]))
+  const walk = (d: string): string[] => readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(join(d, e.name)) : [join(d, e.name)]))
   for (const f of walk(types).filter((f) => f.endsWith('.d.ts') && !f.includes('/vendor/'))) {
     const src = readFileSync(f, 'utf8')
     let rel = relative(dirname(f), `${types}/vendor/esbuild-wasm`)

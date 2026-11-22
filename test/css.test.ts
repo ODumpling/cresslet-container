@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { VFS } from '../src/vfs'
 import { CandidateScanner, extractCandidates, globToRegExp } from '../src/css/scan'
-import { CssPipeline, detectCssMode, nodeCssBackend, PREPROCESSED_RE, TAILWIND_RE, type CssRequest, type CssResult, type CssWorkerSpawn } from '../src/css/pipeline'
+import { CssPipeline, detectCssMode, nodeCssBackend, PREPROCESSED_RE, TAILWIND_RE, type CssBackend, type CssRequest, type CssResult, type CssWorkerSpawn } from '../src/css/pipeline'
 
 // The CSS worker script is plain CommonJS: run it in real Node against the repo's tailwindcss/postcss/autoprefixer.
 const workerPath = fileURLToPath(new URL('../src/css/worker.cjs', import.meta.url))

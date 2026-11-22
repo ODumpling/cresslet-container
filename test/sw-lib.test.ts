@@ -229,6 +229,13 @@ describe('injectStrip', () => {
     const r = await injectStrip(new Response('<html><head></head><body>x</body></html>', { headers: { 'content-type': 'text/html' } }))
     expect(await r.text()).toMatch(/<head><script>/)
   })
+  it('injects the WebSocket shim as JS (preview-ws.ts compiled, not its TS source)', async () => {
+    const r = await injectStrip(new Response('<html><head></head><body>x</body></html>', { headers: { 'content-type': 'text/html' } }))
+    const scripts = [...(await r.text()).matchAll(/<script>([^]*?)<\/script>/g)].map((m) => m[1])
+    expect(scripts).toHaveLength(2)
+    expect(scripts[1]).toContain('cresslet-ws')
+    for (const s of scripts) expect(() => new Function(s)).not.toThrow() // TS syntax (annotations, `declare`) would throw
+  })
   it('passes null-body responses (205 Reset Content with an HTML type) through unchanged', async () => {
     const res = new Response(null, { status: 205, headers: { 'content-type': 'text/html' } })
     const r = await injectStrip(res)

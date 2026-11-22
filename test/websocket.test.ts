@@ -179,7 +179,8 @@ describe('preview WebSockets (port side)', () => {
   it('preview HTML gets the WebSocket shim after the prefix-strip script', async () => {
     const r = await injectStrip(new Response('<html><head></head><body>x</body></html>', { headers: { 'content-type': 'text/html' } }))
     const html = await r.text()
-    expect(html.indexOf('history.replaceState')).toBeLessThan(html.indexOf("type: 'cresslet-ws'"))
-    expect(html).toMatch(/<\/script><script>[^]*window\.WebSocket = WebSocket[^]*<\/script><\/head>/)
+    // the shim is preview-ws.ts compiled + minified (as in dist), so match it loosely
+    expect(html.indexOf('history.replaceState')).toBeLessThan(html.indexOf('"cresslet-ws"'))
+    expect(html).toMatch(/<\/script><script>[^]*window\.WebSocket\s*=\s*[\w$]+[^]*<\/script><\/head>/)
   })
 })

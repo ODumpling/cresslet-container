@@ -13,5 +13,5 @@ export default defineConfig({
     { name: 'firefox', use: { ...devices['Desktop Firefox'] } },
     { name: 'webkit', use: { ...devices['Desktop Safari'] } },
   ],
-  webServer: { command: 'node scripts/serve.mjs', env: { PORT: '4401' }, url: 'http://localhost:4401/', reuseExistingServer: true },
+  webServer: { command: 'node scripts/serve.ts', env: { PORT: '4401' }, url: 'http://localhost:4401/', reuseExistingServer: true },
 })

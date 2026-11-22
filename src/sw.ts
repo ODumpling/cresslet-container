@@ -222,7 +222,7 @@ async function forward(req: Request, t: Target, path: string): Promise<Response>
 }
 
 /**
- * A preview's `new WebSocket()` to its own host (preview-ws.js): forward it to the owning page like a request
+ * A preview's `new WebSocket()` to its own host (preview-ws.ts): forward it to the owning page like a request
  * (`websocket: true`), with the handshake port as the reply port and the server end of the socket. The page answers on
  * the reply port directly. Refused (anything but `open`) when it can't be attributed to a running preview.
  */

@@ -1,5 +1,5 @@
 // Pure helpers for cresslet-sw.js (kept out of sw.ts so they can be unit tested without a service worker global).
-import WS_SHIM from './preview-ws.js?raw'
+import WS_SHIM from './preview-ws.ts?raw'
 
 export const PREFIX = '/__cresslet__/'
 /** Relay page path on a preview origin (see relay.ts). */
@@ -125,7 +125,7 @@ export function receiveResponse(port: MessagePort, o: ReceiveOptions): Promise<R
 
 /** Injected first into preview HTML: hide the preview prefix from the app (routers see "/"). */
 const STRIP_SCRIPT = `<script>(function(){var l=location,m=/^\\/__cresslet__\\/[^/]+\\/\\d+/.exec(l.pathname);if(m)history.replaceState(history.state,'',(l.pathname.slice(m[0].length)||'/')+l.search+l.hash)})()</script>`
-/** Then: WebSockets to the preview's host go to the container through the SW (see preview-ws.js). */
+/** Then: WebSockets to the preview's host go to the container through the SW (see preview-ws.ts). */
 const INJECTED = STRIP_SCRIPT + `<script>${WS_SHIM}</script>`
 
 const TAG_REST = String.raw`(?=[\s>/])(?:[^>"']|"[^"]*"|'[^']*')*>`
