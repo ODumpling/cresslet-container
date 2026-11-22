@@ -3,7 +3,7 @@ import { expect, test, type Frame, type Page } from '@playwright/test'
 type Win = Window & { container: import('../src/container').Container; previewUrl?: string }
 
 // One origin per preview (`boot({ previewOrigins })`): the host is http://localhost:4401 (playwright webServer), and
-// scripts/serve.mjs's preview listener on port 4402 answers any host name, so http://<id>-<port>.localhost:4402 works
+// scripts/serve.ts's preview listener on port 4402 answers any host name, so http://<id>-<port>.localhost:4402 works
 // (browsers resolve *.localhost to loopback). Each <id>-<port>.localhost is a site of its own (localhost isn't a
 // registrable domain), so previews are cross-site to the host and to each other.
 // As in xorigin.spec.ts: re-enable third-party storage partitioning, which Playwright turns off (real Chrome has it).

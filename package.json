@@ -47,12 +47,12 @@
     "vue": "3.5.46"
   },
   "scripts": {
-    "build": "node scripts/build.mjs",
-    "dev": "node scripts/build.mjs --watch",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "node scripts/build.ts",
+    "dev": "node scripts/build.ts --watch",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json",
     "test": "vitest run",
     "test:e2e": "playwright test --project=chromium",
-    "demo": "node scripts/serve.mjs",
+    "demo": "node scripts/serve.ts",
     "test:e2e:all": "playwright test"
   },
   "pnpm": {

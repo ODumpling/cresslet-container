@@ -123,7 +123,7 @@ The host page keeps COOP/COEP as above. At the **preview origin's root**, serve 
 | `/cresslet-relay.js` | none required (same-origin to the relay); `Cross-Origin-Resource-Policy: cross-origin` is fine |
 | `/cresslet-sw.js` | `Service-Worker-Allowed: /` |
 
-`frame-ancestors` is the real guard against other sites (and previews) framing the relay (the origin checks above are a second layer; Firefox has no `ancestorOrigins`). It is checked against every ancestor: if the host page is itself framed (e.g. by a dashboard), list all of its ancestors' origins too, or the relay won't load. Nothing else needs to be served there: every `/__cresslet__/…` URL is answered by the service worker. Serving the whole preview origin with COEP + CORP as `scripts/serve.mjs` does is fine too.
+`frame-ancestors` is the real guard against other sites (and previews) framing the relay (the origin checks above are a second layer; Firefox has no `ancestorOrigins`). It is checked against every ancestor: if the host page is itself framed (e.g. by a dashboard), list all of its ancestors' origins too, or the relay won't load. Nothing else needs to be served there: every `/__cresslet__/…` URL is answered by the service worker. Serving the whole preview origin with COEP + CORP as `scripts/serve.ts` does is fine too.
 
 What it does and doesn't isolate:
 - **One trust boundary per preview origin.** All previews served from one `previewOrigin` (every container, every port, every tab) share that origin: they can script each other's frames and the relay, read each other's storage, and answer each other's requests. Use distinct preview origins for containers that must not trust each other (e.g. different users' projects), or [per-preview origins](#per-preview-origins).

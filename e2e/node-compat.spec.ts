@@ -6,7 +6,7 @@ import * as zlib from 'node:zlib'
 
 type Win = Window & { container: import('../src/container').Container }
 
-/** scripts/serve.mjs serves a preview origin on the next port (same site as the host). */
+/** scripts/serve.ts serves a preview origin on the next port (same site as the host). */
 const previewOf = (baseURL: string) => {
   const u = new URL(baseURL)
   u.port = String(Number(u.port) + 1)

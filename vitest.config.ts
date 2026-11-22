@@ -3,10 +3,10 @@ import { fileURLToPath } from 'node:url'
 import * as esbuild from 'esbuild'
 const nm = (p: string) => fileURLToPath(new URL('./node_modules/' + p, import.meta.url))
 export default defineConfig({
-  // mirror scripts/build.mjs's shims so the dev server loads in node tests
+  // mirror scripts/build.ts's shims so the dev server loads in node tests
   plugins: [
     {
-      name: 'cresslet-bundle', // `pkg?bundle` (scripts/build.mjs bundleText)
+      name: 'cresslet-bundle', // `pkg?bundle` (scripts/build.ts bundleText)
       enforce: 'pre',
       resolveId: (id) => (id.endsWith('?bundle') ? '\0bundle:' + id.slice(0, -7) : null),
       async load(id) {
