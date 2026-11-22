@@ -24,7 +24,7 @@ export interface SwRequest {
   method: string
   headers: [string, string][]
   body: ArrayBuffer | null
-  /** A preview's WebSocket (see preview-ws.js): comes with the socket's server end; answered with `open` or `refused`. */
+  /** A preview's WebSocket (see preview-ws.ts): comes with the socket's server end; answered with `open` or `refused`. */
   websocket?: boolean
 }
 

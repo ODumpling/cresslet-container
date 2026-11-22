@@ -19,14 +19,15 @@ const shims: esbuild.Plugin = {
     b.onResolve({ filter: /^cjs-lexer-js$/ }, () => ({ path: `${root}node_modules/cjs-module-lexer/lexer.js` }))
     // brotli-wasm's `web` glue (its package exports don't expose it); the .wasm loads at runtime (boot({ brotliWasmUrl }))
     b.onResolve({ filter: /^brotli-wasm-web$/ }, () => ({ path: `${root}node_modules/brotli-wasm/pkg.web/brotli_wasm.js` }))
-    // `import text from 'pkg/file.js?raw'` (as in vite/vitest): embed a file's source as a minified string.
-    // Paths are kept root-relative so sourcemaps don't depend on the checkout location.
+    // `import text from 'pkg/file.js?raw'` (as in vite/vitest): embed a file's source as a minified string; a .ts file's
+    // compiled JS (vitest.config.ts does the same). Paths are kept root-relative so sourcemaps don't depend on the checkout.
     b.onResolve({ filter: /\?raw$/ }, (a) => ({ path: relative(root, a.path.startsWith('.') ? join(a.resolveDir, a.path.slice(0, -4)) : `${root}node_modules/${a.path.slice(0, -4)}`), namespace: 'raw' }))
     // `import text from 'pkg?bundle'`: a browser package bundled to one ES module string, its peer `preact` external
     b.onResolve({ filter: /\?bundle$/ }, (a) => ({ path: a.path.slice(0, -7), namespace: 'bundle' }))
     b.onLoad({ filter: /.*/, namespace: 'bundle' }, async (a) => ({ contents: await bundleText(a.path), loader: 'text' }))
     b.onLoad({ filter: /.*/, namespace: 'raw' }, async (a) => {
-      const { code } = await esbuild.transform(readFileSync(join(root, a.path), 'utf8'), { minify: true, legalComments: 'inline' })
+      const loader = a.path.endsWith('.ts') ? 'ts' : 'js'
+      const { code } = await esbuild.transform(readFileSync(join(root, a.path), 'utf8'), { loader, minify: true, legalComments: 'inline' })
       return { contents: code, loader: 'text' }
     })
   },

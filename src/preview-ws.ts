@@ -1,4 +1,4 @@
-// Injected (minified, inline) into preview HTML by cresslet-sw.js, after the prefix-strip script. Service workers can't
+// Injected (compiled to JS and minified, inline) into preview HTML by cresslet-sw.js, after the prefix-strip script. Service workers can't
 // see WebSocket connections, so `window.WebSocket` is replaced: a socket to the preview's own host (ws: or wss:, any
 // path, `/__cresslet__/<id>/<port>/…` or app-relative) is opened through the service worker instead. The SW forwards
 // it to the owning container (over the relay with a `previewOrigin`) as a `cresslet-request` with `websocket: true`;
@@ -10,6 +10,9 @@
 // On the handshake port: { type: 'open', protocol }, or anything else (refused).
 // On the data port, both ways: { type: 'message', data: string | ArrayBuffer }, { type: 'close', code?, reason? }
 // (the sender of `close` is done with the port, its receiver closes it).
+//
+// A script, not a module: no imports or exports, nothing that isn't erased when compiled (types only), so the injected
+// JS is this file minus its types.
 ;(function () {
   var Native = window.WebSocket
   var sw = navigator.serviceWorker
@@ -18,19 +21,37 @@
   var TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
   // as long as the SW waits for a forwarded request's head (sw-lib.ts HEAD_DEADLINE)
   var DEADLINE = 30000
-  var later = (fn) => setTimeout(fn, 0)
+  var later = (fn: () => void) => setTimeout(fn, 0)
   // realm-independent: data may come from another frame
-  var tag = (d) => Object.prototype.toString.call(d)
-  var isBlob = (d) => tag(d) === '[object Blob]' || tag(d) === '[object File]'
-  var bytes = (d) => (ArrayBuffer.isView(d) ? d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength) : tag(d) === '[object ArrayBuffer]' ? d.slice(0) : String(d))
-  var fail = (what, msg) => new DOMException("Failed to construct 'WebSocket': " + msg, what)
+  var tag = (d: unknown) => Object.prototype.toString.call(d)
+  var isBlob = (d: unknown): d is Blob => tag(d) === '[object Blob]' || tag(d) === '[object File]'
+  var bytes = (d: unknown) => (ArrayBuffer.isView(d) ? d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength) : tag(d) === '[object ArrayBuffer]' ? (d as ArrayBuffer).slice(0) : String(d))
+  var fail = (what: string, msg: string) => new DOMException("Failed to construct 'WebSocket': " + msg, what)
   // open (and connecting) sockets, told the page is going away (1001) as a browser does on unload
-  var live = new Set()
+  var live = new Set<WebSocket>()
   addEventListener('pagehide', () => live.forEach((ws) => ws._goingAway()))
 
+  /** Messages from the other end: untyped (structured-cloned from the host), so read defensively. */
+  type Incoming = { type?: unknown; data?: unknown; code?: unknown; reason?: unknown } | null | undefined
+  type Handler = (this: WebSocket, e: Event) => unknown
+
   class WebSocket extends EventTarget {
-    constructor(url, protocols) {
-      var u
+    // `declare`d so no class fields are emitted: the constructor creates them as before
+    declare url: string
+    declare protocol: string
+    declare extensions: string
+    declare binaryType: BinaryType
+    declare bufferedAmount: number
+    declare _state: number
+    declare _queue: Promise<unknown> | null
+    declare _done: boolean
+    declare _port: MessagePort
+    declare _handshake: MessagePort
+    declare _timer: ReturnType<typeof setTimeout>
+    declare _on: Record<string, { fn: Handler | null }> | undefined
+
+    constructor(url: string | URL, protocols?: string | string[]) {
+      var u: URL
       try {
         u = new URL(String(url), document.baseURI)
       } catch (e) {
@@ -38,10 +59,10 @@
       }
       if (u.protocol === 'http:') u.protocol = 'ws:'
       else if (u.protocol === 'https:') u.protocol = 'wss:'
-      if (u.host !== location.host || (u.protocol !== 'ws:' && u.protocol !== 'wss:')) return protocols === undefined ? new Native(url) : new Native(url, protocols)
+      if (u.host !== location.host || (u.protocol !== 'ws:' && u.protocol !== 'wss:')) return (protocols === undefined ? new Native(url) : new Native(url, protocols)) as unknown as WebSocket // a real one
       if (u.href.indexOf('#') >= 0) throw fail('SyntaxError', "The URL contains a fragment identifier ('" + u.hash + "'). Fragment identifiers are not allowed in WebSocket URLs.")
       super()
-      var list = protocols === undefined ? [] : typeof protocols !== 'object' || protocols === null ? [String(protocols)] : Array.from(protocols, String)
+      var list: string[] = protocols === undefined ? [] : typeof protocols !== 'object' || protocols === null ? [String(protocols)] : Array.from(protocols, String)
       for (var i = 0; i < list.length; i++) {
         if (!TOKEN.test(list[i])) throw fail('SyntaxError', "The subprotocol '" + list[i] + "' is invalid.")
         if (list.indexOf(list[i]) !== i) throw fail('SyntaxError', "The subprotocol '" + list[i] + "' is duplicated.")
@@ -61,40 +82,40 @@
       this._timer = setTimeout(() => this._fail(), DEADLINE)
       ch.port1.onmessage = (e) => {
         this._settle()
-        var m = e.data
+        var m: { type?: unknown; protocol: string } | null | undefined = e.data
         var ok = m && m.type === 'open' && (list.length ? list.indexOf(m.protocol) >= 0 : m.protocol === '')
         if (!ok || this._state !== 0 || this._done) return this._fail() // refused, a bad answer, or too late
         this._state = 1
-        this.protocol = m.protocol
+        this.protocol = m!.protocol
         this._port.onmessage = (ev) => this._receive(ev.data)
         this.dispatchEvent(new Event('open'))
       }
-      var ask = (w) => w.postMessage({ type: 'cresslet-ws', url: this.url, protocols: list }, [ch.port2, data.port2])
+      var ask = (w: ServiceWorker) => w.postMessage({ type: 'cresslet-ws', url: this.url, protocols: list }, [ch.port2, data.port2])
       live.add(this)
       if (sw.controller) ask(sw.controller)
-      else sw.ready.then((r) => ask(r.active)).catch(() => this._fail())
+      else sw.ready.then((r) => ask(r.active!)).catch(() => this._fail())
     }
 
     get readyState() {
       return this._state
     }
 
-    send(data) {
+    send(data: string | ArrayBufferLike | ArrayBufferView | Blob) {
       if (this._state === 0) throw new DOMException("Failed to execute 'send' on 'WebSocket': Still in CONNECTING state.", 'InvalidStateError')
       if (this._state !== 1) return
-      var post = (d) => !this._done && this._port.postMessage({ type: 'message', data: d })
+      var post = (d: unknown) => !this._done && this._port.postMessage({ type: 'message', data: d })
       var blob = isBlob(data)
       var d = blob ? data : bytes(data) // copied now: the caller may reuse its buffer
       // Blobs are read asynchronously: keep everything after one in order; one that can't be read fails the socket
       if (blob || this._queue)
         this._queue = (this._queue || Promise.resolve())
-          .then(() => (blob ? d.arrayBuffer() : d))
+          .then(() => (blob ? (d as Blob).arrayBuffer() : d))
           .then(post)
           .catch(() => this._fail(1011))
       else post(d)
     }
 
-    close(code, reason) {
+    close(code?: number, reason?: string) {
       if (code !== undefined && code !== 1000 && !(code >= 3000 && code <= 4999))
         throw new DOMException("Failed to execute 'close' on 'WebSocket': The close code must be either 1000, or between 3000 and 4999. " + code + ' is neither.', 'InvalidAccessError')
       reason = reason === undefined ? '' : String(reason)
@@ -122,20 +143,20 @@
       this._end(1001, '', true)
     }
 
-    _receive(m) {
+    _receive(m: Incoming) {
       if (!m || this._done) return
       if (m.type === 'message' && this._state === 1) {
         var d = m.data
         if (typeof d !== 'string') {
           if (tag(d) !== '[object ArrayBuffer]') d = bytes(d) // views (or whatever else) the server end posted
           if (typeof d === 'string') return
-          if (this.binaryType !== 'arraybuffer') d = new Blob([d])
+          if (this.binaryType !== 'arraybuffer') d = new Blob([d as ArrayBuffer])
         }
         this.dispatchEvent(new MessageEvent('message', { data: d, origin: new URL(this.url).origin }))
       } else if (m.type === 'close') this._end(typeof m.code === 'number' ? m.code : 1005, typeof m.reason === 'string' ? m.reason : '', true, true)
     }
 
-    _end(code, reason, clean, received) {
+    _end(code: number, reason: string, clean: boolean, received?: boolean) {
       if (this._done) return
       this._done = true
       live.delete(this)
@@ -161,7 +182,7 @@
      * Error, then close (1006). Tells the server end, wherever it is (or will be, if the handler still accepts): 1001 by
      * default (1006 is reserved: a WebSocketPair's close() would throw on it).
      */
-    _fail(code) {
+    _fail(code?: number) {
       if (this._done) return
       this._done = true
       live.delete(this)
@@ -179,31 +200,31 @@
       })
     }
 
-    static [Symbol.hasInstance](x) {
+    static override [Symbol.hasInstance](x: unknown) {
       return x instanceof Native || Function.prototype[Symbol.hasInstance].call(WebSocket, x)
     }
   }
 
   for (var k in STATES) {
-    Object.defineProperty(WebSocket, k, { value: STATES[k], enumerable: true })
-    Object.defineProperty(WebSocket.prototype, k, { value: STATES[k], enumerable: true })
+    Object.defineProperty(WebSocket, k, { value: STATES[k as keyof typeof STATES], enumerable: true })
+    Object.defineProperty(WebSocket.prototype, k, { value: STATES[k as keyof typeof STATES], enumerable: true })
   }
   // on<event> handlers, called in the order they were first set among the listeners (as event handler attributes are)
   ;['open', 'message', 'error', 'close'].forEach((t) => {
     Object.defineProperty(WebSocket.prototype, 'on' + t, {
       configurable: true,
-      get() {
+      get(this: WebSocket) {
         return (this._on && this._on[t] && this._on[t].fn) || null
       },
-      set(fn) {
+      set(this: WebSocket, fn: unknown) {
         var on = this._on || (this._on = {})
         if (!on[t]) {
           on[t] = { fn: null }
           this.addEventListener(t, (e) => typeof on[t].fn === 'function' && on[t].fn.call(this, e))
         }
-        on[t].fn = typeof fn === 'function' ? fn : null
+        on[t].fn = typeof fn === 'function' ? (fn as Handler) : null
       },
     })
   })
-  window.WebSocket = WebSocket
+  window.WebSocket = WebSocket as unknown as typeof Native
 })()
