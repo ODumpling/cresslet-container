@@ -1,0 +1,17 @@
+{
+  // The JS kept as JS (see docs/typescript.md): checked in place, not strict (it's untyped by design; strict would need
+  // JSDoc on every parameter). src/css/worker.cjs is also vendored verbatim into cresslet-cli: keep edits comment-only.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "allowJs": true,
+    "checkJs": true,
+    "strict": false,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["src/css/worker.cjs", "src/node/shims/*.cjs"]
+}

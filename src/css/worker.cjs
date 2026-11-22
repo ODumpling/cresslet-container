@@ -389,7 +389,7 @@ function loadConfig(file, root, env, tailwind) {
   // configs that `import tailwindcss from '@tailwindcss/postcss'` get the stand-in
   try {
     const p = r.resolve('@tailwindcss/postcss')
-    require.cache[p] = { id: p, filename: p, path: path.dirname(p), loaded: true, exports: Object.assign(tailwindPostcss, { default: tailwindPostcss }), children: [], paths: [] }
+    require.cache[p] = /** @type {NodeJS.Module} */ ({ id: p, filename: p, path: path.dirname(p), loaded: true, exports: Object.assign(tailwindPostcss, { default: tailwindPostcss }), children: [], paths: [] })
   } catch {}
   let config = interop(require(file))
   if (typeof config === 'function') config = config({ env, cwd: root })
@@ -660,6 +660,7 @@ function located(e, file) {
   if (!e || typeof e !== 'object') return new Error(String(e))
   const loc = e.start || (e.loc && e.loc.start)
   if (loc && !e.cresslet) {
+    /** @type {Error & { cresslet?: boolean }} */
     const err = new Error(`${file}:${loc.line}:${loc.column + (e.start ? 1 : 0)}: ${e.message}${e.frame ? '\n' + e.frame : ''}`)
     err.cresslet = true
     return err
@@ -1088,6 +1089,7 @@ function release(session) {
 
 function serve() {
   let buf = ''
+  /** @type {Promise<unknown>} */
   let queue = Promise.resolve()
   const reply = (m) => process.stdout.write(MARK + JSON.stringify(m) + '\n')
   process.stdin.on('data', (d) => {
